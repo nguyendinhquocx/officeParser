@@ -22,15 +22,53 @@
  * @see https://www.ecma-international.org/publications-and-standards/standards/ecma-376/
  */
 
-import { ChartMetadata, CodeMetadata, FullOfficeParserConfig, HeadingMetadata, ImageMetadata, ListMetadata, OfficeAttachment, OfficeContentNode, OfficeParserAST, OfficeWarningType, SlideMetadata, TextFormatting } from '../types.js';
+import { attachmentLookup } from '../utils/repeatUtils.js';
+import { BreakMetadata, ChartMetadata, CodeMetadata, CommentMetadata, FullOfficeParserConfig, HeadingMetadata, ImageMetadata, ListMetadata, OfficeAttachment, OfficeContentNode, OfficeParserAST, OfficeWarningType, SlideMetadata, TextFormatting } from '../types.js';
 import { createAST } from '../utils/astUtils.js';
 import { extractChartData } from '../utils/chartUtils.js';
 import { checkAbortSignal, logWarning } from '../utils/errorUtils.js';
 import { createAttachment } from '../utils/imageUtils.js';
 import { isEmptyMath, ommlToLatex } from '../utils/mathUtils.js';
-import { performOcr } from '../utils/ocrUtils.js';
-import { getElementsByTagName, getFirstElementByTagName, getRawContent, isElement, parseOfficeMetadata, parseOOXMLAppProperties, parseOOXMLCustomProperties, parseXmlString } from '../utils/xmlUtils.js';
+import { ocrDuringParse } from '../utils/ocrUtils.js';
+import { getChildElements, getDirectChildren, getElementsByTagName, getFirstElementByTagName, getRawContent, isElement, parseOfficeMetadata, parseOOXMLAppProperties, parseOOXMLCustomProperties, parseXmlString } from '../utils/xmlUtils.js';
 import { extractFiles, findRequiredPart } from '../utils/zipUtils.js';
+import { lookupTable } from '../utils/lookupUtils.js';
+import { appendAll } from '../utils/nodeListUtils.js';
+import { diagramList, readDiagram } from '../utils/diagramUtils.js';
+import { alternateContentBranch, PRESENTATION_NAMESPACES } from '../utils/markupCompatibility.js';
+
+/** An element's own text (its text and CDATA children), not its descendants': a classic comment's `p:text` is a plain string. */
+const ownText = (element: Element): string => {
+    const parts: string[] = [];
+    for (let i = 0; i < element.childNodes.length; i++) {
+        const child = element.childNodes[i];
+        if (child.nodeType === 3 || child.nodeType === 4) parts.push(child.nodeValue || '');
+    }
+    return parts.join('');
+};
+
+/** A comment's paragraph of `children`, its text theirs (a line break a new line). */
+const commentParagraph = (children: OfficeContentNode[]): OfficeContentNode => ({
+    type: 'paragraph',
+    text: children.map(child => child.type === 'break' ? '\n' : child.text ?? '').join(''),
+    children,
+});
+
+/** A modern comment's DrawingML paragraph (`a:p`): its runs' and fields' text, and its line breaks. */
+const drawingParagraph = (paragraph: Element): OfficeContentNode => {
+    const children: OfficeContentNode[] = [];
+    for (let i = 0; i < paragraph.childNodes.length; i++) {
+        const child = paragraph.childNodes[i];
+        if (!isElement(child)) continue;
+        if (child.tagName === 'a:r' || child.tagName === 'a:fld') {
+            const text = getChildElements(child, 'a:t').map(t => t.textContent || '').join('');
+            if (text) children.push({ type: 'text', text });
+        } else if (child.tagName === 'a:br') {
+            children.push({ type: 'break', metadata: { breakType: 'textWrapping' } as BreakMetadata });
+        }
+    }
+    return commentParagraph(children);
+};
 
 /**
  * Parses a PowerPoint presentation (.pptx) and extracts slides and notes.
@@ -40,7 +78,7 @@ import { extractFiles, findRequiredPart } from '../utils/zipUtils.js';
  * @returns A promise resolving to the parsed AST
  */
 export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserConfig): Promise<OfficeParserAST> => {
-    // Honour cancellation requests immediately — before extracting the ZIP archive.
+    // Honour cancellation requests immediately, before extracting the ZIP archive.
     // PPTX presentations can have many slides with media/charts and optional OCR per image,
     // so an early abort prevents decompressing and traversing data that will be discarded.
     checkAbortSignal(config.abortSignal);
@@ -55,10 +93,13 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
     const customPropsFileRegex = /docProps\/custom\.xml/;
     const appPropsFileRegex = /docProps\/app\.xml/;
 
-    const commentsFileRegex = /ppt\/comments\/comment\d+\.xml/;
-    const commentAuthorsRegex = /ppt\/commentAuthors\.xml/;
+    // Comments as PowerPoint wrote them until 2019 (`comment1.xml`, authors in `commentAuthors.xml`) and
+    // since (`modernComment_*.xml`, `p188:cm`, authors in `authors.xml`), which newer versions write alone.
+    const commentsFileRegex = /ppt\/comments\/(?:comment\d+|modernComment_[^/]+)\.xml/;
+    const commentAuthorsRegex = /ppt\/(?:commentAuthors|authors)\.xml/;
     const slideMastersRegex = /ppt\/slideMasters\/slideMaster\d+\.xml/;
     const presentationFileRegex = /ppt\/presentation\.xml/;
+    const diagramDataRegex = /ppt\/diagrams\/data\d+\.xml/;
 
     const files = await extractFiles(
         buffer,
@@ -71,6 +112,7 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
             (!config.ignoreComments && (!!x.match(commentsFileRegex) || !!x.match(commentAuthorsRegex))) ||
             (!config.ignoreSlideMasters && !!x.match(slideMastersRegex)) ||
             !!x.match(presentationFileRegex) ||
+            !!x.match(diagramDataRegex) ||
             (!!config.extractAttachments && (!!x.match(mediaFileRegex) || !!x.match(chartFileRegex))),
         config.decompressionLimits,
         config
@@ -87,15 +129,15 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
 
     // Extract metadata
     const corePropsFile = files.find(f => f.path.match(corePropsFileRegex));
-    const metadata = corePropsFile ? parseOfficeMetadata(corePropsFile.content.toString()) : {};
+    const metadata = corePropsFile ? parseOfficeMetadata(corePropsFile.content.toString(), config) : {};
     const customPropsFile = files.find(f => f.path.match(customPropsFileRegex));
     if (customPropsFile) {
-        const customProperties = parseOOXMLCustomProperties(customPropsFile.content.toString());
+        const customProperties = parseOOXMLCustomProperties(customPropsFile.content.toString(), config);
         if (Object.keys(customProperties).length > 0) metadata.customProperties = customProperties;
     }
     const appPropsFile = files.find(f => f.path.match(appPropsFileRegex));
     if (appPropsFile) {
-        const appProperties = parseOOXMLAppProperties(appPropsFile.content.toString());
+        const appProperties = parseOOXMLAppProperties(appPropsFile.content.toString(), config);
         if (Object.keys(appProperties).length > 0) metadata.nativeProperties = appProperties;
     }
 
@@ -111,11 +153,12 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
     const content: OfficeContentNode[] = [];
     const slideRelsMap: Record<number, Record<string, { type: string, target: string }>> = {};
 
-    const authorMap: Record<string, { author?: string, initials?: string }> = {};
+    // Null-prototype, as every map keyed by the document's own ids is here.
+    const authorMap: Record<string, { author?: string, initials?: string }> = Object.create(null);
     if (!config.ignoreComments) {
         const authorsFile = files.find(f => f.path === 'ppt/commentAuthors.xml');
         if (authorsFile) {
-            const authorsXml = parseXmlString(authorsFile.content.toString());
+            const authorsXml = parseXmlString(authorsFile.content.toString(), { config });
             const authorNodes = getElementsByTagName(authorsXml, "p:cmAuthor");
             for (const aNode of authorNodes) {
                 const id = aNode.getAttribute("id");
@@ -127,7 +170,86 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
                 }
             }
         }
+        const modernAuthorsFile = files.find(f => f.path === 'ppt/authors.xml');
+        if (modernAuthorsFile) {
+            for (const aNode of getElementsByTagName(parseXmlString(modernAuthorsFile.content.toString(), { config }), "p188:author")) {
+                const id = aNode.getAttribute("id");
+                if (id !== null && !(id in authorMap)) {
+                    authorMap[id] = {
+                        author: aNode.getAttribute("name") || undefined,
+                        initials: aNode.getAttribute("initials") || undefined
+                    };
+                }
+            }
+        }
     }
+
+    // The comments of each comments part, read once and shared by every relationship naming it: read
+    // again for each, a slide naming one large comments part thousands of times (19 KB of PPTX) ran the
+    // process out of memory. The writers write a shared comment once.
+    const commentsByPart = new Map<string, OfficeContentNode[]>();
+    const attachedCommentParts = new Set<string>();
+    // The package's parts by file name (what a slide relationship's target keeps, see slideRelsMap), the
+    // first of each: a scan of every part for each comments target took targets x parts.
+    const fileByName = new Map<string, (typeof files)[number]>();
+    for (const f of files) { const name = f.path.slice(f.path.lastIndexOf('/') + 1); if (!fileByName.has(name)) fileByName.set(name, f); }
+    const commentsOfPart = (target: string): OfficeContentNode[] => {
+        let comments = commentsByPart.get(target);
+        if (comments) return comments;
+        comments = [];
+        const cFile = fileByName.get(target);
+        /** A comment of `paragraphs`, with its author (and initials) by `authorId`, its date, and the comment it replies to. */
+        const commentOf = (paragraphs: OfficeContentNode[], authorId: string | null, info: { commentId?: string; date?: string; parentId?: string }): void => {
+            if (!paragraphs.length) return;
+            const authorData = authorId !== null ? authorMap[authorId] : undefined;
+            const metadata: CommentMetadata = {};
+            if (info.commentId) metadata.commentId = info.commentId;
+            if (authorData?.author) metadata.author = authorData.author;
+            if (authorData?.initials) metadata.initials = authorData.initials;
+            if (info.date) metadata.date = info.date;
+            if (info.parentId) metadata.parentId = info.parentId;
+            comments!.push({ type: 'comment', text: paragraphs.map(p => p.text).join(' '), children: paragraphs, metadata });
+        };
+        if (cFile) {
+            const cXml = parseXmlString(cFile.content.toString(), { config });
+            // A comment as PowerPoint wrote it until 2019: its text is a plain string (`p:text`), a
+            // paragraph a line, which was never read (only DrawingML text, which it holds none of, was
+            // looked for). A reply (PowerPoint 2013 and later) names its comment in `p15:threadingInfo`.
+            const classicId = (authorId: string | null, idx: string | null) => authorId !== null && idx !== null ? `${authorId}-${idx}` : undefined;
+            for (const cNode of getElementsByTagName(cXml, "p:cm")) {
+                const textNode = getChildElements(cNode, "p:text")[0];
+                const paragraphs = textNode ? ownText(textNode).split(/\r\n?|\n/).filter(line => line.trim()).map(line => commentParagraph([{ type: 'text', text: line }])) : [];
+                const extensions = getChildElements(cNode, "p:extLst")[0];
+                let parent: Element | undefined;
+                for (const extension of extensions ? getChildElements(extensions, "p:ext") : []) {
+                    const threading = getChildElements(extension, "p15:threadingInfo")[0];
+                    parent = threading ? getChildElements(threading, "p15:parentCm")[0] : undefined;
+                    if (parent) break;
+                }
+                commentOf(paragraphs, cNode.getAttribute("authorId"), {
+                    commentId: classicId(cNode.getAttribute("authorId"), cNode.getAttribute("idx")),
+                    date: cNode.getAttribute("dt") || undefined,
+                    parentId: parent ? classicId(parent.getAttribute("authorId"), parent.getAttribute("idx")) : undefined,
+                });
+            }
+            // A modern comment, then each of its replies: a comment each, a paragraph each of their
+            // text's paragraphs (joined, they ran together).
+            const modernParagraphs = (holder: Element): OfficeContentNode[] => {
+                const body = getChildElements(holder, "p188:txBody")[0];
+                return body ? getChildElements(body, "a:p").map(drawingParagraph).filter(p => p.text?.trim()) : [];
+            };
+            for (const cNode of getElementsByTagName(cXml, "p188:cm")) {
+                const commentId = cNode.getAttribute("id") || undefined;
+                commentOf(modernParagraphs(cNode), cNode.getAttribute("authorId"), { commentId, date: cNode.getAttribute("created") || undefined });
+                const replies = getChildElements(cNode, "p188:replyLst")[0];
+                for (const reply of replies ? getChildElements(replies, "p188:reply") : []) {
+                    commentOf(modernParagraphs(reply), reply.getAttribute("authorId"), { commentId: reply.getAttribute("id") || undefined, date: reply.getAttribute("created") || undefined, parentId: commentId });
+                }
+            }
+        }
+        commentsByPart.set(target, comments);
+        return comments;
+    };
 
     let currentListId = 0;
     let runningListIndex = 0;
@@ -142,12 +264,14 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
     // Helper to parse a table node
     const parseTable = (tblNode: Element, xmlContentString: string): OfficeContentNode => {
         const rows: OfficeContentNode[] = [];
-        const trNodes = getElementsByTagName(tblNode, "a:tr");
+        // Each level read as children (see getChildElements): rows, cells and paragraphs nested in
+        // their own kind, read as descendants, were read again at each level (2.9 KB took 18 seconds).
+        const trNodes = getChildElements(tblNode, "a:tr");
 
         for (let rIndex = 0; rIndex < trNodes.length; rIndex++) {
             const trNode = trNodes[rIndex];
             const cells: OfficeContentNode[] = [];
-            const tcNodes = getElementsByTagName(trNode, "a:tc");
+            const tcNodes = getChildElements(trNode, "a:tc");
 
             for (let cIndex = 0; cIndex < tcNodes.length; cIndex++) {
                 const tcNode = tcNodes[cIndex];
@@ -155,9 +279,9 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
                 let cellText = '';
 
                 // Cells contain text bodies (txBody) which contain paragraphs
-                const txBody = getFirstElementByTagName(tcNode, "a:txBody");
+                const txBody = getChildElements(tcNode, "a:txBody")[0];
                 if (txBody) {
-                    const paragraphs = getElementsByTagName(txBody, "a:p");
+                    const paragraphs = getChildElements(txBody, "a:p");
                     for (const p of paragraphs) {
                         // Reuse paragraph parsing logic if possible, or duplicate for now
                         // For simplicity, duplicating basic logic here as the main loop one is tied to shapes
@@ -255,6 +379,21 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
         };
     };
 
+    /**
+     * Where an `a:hlinkClick` leads, for a run or a picture on the given slide: a hyperlink
+     * relationship is external, a slide relationship or a bare action (such as the next slide) internal.
+     */
+    const hlinkClickTarget = (hlinkClick: Element | null | undefined, slideNumber: number): { link: string; linkType: 'internal' | 'external' } | undefined => {
+        if (!hlinkClick) return undefined;
+        const rId = hlinkClick.getAttribute("r:id");
+        const action = hlinkClick.getAttribute("action");
+        const rel = rId ? slideRelsMap[slideNumber]?.[rId] : undefined;
+        if (rel?.type === "hyperlink") return { link: rel.target, linkType: "external" };
+        if (rel?.type === "slide") return { link: rel.target, linkType: "internal" };
+        if (action) return { link: action, linkType: "internal" };
+        return undefined;
+    };
+
     /** Extract an AST node for p:pic */
     const extractImageNode = (imageNode: Element, slideNumber: number, xmlContentString: string): OfficeContentNode | null => {
         const blip = getFirstElementByTagName(imageNode, "a:blip");
@@ -272,6 +411,8 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
         const cNvPr = nvPicPr ? getFirstElementByTagName(nvPicPr, "p:cNvPr") : null;
 
         const altText = cNvPr?.getAttribute("descr") || undefined;
+        // A picture that is a link (its click action is a hyperlink or a jump to a slide).
+        const link = hlinkClickTarget(cNvPr ? getFirstElementByTagName(cNvPr, "a:hlinkClick") : null, slideNumber);
 
         return {
             type: "image",
@@ -280,6 +421,7 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
             {
                 attachmentName,
                 altText,
+                ...link,
             }
         };
     }
@@ -364,6 +506,22 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
         return null;
     }
 
+    // SmartArt data parts read so far: each is shown once, on the first frame showing it (a part shown by
+    // many frames is one diagram, and its text was written again at each).
+    const readDiagrams = new Set<string>();
+    let diagramCount = 0;
+    /** A SmartArt frame's text as a list (see readDiagram); undefined for a frame that is not SmartArt. */
+    const extractDiagramNodes = (frameNode: Element, slideNumber: number): OfficeContentNode[] | undefined => {
+        const relIds = getFirstElementByTagName(frameNode, "dgm:relIds");
+        if (!relIds) return undefined;
+        const rId = relIds.getAttribute("r:dm");
+        const target = rId ? slideRelsMap[slideNumber]?.[rId]?.target : undefined;
+        const file = target ? fileByName.get(target) : undefined;
+        if (!file || !diagramDataRegex.test(file.path) || readDiagrams.has(file.path)) return [];
+        readDiagrams.add(file.path);
+        return diagramList(readDiagram(file.content.toString(), config), `smartart-${++diagramCount}`);
+    };
+
     /** Extract text and hyperlinks from a p:sp shape. */
     const extractShapeNodes = (spNode: Element, slideNumber: number, xmlContentString: string): OfficeContentNode[] => {
         const nodes: OfficeContentNode[] = [];
@@ -375,9 +533,9 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
 
         const isTitle = type === "title" || type === "ctrTitle";
 
-        const txBody = getFirstElementByTagName(spNode, "p:txBody");
+        const txBody = getChildElements(spNode, "p:txBody")[0];
         if (txBody) {
-            const paragraphs = getElementsByTagName(txBody, "a:p");
+            const paragraphs = getChildElements(txBody, "a:p");
 
             for (let i = 0; i < paragraphs.length; i++) {
                 const p = paragraphs[i];
@@ -399,18 +557,19 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
                 }
 
                 // Paragraph Alignment and List Detection
-                const pPr = getFirstElementByTagName(p, "a:pPr");
+                const pPr = getChildElements(p, "a:pPr")[0];
                 let isList = false;
                 let listType: 'ordered' | 'unordered' = 'unordered';
                 let lvl = 0;
 
                 if (pPr) {
                     const lvlAttr = pPr.getAttribute("lvl");
-                    if (lvlAttr) lvl = parseInt(lvlAttr);
+                    // DrawingML's levels are 0 to 8.
+                    if (lvlAttr) { const value = parseInt(lvlAttr, 10); lvl = Number.isFinite(value) ? Math.max(0, Math.min(8, value)) : 0; }
 
-                    const buAutoNum = getFirstElementByTagName(pPr, "a:buAutoNum");
-                    const buChar = getFirstElementByTagName(pPr, "a:buChar");
-                    const buBlip = getFirstElementByTagName(pPr, "a:buBlip");
+                    const buAutoNum = getChildElements(pPr, "a:buAutoNum")[0];
+                    const buChar = getChildElements(pPr, "a:buChar")[0];
+                    const buBlip = getChildElements(pPr, "a:buBlip")[0];
                     const buNode = getFirstElementByTagName(pPr, "a:bu");
 
                     if (buAutoNum) {
@@ -427,12 +586,12 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
 
                     const algn = pPr.getAttribute("algn");
                     if (algn) {
-                        const alignMap: Record<string, 'left' | 'center' | 'right' | 'justify'> = {
+                        const alignMap: Record<string, 'left' | 'center' | 'right' | 'justify'> = lookupTable({
                             'l': 'left',
                             'ctr': 'center',
                             'r': 'right',
                             'just': 'justify'
-                        };
+                        });
                         if (alignMap[algn]) {
                             (pNode.metadata as any).alignment = alignMap[algn];
                         }
@@ -592,25 +751,9 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
                             };
 
                             // Check for Hyperlinks
-                            const hlinkClick = getFirstElementByTagName(element, "a:hlinkClick");
-                            if (hlinkClick) {
-                                const rId = hlinkClick.getAttribute("r:id");
-                                const action = hlinkClick.getAttribute("action");
-                                let link: string | undefined;
-                                let linkType: "internal" | "external" | undefined;
-                                if (rId && slideRelsMap[slideNumber] && slideRelsMap[slideNumber][rId] && slideRelsMap[slideNumber][rId].type === "hyperlink") {
-                                    link = slideRelsMap[slideNumber][rId].target;
-                                    linkType = "external";
-                                } else if (rId && slideRelsMap[slideNumber] && slideRelsMap[slideNumber][rId] && slideRelsMap[slideNumber][rId].type === "slide") {
-                                    link = slideRelsMap[slideNumber][rId].target;
-                                    linkType = "internal";
-                                } else if (action) {
-                                    link = action;
-                                    linkType = "internal";
-                                }
-                                if (link) {
-                                    textNode.metadata = { link, linkType };
-                                }
+                            const link = hlinkClickTarget(getFirstElementByTagName(element, "a:hlinkClick"), slideNumber);
+                            if (link) {
+                                textNode.metadata = link;
                             }
 
                             activeNode.children?.push(textNode);
@@ -680,8 +823,12 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
      */
     function traverseSpTree(treeNode: Element, slideNumber: number, xmlContentString: string): OfficeContentNode[] {
         const nodes: OfficeContentNode[] = [];
-        // Process children in XML order (this preserves Z-order)
-        for (const child of Array.from(treeNode?.childNodes || [])) {
+        // Process children in XML order (this preserves Z-order), a branch of mc:AlternateContent in its place
+        const pending: Node[] = [];
+        const pushChildren = (children: ArrayLike<Node>) => { for (let i = children.length - 1; i >= 0; i--) pending.push(children[i]); };
+        pushChildren(treeNode?.childNodes || []);
+        while (pending.length) {
+            const child = pending.pop()!;
             if (!isElement(child)) {
                 continue;
             }
@@ -691,7 +838,7 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
 
             // Case 1: Normal shape
             if (tag === "p:sp") {
-                nodes.push(...extractShapeNodes(element, slideNumber, xmlContentString));
+                appendAll(nodes, extractShapeNodes(element, slideNumber, xmlContentString));
             }
             // Case 2: Inline picture
             else if (tag === "p:pic") {
@@ -702,15 +849,27 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
             }
             // Case 3: Chart or other graphic frame
             else if (tag === "p:graphicFrame") {
-                const tableNode = extractGraphicFrameNode(element, slideNumber, xmlContentString);
-                if (tableNode) {
-                    nodes.push(tableNode);
+                const diagram = extractDiagramNodes(element, slideNumber);
+                if (diagram) {
+                    appendAll(nodes, diagram);
+                } else {
+                    const tableNode = extractGraphicFrameNode(element, slideNumber, xmlContentString);
+                    if (tableNode) {
+                        nodes.push(tableNode);
+                    }
                 }
             }
             // Case 4: Grouped shape (recursive!)
             else if (tag === "p:grpSp") {
                 // Recurse into the group element itself which holds the child shapes
-                nodes.push(...traverseSpTree(element, slideNumber, xmlContentString));
+                appendAll(nodes, traverseSpTree(element, slideNumber, xmlContentString));
+            }
+            // Case 5: Shapes written for newer readers (an equation, a 3D model, a chart of a newer kind)
+            // beside a fallback for older ones: the branch this reader understands (see
+            // alternateContentBranch), read in place (the whole element was dropped).
+            else if (tag === "mc:AlternateContent") {
+                const branch = alternateContentBranch(element, PRESENTATION_NAMESPACES);
+                if (branch) pushChildren(branch.childNodes);
             }
         }
         return nodes;
@@ -742,9 +901,9 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
                 // Convert matched number to integer
                 const slideNum = parseInt(match[1]);
                 // Prepare map for this slide
-                slideRelsMap[slideNum] = {};
+                slideRelsMap[slideNum] = Object.create(null);
                 // Parse the rels XML
-                const relsXml = parseXmlString(file.content.toString());
+                const relsXml = parseXmlString(file.content.toString(), { config });
                 // Get all Relationship nodes
                 const relationships = getElementsByTagName(relsXml, "Relationship");
                 // Loop through each relationship node
@@ -821,13 +980,15 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
         if (file.path.match(appPropsFileRegex)) continue;
         if (file.path.match(customPropsFileRegex)) continue;
         if (file.path.includes("comment")) continue;
+        if (file.path.match(commentAuthorsRegex)) continue;
         // This loop treats every remaining file as a slide or note, so the presentation part
         // has to be skipped explicitly: it carries no slide number and would otherwise be
         // added to the deck as an empty slide.
         if (file.path.match(presentationFileRegex)) continue;
+        if (file.path.match(diagramDataRegex)) continue;
 
         const xmlContentString = file.content.toString();
-        const xml = parseXmlString(xmlContentString, { locator: config.includeRawContent });
+        const xml = parseXmlString(xmlContentString, { config, locator: config.includeRawContent });
 
         const slideMatch = file.path.match(slideNumberRegex);
         const slideNumber = slideMatch ? parseInt(slideMatch[1]) : 0;
@@ -866,7 +1027,7 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
 
         const spTree = getFirstElementByTagName(xml, "p:spTree");
         if (spTree) {
-            slideNode.children?.push(...traverseSpTree(spTree, nodeNumber, xmlContentString));
+            if (slideNode.children) appendAll(slideNode.children, traverseSpTree(spTree, nodeNumber, xmlContentString));
         }
 
         if (slideNode.children && slideNode.children.length > 0) {
@@ -888,25 +1049,15 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
                 if (!config.ignoreComments && slideRelsMap[slideNumber]) {
                     const commentRels = Object.values(slideRelsMap[slideNumber]).filter(r => r.type === "comments");
                     for (const rel of commentRels) {
-                        const cFile = files.find(f => f.path.endsWith(rel.target));
-                        if (cFile) {
-                            const cXml = parseXmlString(cFile.content.toString());
-                            const commentNodes = getElementsByTagName(cXml, "p:cm");
-                            for (const cNode of commentNodes) {
-                                const authorId = cNode.getAttribute("authorId");
-                                const authorData = authorId !== null ? authorMap[authorId] : undefined;
-                                const text = getElementsByTagName(cNode, "a:t").map(t => t.textContent || '').join('');
-                                if (text) {
-                                    if (!slidesMap[slideNumber].comments) slidesMap[slideNumber].comments = [];
-                                    slidesMap[slideNumber].comments.push({
-                                        type: 'comment',
-                                        text,
-                                        children: [{ type: 'text', text, formatting: {} }],
-                                        metadata: authorData && authorData.author ? { author: authorData.author } : undefined
-                                    });
-                                }
-                            }
-                        }
+                        // Each comments part once, on the first slide naming it (a part is one slide's):
+                        // attached for every relationship, or every slide, naming it, one large part
+                        // was repeated thousands of times (see commentsOfPart).
+                        if (attachedCommentParts.has(rel.target)) continue;
+                        attachedCommentParts.add(rel.target);
+                        const comments = commentsOfPart(rel.target);
+                        if (!comments.length) continue;
+                        const slideComments = slidesMap[slideNumber].comments ??= [];
+                        for (const comment of comments) slideComments.push(comment);
                     }
                 }
             }
@@ -919,6 +1070,7 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
     }
 
     const attachments: OfficeAttachment[] = [];
+    const attachmentsByName = attachmentLookup(attachments);
     const mediaFiles = files.filter(f => f.path.match(/ppt\/media\/.*/));
     const chartFiles = files.filter(f => f.path.match(/ppt\/charts\/chart\d+\.xml/));
 
@@ -929,14 +1081,9 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
             const attachment = createAttachment(media.path.split('/').pop() || 'image', media.content);
             attachments.push(attachment);
 
-            if (config.ocr) {
-                if (attachment.mimeType.startsWith('image/')) {
-                    try {
-                        attachment.ocrText = (await performOcr(media.content, { ...config.ocrConfig })).trim();
-                    } catch (e) {
-                        logWarning(OfficeWarningType.OCR_FAILED, config, attachment.name, e);
-                    }
-                }
+            if (config.ocr && attachment.mimeType.startsWith('image/')) {
+                const ocrText = await ocrDuringParse(media.content, config, attachment.name);
+                if (ocrText !== undefined) attachment.ocrText = ocrText;
             }
         }
 
@@ -953,7 +1100,7 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
 
             // Extract text from chart XML
             try {
-                const chartData = await extractChartData(chart.content);
+                const chartData = await extractChartData(chart.content, config);
                 // Assign chartData to attachment
                 attachment.chartData = chartData;
             }
@@ -967,7 +1114,7 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
             for (const node of nodes) {
                 if ('attachmentName' in (node.metadata || {})) {
                     const meta = node.metadata as ImageMetadata | ChartMetadata;
-                    const attachment = attachments.find(a => a.name === meta.attachmentName);
+                    const attachment = attachmentsByName.get(meta.attachmentName);
                     if (attachment) {
                         if (node.type === 'image') {
                             attachment.altText = (meta as ImageMetadata).altText;
@@ -975,7 +1122,7 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
                                 node.text = attachment.ocrText;
                         }
                         if (node.type === 'chart') {
-                            node.text = attachment.chartData?.rawTexts.join(config.newlineDelimiter);
+                            node.text = attachmentsByName.chartText(attachment, config.newlineDelimiter);
                         }
                     }
                 }
