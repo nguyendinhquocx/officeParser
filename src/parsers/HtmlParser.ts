@@ -9,6 +9,7 @@ import { isSafeHtmlAttributeName, iframeAllowed } from '../utils/sanitize.js';
 import { setOwn } from '../utils/lookupUtils.js';
 import { cellSpan, MAX_COL_SPAN, MAX_ROW_SPAN } from '../utils/numberUtils.js';
 import { appendAll } from '../utils/nodeListUtils.js';
+import { textDecoder } from '../utils/encodingUtils.js';
 
 /**
  * Maximum element nesting depth accepted from an HTML/XHTML source before the parser gives up
@@ -974,7 +975,7 @@ const decodeHtmlBytes = (buffer: Buffer): string => {
     const declared = declaredEncoding(Buffer.from(buffer.subarray(0, 1024)).toString('latin1'));
     if (declared) {
         try {
-            return new TextDecoder(declared).decode(buffer);
+            return textDecoder(declared).decode(buffer);
         } catch { /* an encoding this runtime does not decode */ }
     }
     return new TextDecoder('utf-8').decode(buffer);
@@ -1112,6 +1113,8 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
     const noteNodesByKey = new Map<string, OfficeContentNode>();
     // Set while a definition is read: a back-link in it (to its reference) is plumbing, not the note's text.
     let readingFootnote = 0;
+    // Set while a table's `<thead>` is read: every cell in it is a header cell, a `<td>` too.
+    let inTableHead = 0;
     const hasToken = (value: string | undefined, token: string): boolean => !!value && value.split(/\s+/).includes(token);
     /** A note's back-link to its reference: this library's, GitHub's, Pandoc's and markdown-it's. */
     const isFootnoteBackLink = (node: HtmlNode): boolean => node.tagName === 'a' && (
@@ -1296,11 +1299,25 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
                     if (parts.includes('line-through')) newFormatting.strikethrough = true;
                 }
 
+                // A colour of the text's own only. `inherit`, `unset` (which is `inherit` for a colour)
+                // and `currentcolor` name the colour the text already has, and `initial` and `revert` the
+                // default one: kept as written, `color: inherit` (what an editor adds to a highlight) was a
+                // colour, and the text was written back in a `<span style="color: inherit">`.
                 const color = decls.get('color');
-                if (color) newFormatting.color = color;
+                if (color) {
+                    const keyword = color.trim().toLowerCase();
+                    if (keyword === 'initial' || keyword === 'revert' || keyword === 'revert-layer') delete newFormatting.color;
+                    else if (keyword !== 'inherit' && keyword !== 'unset' && keyword !== 'currentcolor') newFormatting.color = color;
+                }
 
+                // The same for a background, which is not inherited: every keyword is none, but `inherit`
+                // (the background around it) and `currentcolor` (a background in the text's colour).
                 const background = getDeclaration(decls, 'background-color');
-                if (background) newFormatting.backgroundColor = background;
+                if (background) {
+                    const keyword = background.trim().toLowerCase();
+                    if (keyword === 'transparent' || keyword === 'initial' || keyword === 'unset' || keyword === 'revert' || keyword === 'revert-layer') delete newFormatting.backgroundColor;
+                    else if (keyword !== 'inherit') newFormatting.backgroundColor = background;
+                }
 
                 const size = getDeclaration(decls, 'font-size');
                 if (size) newFormatting.size = size;
@@ -1878,7 +1895,14 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
                 // caption became a header row in Markdown and the rest was lost from plain text.
                 const rows: OfficeContentNode[] = [];
                 const before: OfficeContentNode[] = [];
-                for (const child of parseChildren(node, newFormatting, listContext)) (child.type === 'row' ? rows : before).push(child);
+                // A table in another's head is no part of that head.
+                const outerTableHead = inTableHead;
+                inTableHead = 0;
+                try {
+                    for (const child of parseChildren(node, newFormatting, listContext)) (child.type === 'row' ? rows : before).push(child);
+                } finally {
+                    inTableHead = outerTableHead;
+                }
                 const tableNode: OfficeContentNode = {
                     type: 'table',
                     metadata: { anchorIds: anchorIds.length > 0 ? anchorIds : undefined, align: tableAlign } as TableMetadata,
@@ -1891,6 +1915,14 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
                 if (!before.length) return tableNode;
                 before.push(tableNode);
                 return before;
+            }
+            if (tagName === 'thead') {
+                inTableHead++;
+                try {
+                    return parseChildren(node, newFormatting, listContext);
+                } finally {
+                    inTableHead--;
+                }
             }
             if (tagName === 'tr') {
                 // What a row holds outside its cells goes before the table (see the table's branch).
@@ -1934,7 +1966,12 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
                         colSpan: colSpan > 1 ? colSpan : undefined,
                         rowSpan: rowSpan > 1 ? rowSpan : undefined,
                         align: cellAlign,
-                        anchorIds: anchorIds.length > 0 ? anchorIds : undefined
+                        anchorIds: anchorIds.length > 0 ? anchorIds : undefined,
+                        // A header cell (`<th>`, or any cell of the table's `<thead>`) is marked as the
+                        // Word, ODF and PDF parsers mark one, which is what every generator reads a header
+                        // row by (see isHeaderRow). Unmarked, a header row whose text is not bold was
+                        // written back as an ordinary row (`<td>`), and its table had no header.
+                        style: tagName === 'th' || inTableHead > 0 ? 'header' : undefined
                     } as CellMetadata,
                     children: parseChildren(node, newFormatting, listContext),
                     htmlAttributes: collectHtmlAttributes(node, ['colspan', 'rowspan', 'align'])

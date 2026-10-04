@@ -120,7 +120,7 @@ export enum OfficeWarningType {
     REPEATED_CONTENT_LIMIT_EXCEEDED = 'REPEATED_CONTENT_LIMIT_EXCEEDED',
     /** A DOCX alternative-format chunk (`w:altChunk`) could not be read (its part is missing, of a format not read, a DOCX inside a DOCX chunk, or unreadable: not a ZIP, no document part, nested too deep); its content is not in the AST, and the rest of the document is */
     ALT_CHUNK_NOT_READ = 'ALT_CHUNK_NOT_READ',
-    /** A part of the document its package lists (an EPUB chapter) was not read: it is missing from the archive, or encrypted; its content is not in the AST */
+    /** A part of the document was not read, and what it holds is not in the AST: an EPUB chapter its package lists that is missing from the archive or encrypted; or, in a PPTX, the presentation's slide list or relationships, or the relationships of a notes page or a slide master, that are not XML */
     CONTENT_PART_NOT_READ = 'CONTENT_PART_NOT_READ',
     /** A metadata override could not be represented in the destination format's vocabulary */
     METADATA_NOT_REPRESENTABLE = 'METADATA_NOT_REPRESENTABLE',
@@ -142,7 +142,7 @@ export enum OfficeWarningType {
     NO_SLIDES_FOUND = 'NO_SLIDES_FOUND',
     /** A PDF's tagged-structure tree was absent, incomplete, or flagged unreliable; heuristics were used instead */
     PDF_STRUCT_TREE_UNRELIABLE = 'PDF_STRUCT_TREE_UNRELIABLE',
-    /** A PDF page yielded mostly unmappable glyphs (broken/missing ToUnicode); extracted text is likely garbage */
+    /** A fifth or more of a PDF's characters (of at least 50) are unmappable glyphs (broken/missing ToUnicode); extracted text is likely garbage */
     PDF_TEXT_ENCODING_SUSPECT = 'PDF_TEXT_ENCODING_SUSPECT',
     /** A PDF yielded essentially no text; it is very likely a scanned/image-only document needing OCR */
     PDF_NO_TEXT_EXTRACTED = 'PDF_NO_TEXT_EXTRACTED',
@@ -1778,8 +1778,13 @@ export type FootnoteSyntax = 'caret' | 'none';
 export type CitationSyntax = 'at' | 'none';
 /** `[[Page]]` wikilinks (`'double-bracket'`), or `'none'`. */
 export type WikilinkSyntax = 'double-bracket' | 'none';
-/** `{width=50%}` attribute lists (`'brace'`), or `'none'`. */
-export type AttributeListSyntax = 'brace' | 'none';
+/**
+ * `{…}` attribute lists: after an image (`![alt](src){width=50%}`) and on the line under a pipe table
+ * (`{align=right}`, where the table stands on the page) with `'brace'`; after an image alone with
+ * `'brace-inline'`, which is what Pandoc reads (it has attributes for an image, and shows a list under
+ * a table as text); or `'none'`.
+ */
+export type AttributeListSyntax = 'brace' | 'brace-inline' | 'none';
 /**
  * How an `embed` node is written to Markdown:
  * - `'html'` (default): the single-line `<div data-youtube-video="ID">` / `<iframe src=...>` block
@@ -1855,9 +1860,10 @@ export interface MarkdownDialectConfig {
     /** Inline `$...$`/block `$$...$$` math delimiters (`'dollar'`), or `'none'` for bare LaTeX text. */
     math?: 'dollar' | 'none';
     /**
-     * Pandoc-style `{width=50% .centered}` attribute lists after images/tables (`'brace'`), or
-     * `'none'`. Omit to inherit from `extends`. Passing a boolean is deprecated: `true` = `'brace'`,
-     * `false` = `'none'` (removed next major).
+     * `{width=50% align=center}` attribute lists: after an image and under a table (`'brace'`), after
+     * an image alone (`'brace-inline'`, all that Pandoc reads), or `'none'`. Omit to inherit from
+     * `extends`. Passing a boolean is deprecated: `true` = the preset's own syntax (`'brace'` when the
+     * preset has none), `false` = `'none'` (removed next major).
      */
     attributeLists?: AttributeListSyntax | DeprecatedDialectToggle;
     /**
@@ -2461,7 +2467,11 @@ export interface TextFormatting {
  * Metadata for a slide in PowerPoint.
  */
 export interface SlideMetadata {
-    /** The slide number (1-based). */
+    /**
+     * The slide's place in the presentation (1-based), as the presentation numbers it: for PPTX the
+     * place its slide list gives the slide, whatever number its part's file name carries. A slide
+     * master's is the number of its part.
+     */
     slideNumber: number;
 
     /**
@@ -2632,7 +2642,11 @@ export interface TableMetadata {
     /** Unique anchor IDs for internal linking. */
     anchorIds?: string[];
     /**
-     * Layout alignment of the table on the page (e.g. an editor's custom table node).
+     * Layout alignment of the table on the page (e.g. an editor's custom table node): where the table
+     * stands, not how the text in its columns is aligned, which is each cell's own
+     * (`CellMetadata.align`). HTML holds it as `data-align` on the `<table>`, and Markdown as an
+     * attribute list under the table (`{align=right}`) in a dialect that writes one there
+     * (`attributeLists: 'brace'`, as `extended` has).
      * @example 'center'
      */
     align?: 'left' | 'center' | 'right';

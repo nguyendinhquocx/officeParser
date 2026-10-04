@@ -1836,7 +1836,7 @@ async function missingMainPartTests() {
         `got ${JSON.stringify((await docxAst.to('text')).value)}`);
 
     const pptx = Buffer.from(zipSync({
-        'ppt/presentation.xml': zipEnc('<p:presentation/>'),
+        'ppt/presentation.xml': zipEnc('<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>'),
         'ppt/slides/slide1.xml': zipEnc('<?xml version="1.0"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Hello slide</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>'),
     }));
     const pptxAst = await OfficeParser.parseOffice(pptx, { fileType: 'pptx', ...QUIET } as any);
@@ -1880,7 +1880,7 @@ async function incompleteArchiveWarningTests() {
 
     // PowerPoint can save a deck with no slides at all, so this warns rather than failing.
     const noSlides = collect();
-    const pptx = Buffer.from(zipSync({ 'ppt/presentation.xml': zipEnc('<p:presentation/>') }));
+    const pptx = Buffer.from(zipSync({ 'ppt/presentation.xml': zipEnc('<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>') }));
     const pptxAst = await OfficeParser.parseOffice(pptx, { fileType: 'pptx', ...noSlides.config });
     const slideWarnings = noSlides.issues.filter(i => i.code === 'NO_SLIDES_FOUND');
     check('empty archive: a slide-less presentation resolves', pptxAst.type === 'pptx');
@@ -1964,7 +1964,7 @@ async function configOwnershipTests() {
     });
 
     // A presentation with no slides warns, which gives each parse exactly one warning to trace.
-    const slideless = Buffer.from(zipSync({ 'ppt/presentation.xml': zipEnc('<p:presentation/>') }));
+    const slideless = Buffer.from(zipSync({ 'ppt/presentation.xml': zipEnc('<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>') }));
 
     const shared = fullConfig();
     const PARSE_COUNT = 4;
@@ -2629,7 +2629,7 @@ async function parserHardeningTests() {
     await timed('md: indented code of 200k blank lines before its last line parses', () => parseQuiet(Buffer.from('    a' + '\n'.repeat(200000) + '    b\n'), 'md'));
     await timed('html: 100k unclosed <style>s parse', () => parseQuiet(Buffer.from('<p><style>'.repeat(100000)), 'html'));
     await timed('html: 80k cells of unclosed <script>s parse', () => parseQuiet(Buffer.from('<table><tr>' + '<td><script>'.repeat(80000)), 'html'));
-    await timed('csv: a 1 MB run of digits is checked as a formula', async () => csvSafeCell('1'.repeat(1_000_000) + 'x'));
+    await timed('csv: a 1 MB run of digits is checked as a formula', async () => csvSafeCell('1'.repeat(1_000_000) + 'x', ','));
     await timed('xlsx: 1 MB of & in an inline string decodes', () => parseQuiet(withSheetData('<row r="1"><c r="A1" t="inlineStr"><is><t>' + '&amp;'.repeat(200000) + '</t></is></c></row>'), 'xlsx'));
     await timed('docx: an image width of 200 KB of spaces is written', () => OfficeGenerator.generate(astWith([{ type: 'paragraph', children: [{ type: 'image', metadata: { url: 'a.png', width: '1' + ' '.repeat(200000) + 'x' } }] }]), 'docx' as any, { onWarning: () => {} } as any));
     await timed('md: block math of 200 KB of spaces is written inline', () => OfficeGenerator.generate(astWith([{ type: 'paragraph', children: [{ type: 'text', text: 'a' }, { type: 'code', text: 'x' + ' '.repeat(200000) + 'y', metadata: { math: 'block' } }] }]), 'md' as any, { onWarning: () => {} } as any));
@@ -2836,6 +2836,23 @@ async function parserHardeningTests() {
         'ppt/comments/comment1.xml': `<?xml version="1.0"?><p:cmLst ${pns}>${'<p:cm authorId="0"><p:text>c</p:text></p:cm>'.repeat(20000)}</p:cmLst>`,
     }), 'pptx')) as any;
     check('pptx: a comments part named 2,000 times is attached once', sharedComments.ast?.content[0]?.comments?.length === 20000, `${sharedComments.ast?.content[0]?.comments?.length} ${sharedComments.error}`);
+    // The same for the parts a presentation and a slide name by relationship: one notes page named by
+    // 2,000 of a slide's relationships is its notes once, and a slide list naming one slide 100,000
+    // times shows it once.
+    const relationshipsOf = (rels: string) => `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${rels}</Relationships>`;
+    const sharedNotes = await heapBudget('pptx: one notes page named 2,000 times is read', () => parseQuiet(pptxOf({
+        'ppt/slides/_rels/slide1.xml.rels': relationshipsOf(Array.from({ length: 2000 }, (_, i) => `<Relationship Id="rId${i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>`).join('')),
+        'ppt/notesSlides/notesSlide1.xml': `<?xml version="1.0"?><p:notes ${pns}><p:cSld><p:spTree>${'<p:sp><p:txBody><a:p><a:r><a:t>n</a:t></a:r></a:p></p:txBody></p:sp>'.repeat(20000)}</p:spTree></p:cSld></p:notes>`,
+    }), 'pptx')) as any;
+    check('pptx: a notes page named 2,000 times is the slide\'s notes once', sharedNotes.ast?.content[0]?.notes?.length === 1 && sharedNotes.ast.content[0].notes[0].children.length === 20000, `${sharedNotes.ast?.content[0]?.notes?.length} ${sharedNotes.error}`);
+    let repeatedSlide: any;
+    await timed('pptx: a slide list naming one slide 100,000 times is read', async () => {
+        repeatedSlide = await parseQuiet(pptxOf({
+            'ppt/presentation.xml': `<?xml version="1.0"?><p:presentation ${pns}><p:sldIdLst>${'<p:sldId id="256" r:id="rId2"/>'.repeat(100000)}</p:sldIdLst></p:presentation>`,
+            'ppt/_rels/presentation.xml.rels': relationshipsOf('<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>'),
+        }), 'pptx');
+    });
+    check('pptx: a slide named 100,000 times by the slide list is shown once', repeatedSlide.ast?.content.length === 1, `${repeatedSlide.ast?.content.length} ${repeatedSlide.error}`);
 
     // XML readers: content nested in its own kind is read once per level, not again at each (notes in
     // notes doubled per level; tables in tables, text boxes in text boxes, shared-string runs and PPTX
@@ -3351,9 +3368,14 @@ async function parserHardeningTests() {
     const linkStarted = Date.now();
     const nestedLinks = await parseQuiet(docxOf(`<w:p>${'<w:hyperlink w:anchor="a">'.repeat(400)}${'<w:r><w:t>x</w:t></w:r>'.repeat(2000)}${'</w:hyperlink>'.repeat(400)}</w:p>`), 'docx');
     check('docx: 2,000 runs in hyperlinks nested 400 deep parse in linear time', Date.now() - linkStarted < 5000, `${Date.now() - linkStarted}ms`);
+    const atBound = await parseQuiet(docxOf(`<w:p>${'<w:hyperlink w:anchor="a">'.repeat(512)}<w:r><w:t>x</w:t></w:r>${'</w:hyperlink>'.repeat(512)}</w:p>`), 'docx');
+    check('docx: hyperlinks nested at the 512-level bound parse', !atBound.error, String(atBound.error));
     let deepLinksError: any;
-    try { await OfficeParser.parseOffice(docxOf(`<w:p>${'<w:hyperlink w:anchor="a">'.repeat(5000)}<w:r><w:t>x</w:t></w:r>${'</w:hyperlink>'.repeat(5000)}</w:p>`), { fileType: 'docx', onWarning: () => {} } as any); } catch (e) { deepLinksError = e; }
-    check('docx: hyperlinks nested past what the stack holds are a nesting error', deepLinksError?.officeIssue?.code === 'MAX_NESTING_DEPTH_EXCEEDED', String(deepLinksError));
+    try { await OfficeParser.parseOffice(docxOf(`<w:p>${'<w:hyperlink w:anchor="a">'.repeat(513)}<w:r><w:t>x</w:t></w:r>${'</w:hyperlink>'.repeat(513)}</w:p>`), { fileType: 'docx', onWarning: () => {} } as any); } catch (e) { deepLinksError = e; }
+    check('docx: hyperlinks nested past the 512-level bound are a nesting error', deepLinksError?.officeIssue?.code === 'MAX_NESTING_DEPTH_EXCEEDED', String(deepLinksError));
+    let deepTablesError: any;
+    try { await OfficeParser.parseOffice(docxOf(`${'<w:tbl><w:tr><w:tc>'.repeat(5000)}<w:p><w:r><w:t>x</w:t></w:r></w:p>${'</w:tc></w:tr></w:tbl>'.repeat(5000)}`), { fileType: 'docx', onWarning: () => {} } as any); } catch (e) { deepTablesError = e; }
+    check('docx: tables nested past what the stack holds are a nesting error', deepTablesError?.officeIssue?.code === 'MAX_NESTING_DEPTH_EXCEEDED', String(deepTablesError));
     const linkedRuns = JSON.stringify(nestedLinks.ast?.content ?? []).split('"link":"#a"').length - 1;
     check('docx: runs in nested hyperlinks keep the outermost link', !nestedLinks.error && linkedRuns === 2000, `${nestedLinks.error} ${linkedRuns}`);
 

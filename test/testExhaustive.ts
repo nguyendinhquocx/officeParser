@@ -14,6 +14,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import type { ImageMetadata, OfficeContentNode, OfficeParserAST } from '../src/types';
 import { parseXmlString } from '../src/utils/xmlUtils';
+import { decodeWindows1252, textDecoder } from '../src/utils/encodingUtils';
 import { ocrTestHooks, performOcr, terminateOcr } from '../src/utils/ocrUtils';
 import { imageFromPdf, imageToTextPdf, newDecodeBudget } from '../src/utils/textPdf';
 import { decodeBase64, hexColor, isHeaderRow, lengthToPt, resolveZipInstant, sniffImageSize, toBookmarkNameRaw } from '../src/utils/officeGenUtils';
@@ -1310,11 +1311,16 @@ async function testGeneratedOutput(): Promise<void> {
     }
 
     // 4.B: a highlight emits <mark> (Tiptap's Highlight extension parseHTML matches exactly `mark`),
-    // not a <span style="background-color">, and the generated <mark> re-parses as a highlight.
-    const hlHtml = String((await OfficeGenerator.generate(await parseHtml('<p><span style="background-color:#ffff00">hi</span></p>'), 'html', { htmlConfig: { standalone: false } })).value);
+    // not a <span style="background-color">, and the generated <mark> re-parses as a highlight. A
+    // highlight in a colour of its own carries it; one in the default colour is a plain <mark> (see
+    // testEditorSaveShapes).
+    const hlHtml = String((await OfficeGenerator.generate(await parseHtml('<p><span style="background-color:#b8f5c0">hi</span></p>'), 'html', { htmlConfig: { standalone: false } })).value);
     assert.ok(/<mark[^>]*background-color/.test(hlHtml), '4.B: highlight emits <mark> carrying the background-color');
     assert.ok(!/<span[^>]*background-color/.test(hlHtml), '4.B: highlight is not a background-color <span>');
-    assert.ok(collectAllNodes(await parseHtml(hlHtml)).some(n => !!n.formatting?.backgroundColor), '4.B: generated <mark> round-trips back to a highlight');
+    assert.ok(collectAllNodes(await parseHtml(hlHtml)).some(n => n.formatting?.backgroundColor === '#b8f5c0'), '4.B: generated <mark> round-trips back to a highlight in its colour');
+    const defaultHlHtml = String((await OfficeGenerator.generate(await parseHtml('<p><span style="background-color:#ffff00">hi</span></p>'), 'html', { htmlConfig: { standalone: false } })).value);
+    assert.ok(defaultHlHtml.includes('<mark>hi</mark>') && !/<span[^>]*background-color/.test(defaultHlHtml), '4.B: a highlight in the default colour is a plain <mark>');
+    assert.ok(collectAllNodes(await parseHtml(defaultHlHtml)).some(n => !!n.formatting?.backgroundColor), '4.B: a plain <mark> round-trips back to a highlight');
 
     // 4.C: a footnote body is searchable in RAG chunks (folded into the referencing node's text).
     const fnChunks = ((await OfficeGenerator.generate(await parseMd('Para[^1].\n\n[^1]: Searchable footnote body.'), 'chunks')).value as any[]).map(c => c.text).join('  ');
@@ -1494,12 +1500,32 @@ async function testGeneratedOutput(): Promise<void> {
     const plainHtml = String((await OfficeGenerator.generate(await parseMd('| A | B |\n| --- | --- |\n| 1 | 2 |'), 'html', { htmlConfig: { standalone: false } })).value);
     assert.ok(!/text-align/.test(plainHtml), '8.G: an unaligned table emits no text-align');
 
-    // 8.G: html -> md reads BOTH the new per-cell `text-align` form and the existing table-level
-    // `<table data-align>` form.
+    // 8.G: html -> md reads the per-cell `text-align` form into the separator. The table-level
+    // `<table data-align>` form is where the table stands on the page, not its columns' alignment
+    // (it was written as every column's, so a table an editor had centred came back with every
+    // column centred), and how a Markdown table's columns are aligned is not where it stands either.
     const fromCells = String((await OfficeGenerator.generate(await parseHtml('<table><thead><tr><th style="text-align:right">A</th></tr></thead><tbody><tr><td style="text-align:right">1</td></tr></tbody></table>'), 'md', { mdConfig: { dialect: 'extended' } })).value);
     assert.ok(/\|\s*---:\s*\|/.test(fromCells), '8.G: html -> md reads per-cell text-align into the separator');
     const fromTableAlign = String((await OfficeGenerator.generate(await parseHtml('<table data-align="center"><thead><tr><th>A</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table>'), 'md', { mdConfig: { dialect: 'extended' } })).value);
-    assert.ok(/\|\s*:---:\s*\|/.test(fromTableAlign), '8.G: html -> md still reads the table-level data-align form');
+    assert.strictEqual(fromTableAlign, '| A |\n| --- |\n| 1 |\n{align=center}', '8.G: a table\'s place on the page is written under it, not as its columns\' alignment');
+    const fromTableAlignGithub = String((await OfficeGenerator.generate(await parseHtml('<table data-align="center"><thead><tr><th>A</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table>'), 'md', { mdConfig: { dialect: 'github' } })).value);
+    assert.strictEqual(fromTableAlignGithub, '| A |\n| --- |\n| 1 |', '8.G: a dialect without attribute lists writes no placement');
+    // Pandoc reads an attribute list after an image, and shows one under a table as a paragraph of
+    // text (`<p>{align=center}</p>`, pandoc 3.12): its dialect writes the first and not the second.
+    const placedWithImage = await parseHtml('<table data-align="center"><thead><tr><th>A</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table><p><img src="a.png" alt="x" width="50%"></p>');
+    const inDialect = async (dialect: any) => String((await OfficeGenerator.generate(placedWithImage, 'md', { mdConfig: { dialect } })).value);
+    assert.strictEqual(await inDialect('pandoc'), '| A |\n| --- |\n| 1 |\n\n![x](a.png){width=50%}', '8.G: the pandoc dialect writes an image\'s attribute list, and none under a table');
+    assert.strictEqual(await inDialect('extended'), '| A |\n| --- |\n| 1 |\n{align=center}\n\n![x](a.png){width=50%}', '8.G: the extended dialect writes both');
+    assert.strictEqual(await inDialect({ extends: 'extended', attributeLists: 'brace-inline' }), await inDialect('pandoc'), '8.G: brace-inline is an attribute list after an image alone');
+    assert.strictEqual(await inDialect({ extends: 'pandoc', attributeLists: 'brace' }), await inDialect('extended'), '8.G: brace is an attribute list under a table too');
+    // The deprecated `true` is the preset's own syntax, and `brace` for a preset that has none.
+    assert.strictEqual(await inDialect({ extends: 'pandoc', attributeLists: true }), await inDialect('pandoc'), '8.G: attributeLists: true keeps the pandoc preset\'s syntax');
+    assert.strictEqual(await inDialect({ extends: 'github', attributeLists: true }), await inDialect('extended'), '8.G: attributeLists: true on a preset with none is brace');
+    assert.strictEqual(await inDialect({ extends: 'extended', attributeLists: false }), '| A |\n| --- |\n| 1 |\n\n![x](a.png)', '8.G: attributeLists: false writes none');
+    const uniformColumns = await parseMd('| A | B |\n| ---: | ---: |\n| 1 | 2 |');
+    assert.strictEqual((uniformColumns.content[0].metadata as any)?.align, undefined, '8.G: columns aligned alike do not place their table on the page');
+    assert.ok(!/data-align|margin-/.test(String((await OfficeGenerator.generate(uniformColumns, 'html', { htmlConfig: { standalone: false } })).value)), '8.G: a table of right-aligned columns is not moved to the right of the page');
+    assert.strictEqual((await parseMd('| A |\n| --- |\n| 1 |\n{align=right}')).content[0].metadata && ((await parseMd('| A |\n| --- |\n| 1 |\n{align=right}')).content[0].metadata as any).align, 'right', '8.G: an attribute list after a table still places it');
 
     // ── Round 9: embeds (leaf directive, dialect.embeds modes, parser parity, gated contract) ──
     const embedMeta = (ast: OfficeParserAST) => collectAllNodes(ast).find(n => n.type === 'embed')?.metadata as any;
@@ -1764,6 +1790,200 @@ async function testPptxComments(): Promise<void> {
         ['MODERN REPLY', ['MODERN REPLY'], { commentId: '{R1}', author: 'Replier Bob', initials: 'RB', date: '2021-01-02T00:00:00.000', parentId: '{C1}' }],
     ], 'PPTX: classic and modern comments, their paragraphs, and replies with their date, initials and thread');
     console.log('  PPTX comments: All assertions passed ✓');
+}
+
+/**
+ * PowerPoint parts are related by relationships, not by the numbers in their file names: the slides are
+ * in the order of the presentation's slide list, a slide's notes are the notes page it names, and a
+ * notes page's and a slide master's `r:id`s are their own.
+ */
+async function testPptxSlideOrderAndParts(): Promise<void> {
+    const { relsOf, rel, parse } = ooxmlHelpers();
+    const pns = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"';
+    const shape = (runs: string, placeholder = '') => `<p:sp><p:nvSpPr><p:cNvPr id="2" name="T"/><p:cNvSpPr/><p:nvPr>${placeholder}</p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:p>${runs}</a:p></p:txBody></p:sp>`;
+    const run = (text: string, linkId = '') => `<a:r>${linkId ? `<a:rPr><a:hlinkClick r:id="${linkId}"/></a:rPr>` : ''}<a:t>${text}</a:t></a:r>`;
+    const part = (root: string, shapes: string) => `<?xml version="1.0"?><p:${root} ${pns}><p:cSld><p:spTree>${shapes}</p:spTree></p:cSld></p:${root}>`;
+    const slide = (text: string) => part('sld', shape(run(text)));
+    const notes = (text: string) => part('notes', shape(run(text), '<p:ph type="body" idx="1"/>'));
+    const presentation = (...ids: string[]) => `<?xml version="1.0"?><p:presentation ${pns}><p:sldIdLst>${ids.map((id, i) => `<p:sldId id="${256 + i}" r:id="${id}"/>`).join('')}</p:sldIdLst></p:presentation>`;
+    const link = (id: string, url: string) => `<Relationship Id="${id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="${url}" TargetMode="External"/>`;
+    const deck = (parts: Record<string, string>) => Buffer.from(zipSync(Object.fromEntries(Object.entries(parts).map(([name, value]) => [name, strToU8(value)]))));
+    /** Each slide as its number, its text, and its notes' ids and text. */
+    const outline = (ast: OfficeParserAST) => ast.content.map(s => [(s.metadata as any).slideNumber, s.children?.map(c => c.text).join('|'), ...(s.notes ?? []).map(n => `${(n.metadata as any).noteId}=${n.children?.map(c => c.text).join('|')}`)]);
+    const linksIn = (nodes: OfficeContentNode[]): string[] => nodes.flatMap(n => [...((n.metadata as any)?.link ? [`${n.text}=>${(n.metadata as any).link}`] : []), ...linksIn(n.children ?? [])]);
+
+    // The slide list orders the deck. Here it shows `slide7.xml` first and `slide2.xml` second, and no
+    // longer names `slide1.xml`, a deleted slide whose part an editor left in the package; a slide is
+    // numbered by its place, as PowerPoint numbers it. An entry naming no slide part, and a second one
+    // naming a slide already listed, add nothing.
+    const reordered = deck({
+        'ppt/presentation.xml': presentation('rId7', 'rIdMissing', 'rId2', 'rId7', 'rIdMaster'),
+        'ppt/_rels/presentation.xml.rels': relsOf(rel('rId1', 'slide', 'slides/slide1.xml') + rel('rId2', 'slide', '/ppt/slides/slide2.xml') + rel('rId7', 'slide', 'slides/slide7.xml') + rel('rIdMaster', 'slideMaster', 'slideMasters/slideMaster1.xml')),
+        'ppt/slides/slide1.xml': slide('DELETED'),
+        'ppt/slides/slide2.xml': slide('SHOWN SECOND'),
+        'ppt/slides/slide7.xml': slide('SHOWN FIRST'),
+        // The only notes page is the second slide's, and both of that slide's relationships to it are one page.
+        'ppt/slides/_rels/slide2.xml.rels': relsOf(rel('rId1', 'notesSlide', '../notesSlides/notesSlide1.xml') + rel('rId3', 'notesSlide', '../notesSlides/notesSlide1.xml') + link('rId2', 'https://slide.example/')),
+        'ppt/notesSlides/notesSlide1.xml': part('notes', shape(run('NOTES OF THE SECOND', 'rId2'), '<p:ph type="body" idx="1"/>')),
+        'ppt/notesSlides/_rels/notesSlide1.xml.rels': relsOf(rel('rId1', 'slide', '../slides/slide2.xml') + link('rId2', 'https://notes.example/')),
+        // A notes page no slide names is no slide's.
+        'ppt/notesSlides/notesSlide7.xml': notes('NOTES OF NO SLIDE'),
+        'ppt/slideMasters/slideMaster1.xml': part('sldMaster', shape(run('MASTER', 'rId2'))),
+        'ppt/slideMasters/_rels/slideMaster1.xml.rels': relsOf(link('rId2', 'https://master.example/')),
+    });
+    const { ast: shown } = await parse(reordered, {}, 'pptx');
+    assert.deepStrictEqual(outline(shown), [[1, 'SHOWN FIRST'], [2, 'SHOWN SECOND', 'slide-note-2=NOTES OF THE SECOND']],
+        'PPTX: slides are in the order of the slide list, numbered by their place, with the notes page each names; a slide the list does not name is not read');
+    assert.ok(!JSON.stringify(shown).includes('NOTES OF NO SLIDE'), 'PPTX: a notes page no slide names is not read');
+    // A notes page's and a slide master's ids are their own, not those of the slide with their number.
+    assert.deepStrictEqual(linksIn(shown.content[1].notes!), ['NOTES OF THE SECOND=>https://notes.example/'], 'PPTX: a link in a notes page is the notes page\'s relationship');
+    assert.deepStrictEqual(linksIn(shown.auxiliary!.slideMasters!), ['MASTER=>https://master.example/'], 'PPTX: a link in a slide master is the master\'s relationship');
+    assert.strictEqual((await parse(reordered, { ignoreNotes: true }, 'pptx')).ast.content.some(s => s.notes?.length), false, 'PPTX: ignoreNotes leaves the notes out');
+    // What is written from the tree follows the deck: a slide's number in a chunk, and the order of the text.
+    const chunks = (await shown.to('chunks', { chunksConfig: { strategy: 'document-structure', splitBy: 'slide' } })).value;
+    assert.deepStrictEqual(chunks.filter(c => c.text.startsWith('SHOWN')).map(c => [c.metadata.slideNumber, c.text]), [[1, 'SHOWN FIRST'], [2, 'SHOWN SECOND']], 'PPTX: a chunk\'s slide number is the slide\'s place in the deck');
+    const text = String((await shown.to('text')).value);
+    assert.ok(text.indexOf('SHOWN FIRST') >= 0 && text.indexOf('SHOWN FIRST') < text.indexOf('SHOWN SECOND') && !text.includes('DELETED'), 'PPTX: text is written in the order of the deck');
+
+    // A presentation whose slide list names no slide part (it has none, or names none there is, or
+    // the part cannot be read) has every slide part, in the order of their numbers, numbered by place.
+    for (const [label, presentationXml] of [
+        ['no slide list', `<?xml version="1.0"?><p:presentation ${pns}/>`],
+        ['a slide list naming no part', presentation('rIdMissing')],
+        ['a presentation part that is not XML', 'not xml <<<'],
+    ] as const) {
+        const { ast } = await parse(deck({ 'ppt/presentation.xml': presentationXml, 'ppt/slides/slide7.xml': slide('SEVEN'), 'ppt/slides/slide2.xml': slide('TWO') }), {}, 'pptx');
+        assert.deepStrictEqual(outline(ast), [[1, 'TWO'], [2, 'SEVEN']], `PPTX: ${label} leaves the slides in the order of their file numbers`);
+    }
+
+    // A deck is read without the parts that hold none of its slides' text: the presentation's slide
+    // list and relationships, and the relationships of a notes page and of a slide master. One that is
+    // not XML is reported, and the deck is read as it is without it: the slides in the order of their
+    // file numbers, or the links of the part it belongs to left unresolved.
+    const notXml = '<?xml version="1.0"?><Relationships><Relationship Id="rId1"';
+    const sound: Record<string, string> = {
+        'ppt/presentation.xml': presentation('rId2', 'rId1'),
+        'ppt/_rels/presentation.xml.rels': relsOf(rel('rId1', 'slide', 'slides/slide1.xml') + rel('rId2', 'slide', 'slides/slide2.xml')),
+        'ppt/slides/slide1.xml': slide('ONE'),
+        'ppt/slides/slide2.xml': slide('TWO'),
+        'ppt/slides/_rels/slide1.xml.rels': relsOf(rel('rId1', 'notesSlide', '../notesSlides/notesSlide1.xml')),
+        'ppt/notesSlides/notesSlide1.xml': part('notes', shape(run('NOTES', 'rId2'), '<p:ph type="body" idx="1"/>')),
+        'ppt/notesSlides/_rels/notesSlide1.xml.rels': relsOf(link('rId2', 'https://notes.example/')),
+        'ppt/slideMasters/slideMaster1.xml': part('sldMaster', shape(run('MASTER', 'rId2'))),
+        'ppt/slideMasters/_rels/slideMaster1.xml.rels': relsOf(link('rId2', 'https://master.example/')),
+    };
+    const listed = [[1, 'TWO'], [2, 'ONE', 'slide-note-2=NOTES']], byFileNumber = [[1, 'ONE', 'slide-note-1=NOTES'], [2, 'TWO']];
+    const allLinks = (ast: OfficeParserAST) => [...linksIn(ast.content.flatMap(s => s.notes ?? [])), ...linksIn(ast.auxiliary?.slideMasters ?? [])];
+    assert.deepStrictEqual(await parse(deck(sound), {}, 'pptx').then(({ ast, issues }) => [outline(ast), allLinks(ast), issues.length]),
+        [listed, ['NOTES=>https://notes.example/', 'MASTER=>https://master.example/'], 0], 'PPTX: the deck these checks break a part of is read whole');
+    for (const [brokenPart, slides, links] of [
+        ['ppt/presentation.xml', byFileNumber, ['NOTES=>https://notes.example/', 'MASTER=>https://master.example/']],
+        ['ppt/_rels/presentation.xml.rels', byFileNumber, ['NOTES=>https://notes.example/', 'MASTER=>https://master.example/']],
+        ['ppt/notesSlides/_rels/notesSlide1.xml.rels', listed, ['MASTER=>https://master.example/']],
+        ['ppt/slideMasters/_rels/slideMaster1.xml.rels', listed, ['NOTES=>https://notes.example/']],
+    ] as const) {
+        const { ast, issues } = await parse(deck({ ...sound, [brokenPart]: notXml }), {}, 'pptx');
+        assert.deepStrictEqual([outline(ast), allLinks(ast)], [slides, links], `PPTX: a deck whose ${brokenPart} is not XML is read without it`);
+        assert.ok(issues.length === 1 && issues[0].code === 'CONTENT_PART_NOT_READ' && issues[0].message.includes(brokenPart), `PPTX: a ${brokenPart} that is not XML is reported`);
+    }
+    // A slide's own relationships are how its notes, comments and pictures are found: not XML, they
+    // end the parse, as a slide that is not XML does.
+    await assert.rejects(parse(deck({ ...sound, 'ppt/slides/_rels/slide1.xml.rels': notXml }), { onError: () => { } }, 'pptx'), /unclosed xml tag/, 'PPTX: a slide\'s relationships that are not XML end the parse');
+    // A limit the document is held to as a whole ends the parse in these parts too.
+    const manyRelationships = relsOf(Array.from({ length: 3000 }, (_, i) => link(`rId${i}`, 'https://notes.example/')).join(''));
+    await assert.rejects(parse(deck({ ...sound, 'ppt/notesSlides/_rels/notesSlide1.xml.rels': manyRelationships }), { decompressionLimits: { maxXmlElements: 1000 }, onError: () => { } }, 'pptx'),
+        (e: any) => e?.officeIssue?.code === 'XML_ELEMENT_LIMIT_EXCEEDED', 'PPTX: a notes page\'s relationships count against maxXmlElements');
+
+    // A slide holding only comments is still a slide.
+    const commented = deck({
+        'ppt/presentation.xml': presentation('rId1'),
+        'ppt/_rels/presentation.xml.rels': relsOf(rel('rId1', 'slide', 'slides/slide1.xml')),
+        'ppt/slides/slide1.xml': part('sld', ''),
+        'ppt/slides/_rels/slide1.xml.rels': relsOf(rel('rId1', 'comments', '../comments/comment1.xml')),
+        'ppt/comments/comment1.xml': `<?xml version="1.0"?><p:cmLst ${pns}><p:cm authorId="0" idx="1"><p:text>ONLY A COMMENT</p:text></p:cm></p:cmLst>`,
+    });
+    assert.deepStrictEqual((await parse(commented, {}, 'pptx')).ast.content.map(s => s.comments?.map(c => c.text)), [['ONLY A COMMENT']], 'PPTX: a slide with nothing but comments keeps them');
+
+    // The sample deck: its fifth slide's notes page is `notesSlide4.xml`, and was the fourth slide's.
+    const sample = await OfficeParser.parseOffice(path.join(__dirname, 'files/test.pptx'));
+    assert.deepStrictEqual(sample.content.map(s => (s.notes ?? []).map(n => (n.metadata as any).noteId)), [['slide-note-1'], ['slide-note-2'], ['slide-note-3'], [], ['slide-note-5'], [], [], [], []], 'PPTX: the sample deck\'s notes are on the slides that name them');
+    assert.ok(sample.content[4].notes![0].children![0].text!.startsWith('Now calendars') && sample.content[4].children![0].text!.includes('calendar'), 'PPTX: the calendar slide has the calendar notes');
+    console.log('  PPTX slide order and parts: All assertions passed ✓');
+}
+
+/**
+ * A note opened in an editor and saved with no edit is the note that was opened. Markdown is written as
+ * HTML for the editor (Tiptap's shapes) and the editor's HTML is written back as Markdown; the editor's
+ * HTML here is what one produces, recorded from a running editor.
+ */
+async function testEditorSaveShapes(): Promise<void> {
+    const quiet = { onWarning: () => { } };
+    const editorHtml = { htmlConfig: { sourceAttributes: true, standalone: { document: false, styles: 'none' as const } } };
+    const saved = { generateIds: false, mdConfig: { dialect: 'extended' as const, fallbackToHtml: { inlineFormatting: true } } };
+    const toEditor = async (md: string) => String((await OfficeGenerator.generate(await OfficeParser.parseOffice(Buffer.from(md), { fileType: 'md', ...quiet }), 'html', editorHtml)).value);
+    const toMarkdown = async (html: string) => String((await OfficeGenerator.generate(await OfficeParser.parseOffice(Buffer.from(html), { fileType: 'html', ...quiet }), 'md', saved)).value);
+    const toHtml = async (html: string) => String((await OfficeGenerator.generate(await OfficeParser.parseOffice(Buffer.from(html), { fileType: 'html', ...quiet }), 'html', editorHtml)).value);
+
+    // A task item is marked as one (Tiptap reads only `li[data-type="taskItem"]`), at every depth.
+    const tasks = await toEditor('- [ ] open task\n- [x] done task\n  - [ ] nested\n');
+    assert.strictEqual(tasks.split('<li ').length - 1, 3, 'three task items are written');
+    assert.strictEqual(tasks.split('data-type="taskItem"').length - 1, 3, 'HTML: every task item is marked data-type="taskItem"');
+    assert.ok(tasks.includes('<li data-checked="true" data-type="taskItem"') && tasks.includes('<li data-checked="false" data-type="taskItem"'), 'HTML: a task item keeps its checked state beside the marker');
+    assert.strictEqual(await toMarkdown('<ul data-type="taskList"><li data-checked="false" data-type="taskItem"><label><input type="checkbox"><span></span></label><div><p>open task</p></div></li><li data-checked="true" data-type="taskItem"><label><input type="checkbox" checked="checked"><span></span></label><div><p>done task</p></div></li></ul>'),
+        '- [ ] open task\n- [x] done task', 'Markdown: an editor\'s task items are written back as they were');
+
+    // A footnote's back-link, which the editor keeps as the note's content, is not the note's text.
+    assert.strictEqual(await toMarkdown('<p>A footnote<sup data-footnote-ref="1"></sup>.</p><section data-footnotes="true"><div data-footnote-id="1"><p>The note text. <a target="_blank" rel="noopener noreferrer nofollow" href="#footnote-ref-1">↩</a></p></div></section>'),
+        'A footnote[^1].\n\n[^1]: The note text.', 'Markdown: a footnote\'s back-link is not written into the note');
+
+    // A highlight that names no colour is a plain <mark>, and a mark in that colour is `==text==`
+    // however the colour is written and whatever the editor adds (`color: inherit`).
+    assert.ok((await toEditor('Some ==highlighted== text.\n')).includes('<p>Some <mark>highlighted</mark> text.</p>'), 'HTML: ==text== is a plain <mark>');
+    assert.strictEqual(await toMarkdown('<p>Some <mark data-color="#ffff00" style="background-color: rgb(255, 255, 0); color: inherit;">highlighted</mark> text.</p>'),
+        'Some ==highlighted== text.', 'Markdown: the editor\'s mark in the default colour is ==text==');
+    assert.strictEqual(await toMarkdown('<p><mark>a</mark> <span style="background-color: yellow">b</span> <mark data-color="#FF0">c</mark> <mark style="background-color: #FFFF00">d</mark></p>'),
+        '==a== ==b== ==c== ==d==', 'Markdown: the default highlight colour is the same colour however it is written');
+    // A yellow that is partly see-through is a colour of its own: written as the default, it came out solid.
+    for (const translucent of ['rgba(255, 255, 0, 0.3)', '#ffff0080', '#ff08', 'rgb(255 255 0 / 30%)', 'hsla(60, 100%, 50%, 0.3)']) {
+        assert.ok((await toHtml(`<p><span style="background-color: ${translucent}">x</span></p>`)).includes(`style="background-color: ${translucent}">x</mark>`), `HTML: a see-through yellow (${translucent}) keeps its colour`);
+        assert.strictEqual(await toMarkdown(`<p><span style="background-color: ${translucent}">x</span></p>`), `<span style="background-color: ${translucent}">x</span>`, `Markdown: a see-through yellow (${translucent}) keeps its colour`);
+    }
+    assert.strictEqual(await toMarkdown('<p><mark style="background-color: rgba(255, 255, 0, 1)">a</mark> <mark style="background-color: #ffff00ff">b</mark> <mark style="background-color: rgb(255 255 0 / 100%)">c</mark></p>'),
+        '==a== ==b== ==c==', 'Markdown: a yellow whose alpha is 1 is the default highlight');
+    // A highlight in a colour of its own keeps it, both ways.
+    assert.strictEqual(await toMarkdown('<p>Some <mark data-color="#b8f5c0" style="background-color: #b8f5c0; color: inherit">x</mark> text.</p>'),
+        'Some <span style="background-color: #b8f5c0">x</span> text.', 'Markdown: a highlight in another colour keeps its colour');
+    assert.ok((await toHtml('<p><mark data-color="#b8f5c0">x</mark></p>')).includes('<mark data-color="#b8f5c0" style="background-color: #b8f5c0">x</mark>'), 'HTML: a highlight in another colour is written with it');
+    // CSS's keywords are no colours: `inherit` keeps the colour the text has, `initial` is the default
+    // one, and a transparent background is none.
+    assert.strictEqual(await toMarkdown('<p><span style="color: red">red <span style="color: inherit">still red</span></span> <span style="color: initial">plain</span> <mark style="background-color: transparent">unmarked</mark></p>'),
+        '<span style="color: red">red still red</span> plain unmarked', 'Markdown: inherit, initial and transparent are not written as colours');
+
+    // Where a table stands on the page is not its columns' alignment, and a column's alignment is said
+    // once, in the delimiter row.
+    const placed = '<table data-align="center" style="margin-left: auto; margin-right: auto;"><tbody><tr><th colspan="1" rowspan="1" style="text-align: right;"><p>a</p></th><th colspan="1" rowspan="1"><p>b</p></th></tr><tr><td colspan="1" rowspan="1" style="text-align: right;"><p>1</p></td><td colspan="1" rowspan="1"><p>2</p></td></tr></tbody></table>';
+    assert.strictEqual(await toMarkdown(placed), '| a | b |\n| ---: | --- |\n| 1 | 2 |\n{align=center}', 'Markdown: a centred table\'s columns keep their own alignment, written once, and its place is written under it');
+    assert.ok((await toHtml(placed)).includes('<table data-align="center"'), 'HTML: a table keeps its place on the page');
+    // A table's place and its columns' alignment are kept apart, both ways, and a table with no place has none written.
+    const placedMarkdown = '| a | b |\n| :--- | :--- |\n| 1 | 2 |\n{align=right}';
+    const placedHtml = await toEditor(placedMarkdown);
+    assert.ok(placedHtml.includes('<table data-align="right" style="margin-left: auto; margin-right: 0">') && placedHtml.split('text-align: left').length - 1 === 4, `HTML: placement right and left-aligned cells are both written: ${placedHtml}`);
+    assert.strictEqual(await toMarkdown(placedHtml), placedMarkdown, 'Markdown: a placed table with aligned columns round-trips');
+    assert.ok(!(await toEditor('| a | b |\n| ---: | ---: |\n| 1 | 2 |\n')).includes('data-align'), 'HTML: columns aligned alike do not place the table');
+    assert.strictEqual(await toMarkdown(placed.replace(' data-align="center" style="margin-left: auto; margin-right: auto;"', '')), '| a | b |\n| ---: | --- |\n| 1 | 2 |', 'Markdown: a table with no place has none written');
+    assert.strictEqual(await toMarkdown(await toEditor('| a | b |\n| :--- | ---: |\n| 1 | 2 |\n')), '| a | b |\n| :--- | ---: |\n| 1 | 2 |', 'Markdown: column alignment round-trips');
+    // A cell aligned unlike its column still says so.
+    assert.strictEqual(await toMarkdown('<table><tbody><tr><th><p>a</p></th><th style="text-align: right;"><p>b</p></th></tr><tr><td style="text-align: center;"><p>1</p></td><td style="text-align: right;"><p>2</p></td></tr></tbody></table>'),
+        '| a | b |\n| --- | ---: |\n| <div style="text-align: center">1</div> | 2 |', 'Markdown: a cell aligned unlike its column keeps its own alignment');
+
+    // A header cell stays one: `<th>`, and any cell of a `<thead>`, whether or not its text is bold.
+    const oneLine = (html: string) => html.replace(/\n/g, '');
+    assert.ok(oneLine(await toHtml('<table><tbody><tr><th colspan="1" rowspan="1"><p>a</p></th></tr><tr><td colspan="1" rowspan="1"><p>1</p></td></tr></tbody></table>')).includes('<thead><tr><th><p>a</p></th></tr></thead><tbody><tr><td><p>1</p></td></tr>'), 'HTML: a <th> row is written as a header row');
+    assert.ok(oneLine(await toHtml('<table><thead><tr><td>a</td></tr></thead><tbody><tr><td>1</td></tr></tbody></table>')).includes('<thead><tr><th>a</th></tr></thead>'), 'HTML: a <thead> row is a header row');
+    const nestedInHead = await OfficeParser.parseOffice(Buffer.from('<table><thead><tr><th>h<table><tr><td>inner</td></tr></table></th></tr></thead><tr><td>1</td></tr></table>'), { fileType: 'html', ...quiet });
+    const cellStyles = collectAllNodes(nestedInHead).filter(n => n.type === 'cell').map(n => [n.text, (n.metadata as any)?.style]);
+    assert.deepStrictEqual(cellStyles.filter(([, style]) => style === 'header').length, 1, `HTML: a table nested in a header cell is no part of the head: ${JSON.stringify(cellStyles)}`);
+    console.log('  Editor save shapes: All assertions passed ✓');
 }
 
 /**
@@ -4576,7 +4796,7 @@ async function testDocxReadingReview(): Promise<void> {
         assert.ok(out.includes('Box title') && out.includes('bullet two') && !/text\.Box|titleBox|twobullet|onebullet/.test(out), `${format}: a text box's paragraphs keep their word boundaries`);
     }
     for (const format of ['docx', 'odt'] as const) {
-        const back = await OfficeParser.parseOffice(Buffer.from((await boxed.ast.to(format)).value as Uint8Array), { fileType: format } as any);
+        const back = await OfficeParser.parseOffice(Buffer.from((await boxed.ast.to(format)).value as any), { fileType: format } as any);
         assert.deepStrictEqual(back.content.map(n => n.text).filter(Boolean), ['Intro text.', 'Box title', 'Box line two', 'bullet one', 'bullet two', 'After'], `${format}: a text box's paragraphs are written apart`);
     }
     const emoji = await parse(docx(`<w:p>${r('I love ')}<w:r><mc:AlternateContent xmlns:w16se="http://schemas.microsoft.com/office/word/2015/wordml/symex"><mc:Choice Requires="w16se"><w16se:symEx w16se:font="Segoe UI Emoji" w16se:char="1F600"/></mc:Choice><mc:Fallback><w:t>😀</w:t></mc:Fallback></mc:AlternateContent></w:r>${r(' emoji')}</w:p>`));
@@ -4755,6 +4975,27 @@ async function testHtmlBrowserReading(): Promise<void> {
     assert.strictEqual((await parse('<body><title>T</title><p>x</p></body>')).metadata.title, 'T', 'HTML: a title outside the head is the title, not text');
     const windows1252 = Buffer.concat([Buffer.from('<meta http-equiv="Content-Type" content="text/html; charset=windows-1252"><p>caf'), Buffer.from([0xE9, 0x20, 0x92, 0x71, 0x92]), Buffer.from('</p>')]);
     assert.strictEqual(collectAllNodes(await parse(windows1252)).find(n => n.type === 'text')?.text, 'café \u2019q\u2019', 'HTML: a page in its declared encoding');
+    // Windows-1252 is decoded by the library, not by the runtime: Node 22's TextDecoder reads its bytes
+    // 0x80 to 0x9F as Latin-1 (nodejs/node#56542), so a page's curly quotes came out as control
+    // characters there. Every byte, against the Encoding Standard's table, written out here.
+    const high1252 = [0x20AC, 0x81, 0x201A, 0x192, 0x201E, 0x2026, 0x2020, 0x2021, 0x2C6, 0x2030, 0x160, 0x2039, 0x152, 0x8D, 0x17D, 0x8F,
+        0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x2DC, 0x2122, 0x161, 0x203A, 0x153, 0x9D, 0x17E, 0x178];
+    const everyByte = Uint8Array.from({ length: 256 }, (_, i) => i);
+    assert.deepStrictEqual([...decodeWindows1252(everyByte)].map(c => c.codePointAt(0)), [...everyByte].map(b => b >= 0x80 && b <= 0x9F ? high1252[b - 0x80] : b), 'Windows-1252: every byte is its character');
+    const longRun = new Uint8Array(20_001).fill(0x92);
+    assert.strictEqual(decodeWindows1252(longRun), '\u2019'.repeat(20_001), 'Windows-1252: a long run is decoded whole');
+    assert.strictEqual(decodeWindows1252(new Uint8Array(0)), '', 'Windows-1252: no bytes are no text');
+    for (const label of ['windows-1252', 'latin1', 'ISO-8859-1', 'ascii', ' cp1252 ']) {
+        assert.deepStrictEqual([textDecoder(label).encoding, textDecoder(label).decode(Uint8Array.of(0x80, 0x92, 0xE9))], ['windows-1252', '\u20AC\u2019\u00E9'], `Windows-1252: the label ${label.trim()} is decoded as it`);
+    }
+    assert.deepStrictEqual([textDecoder('iso-8859-2').encoding, textDecoder('iso-8859-2').decode(Uint8Array.of(0xB1))], ['iso-8859-2', '\u0105'], 'An encoding other than Windows-1252 is the runtime\'s to decode');
+    assert.throws(() => textDecoder('no-such-encoding'), RangeError, 'A label that names no encoding is refused, as TextDecoder refuses it');
+    // The other readers of a Windows-1252 document: RTF (its code page), LaTeX (a file that is not
+    // UTF-8) and an MHT chunk's page.
+    const rtf1252 = await OfficeParser.parseOffice(Buffer.from("{\\rtf1\\ansi\\ansicpg1252 it\\'92s 5\\'80}"), { fileType: 'rtf' } as any);
+    assert.strictEqual(String((await rtf1252.to('text')).value).trim(), 'it\u2019s 5\u20AC', 'RTF: a code page 1252 byte is its Windows-1252 character');
+    const tex1252 = await OfficeParser.parseOffice(Buffer.concat([Buffer.from('\\documentclass{article}\\begin{document}it'), Buffer.from([0x92]), Buffer.from('s caf'), Buffer.from([0xE9]), Buffer.from('\\end{document}')]), { fileType: 'tex', onWarning: () => { } } as any);
+    assert.strictEqual(String((await tex1252.to('text')).value).trim(), 'it\u2019s caf\u00E9', 'LaTeX: a file that is not UTF-8 is read as Windows-1252');
     assert.strictEqual(collectAllNodes(await parse(Buffer.concat([Buffer.from([0xFF, 0xFE]), Buffer.from('<p>h\u00E9llo</p>', 'utf16le')]))).find(n => n.type === 'text')?.text, 'h\u00E9llo', 'HTML: a UTF-16 page with its byte order mark');
     assert.strictEqual(collectAllNodes(await parse('<meta charset="windows-1252"><p>\u00E9</p>')).find(n => n.type === 'text')?.text, '\u00E9', 'HTML: UTF-8 bytes stay UTF-8 whatever the page declares');
     const based = await read('<head><base href="https://example.com/dir/"></head><a href="page.html">p</a> <a href="#frag">f</a> <img src="i.png"> <img srcset="small.png 1x, big.png 2x">');
@@ -4973,6 +5214,8 @@ async function runTests(): Promise<void> {
         ['ODG', testOdg],
         ['ODFComments', testOdfComments],
         ['PPTX comments', testPptxComments],
+        ['PPTX slide order and parts', testPptxSlideOrderAndParts],
+        ['Editor save shapes', testEditorSaveShapes],
         ['ConsistencyBehaviors', testConsistencyBehaviors],
         ['DOCX', testDocxGeneration],
         ['DOCX notes and bookmarks', testDocxNotesAndBookmarks],
