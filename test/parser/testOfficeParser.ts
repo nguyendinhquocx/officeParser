@@ -101,6 +101,7 @@ const FULL_CONFIG: DeepRequired<OfficeParserConfig> = {
         workerPath: '',
         corePath: '',
         langPath: '',
+        cacheMethod: 'write',
         preserveLayout: true,
         // Generous (0 = unlimited) for workerLoad/recognition so the real-file tests are never
         // killed by the timeout machinery.  C8/C9 permutation tests override these to 1 ms.
@@ -140,6 +141,8 @@ const FULL_CONFIG: DeepRequired<OfficeParserConfig> = {
     ignorePageGeometry: false,
     password: '',
     onPassword: () => undefined,
+    maxPasswordAttempts: 3,
+    allowRemoteAssets: true,
     pdfParserConfig: {
         useTags: true,
         detectColumns: true,
@@ -3403,6 +3406,37 @@ async function testPdfSmoke(): Promise<FeatureTest[]> {
         add("headingDetection font-size", false, 'ran', e?.message || String(e));
     }
 
+    // --- headingDetection:'tags' keeps only tagged headings, and every heading names what decided it ---
+    // tagged_headings.pdf: page one is read from its tags (H1 "Purpose" and H2 "Scope" in body-size
+    // type) with one 30pt line ("2024") outside them; page two's tree covers too little of it, so the
+    // page is read from geometry and its 24pt first line ("Annual Report") is a heading by size alone.
+    try {
+        const file = path.join(pdfDir, 'tagged_headings.pdf');
+        const read = async (pdfParserConfig: any) => {
+            const ast = await OfficeParser.parseOffice(file, { ocr: false, pdfParserConfig });
+            const hs: string[] = [], blocks: string[] = [];
+            ast.content.forEach((p: any) => walk(p, (n: any) => {
+                if (n.type === 'heading') hs.push(`${n.text}:${n.metadata?.level}:${n.metadata?.levelSource}`);
+                if (n.type === 'heading' || n.type === 'paragraph') blocks.push(String(n.text));
+            }));
+            return { hs: hs.join(' | '), text: blocks.join('\n') };
+        };
+        const auto = await read({ headingDetection: 'auto' });
+        const tags = await read({ headingDetection: 'tags' });
+        const fontSize = await read({ headingDetection: 'font-size' });
+        const untagged = await read({ headingDetection: 'tags', useTags: false });
+        const expectAuto = '2024:1:font-size | Purpose:1:tags | Scope:2:tags | Annual Report:2:font-size';
+        add("headingDetection:'auto' marks each heading's levelSource", auto.hs === expectAuto, expectAuto, auto.hs);
+        const expectTags = 'Purpose:1:tags | Scope:2:tags';
+        add("headingDetection:'tags' keeps only the tagged headings", tags.hs === expectTags, expectTags, tags.hs);
+        add("headingDetection:'tags' reads the same text as 'auto'", tags.text === auto.text && tags.text.includes('2024') && tags.text.includes('Annual Report'), 'identical block text', tags.text === auto.text ? 'identical' : 'differs');
+        const expectFontSize = '2024:1:font-size | Annual Report:2:font-size';
+        add("headingDetection:'font-size' headings are marked font-size", fontSize.hs === expectFontSize, expectFontSize, fontSize.hs);
+        add("headingDetection:'tags' with useTags:false gives no headings", untagged.hs === '', 'no headings', untagged.hs || 'none');
+    } catch (e: any) {
+        add("headingDetection tags", false, 'ran', e?.message || String(e));
+    }
+
     // --- layout-faithful .to('text') ---
     try {
         const ast = await OfficeParser.parseOffice(getFilePath('pdf'), { ocr: false });
@@ -3714,6 +3748,33 @@ async function testCryptoSmoke(): Promise<FeatureTest[]> {
         } catch (e: any) {
             add(`${label}: onPassword supplies it`, false, 'marker', e?.officeIssue?.code || e?.message, type);
         }
+    }
+
+    // onPassword is asked `maxPasswordAttempts` times (3 unless set), for containers and PDF alike.
+    for (const [file, type] of [['agile.docx', 'docx'], ['encrypted.odt', 'odt'], [path.join('..', 'pdf', 'encrypted.pdf'), 'pdf']] as const) {
+        for (const [limit, expected] of [[undefined, 3], [5, 5], [0, 0], [-1, 3]] as const) {
+            let asked = 0;
+            let code = 'parsed';
+            try {
+                await OfficeParser.parseOffice(path.join(dir, file), { ocr: false, onPassword: () => { asked++; return 'wrong'; }, ...(limit === undefined ? {} : { maxPasswordAttempts: limit }) });
+            } catch (e: any) { code = e?.officeIssue?.code || e?.message; }
+            add(`${type}: onPassword is asked ${expected} times with maxPasswordAttempts ${limit}`, asked === expected && /^PASSWORD_/.test(code), `${expected} asks, a PASSWORD_ error`, `${asked} asks, ${code}`, type);
+        }
+    }
+
+    // allowRemoteAssets: false turns a fall back to a CDN address into an error naming what to set.
+    try {
+        await OfficeParser.parseOffice(getFilePath('docx'), { ocr: true, extractAttachments: true, allowRemoteAssets: false });
+        add('allowRemoteAssets:false blocks OCR with no langPath', false, 'REMOTE_ASSET_BLOCKED', 'parsed', 'docx');
+    } catch (e: any) {
+        add('allowRemoteAssets:false blocks OCR with no langPath', e?.officeIssue?.code === 'REMOTE_ASSET_BLOCKED' && String(e?.message).includes('ocrConfig.langPath'), 'REMOTE_ASSET_BLOCKED naming ocrConfig.langPath', `${e?.officeIssue?.code}: ${e?.message}`, 'docx');
+    }
+    try {
+        const ast: any = await OfficeParser.parseOffice(getFilePath('docx'), { ocr: false, allowRemoteAssets: false });
+        const html = String((await ast.to('html')).value);
+        add('allowRemoteAssets:false parses with OCR off and writes no CDN address', ast.content.length > 0 && !html.includes('cdn.jsdelivr.net'), 'parsed, no CDN address in HTML', html.includes('cdn.jsdelivr.net') ? 'CDN address written' : 'parsed', 'docx');
+    } catch (e: any) {
+        add('allowRemoteAssets:false parses with OCR off and writes no CDN address', false, 'parsed', e?.officeIssue?.code || e?.message, 'docx');
     }
 
     // Regression: an ordinary (unencrypted) zip document is untouched by the decryption pre-pass.

@@ -21,6 +21,8 @@ export enum OfficeErrorType {
     INVALID_INPUT = 'INVALID_INPUT',
     /** PDF worker source is missing (required in browser) */
     PDF_WORKER_MISSING = 'PDF_WORKER_MISSING',
+    /** A file the parse needs would have been fetched from the library's default CDN address, and `allowRemoteAssets` is false */
+    REMOTE_ASSET_BLOCKED = 'REMOTE_ASSET_BLOCKED',
     /** The document is encrypted (PDF, or a password-protected OOXML/ODF) and no password was supplied */
     PASSWORD_REQUIRED = 'PASSWORD_REQUIRED',
     /** The supplied password did not decrypt the document */
@@ -31,6 +33,10 @@ export enum OfficeErrorType {
     TEMPLATE_UNSUPPORTED_FORMAT = 'TEMPLATE_UNSUPPORTED_FORMAT',
     /** A template placeholder had no matching data field and `onMissing: 'error'` was set */
     TEMPLATE_FIELD_MISSING = 'TEMPLATE_FIELD_MISSING',
+    /** A template's block tags cannot be read or do not enclose content (see {@link TemplateSyntaxDetails}) */
+    TEMPLATE_SYNTAX = 'TEMPLATE_SYNTAX',
+    /** A template's data does not fit how a tag uses it (see {@link TemplateDataDetails}) */
+    TEMPLATE_DATA_INVALID = 'TEMPLATE_DATA_INVALID',
     /** PDF generation failed (e.g. the puppeteer engine is unavailable or rendering errored) */
     PDF_GENERATION_FAILED = 'PDF_GENERATION_FAILED',
     /** Attempted to use Node.js-only features in a browser environment */
@@ -280,6 +286,17 @@ export interface OcrConfig {
      */
     langPath?: string;
     /**
+     * Where Tesseract keeps the language data it has loaded, so the next parse does not load it again
+     * (IndexedDB in the browser, a file in the working directory in Node):
+     * - 'write': read it from there when present, and store it after loading.
+     * - 'readOnly': read it from there when present, never store.
+     * - 'refresh': load it again and store it.
+     * - 'none': neither read nor store, for an application that must write nothing to the device.
+     *
+     * Default is 'write'.
+     */
+    cacheMethod?: 'write' | 'readOnly' | 'refresh' | 'none';
+    /**
      * Reconstruct the recognized text's two-dimensional page layout from Tesseract's per-word
      * bounding boxes, instead of returning the flat, linearized string. Words keep their relative
      * horizontal position (right-hand text stays on the right, columns line up) and lines/blocks keep
@@ -341,15 +358,38 @@ export interface CommonOfficeParserConfig {
      * Called with `'required'` when the document is encrypted and no password was given, or
      * `'incorrect'` when the last attempt was wrong. Return a password (sync or async) to retry;
      * return `undefined`/`''` to stop, in which case parsing rejects with `PASSWORD_REQUIRED` or
-     * `PASSWORD_INCORRECT` as it would with no callback. The callback is asked at most 3 times in total
-     * (shared across `'required'`/`'incorrect'`), so one that keeps returning a wrong password cannot
-     * loop forever.
+     * `PASSWORD_INCORRECT` as it would with no callback. The callback is asked at most
+     * `maxPasswordAttempts` times in total (shared across `'required'`/`'incorrect'`), so one that keeps
+     * returning a wrong password cannot loop forever.
      *
      * By default this is unset, so an encrypted document without a valid `password` simply throws:
      * an undecryptable document is unrecoverable for that call, so it is an error rather than a
      * warning. The callback is the escape hatch for handling it gracefully.
      */
     onPassword?: (reason: 'required' | 'incorrect') => string | undefined | Promise<string | undefined>;
+    /**
+     * How many times `onPassword` is asked for one document before the parse rejects with
+     * `PASSWORD_REQUIRED` or `PASSWORD_INCORRECT`. A whole number of 0 or more; anything else is read
+     * as the default. Applies to every encryptable format (PDF/OOXML/ODF).
+     *
+     * Default is 3.
+     */
+    maxPasswordAttempts?: number;
+    /**
+     * Whether the library may fall back to the addresses it has built in for files it loads at run
+     * time: the pdf.js worker (`pdfWorkerSrc`, in the browser, and in Node when the installed worker
+     * cannot be found) and Tesseract's worker, core and language data (`ocrConfig.workerPath`,
+     * `corePath`, `langPath`), all on a public CDN.
+     *
+     * Set false for an application that must make no request to another site: a parse that would use
+     * one of those defaults rejects with `REMOTE_ASSET_BLOCKED`, naming the option to set, in place of
+     * fetching it. An address you pass yourself is used as given, wherever it points. HTML and PDF
+     * written from an AST parsed with false also name no chart script address unless
+     * `htmlConfig.chartJsSrc` is set.
+     *
+     * Default is true.
+     */
+    allowRemoteAssets?: boolean;
     /**
      * The delimiter used for every new line in places that allow multiline text like word.
      * Default is \n.
@@ -492,7 +532,8 @@ export interface CommonOfficeParserConfig {
     csvDelimiter?: string;
     /**
      * Limits and checks applied during ZIP extraction to protect against excessive
-     * memory and resource usage.
+     * memory and resource usage. A value that is not an object of limits is reported
+     * (`INVALID_CONFIG_VALUE`) and the defaults used.
      */
     decompressionLimits?: DecompressionLimits;
     /**
@@ -581,11 +622,19 @@ export interface PdfParserConfig {
      *   font size (and demoted to a paragraph when it is not visually heading-like); a block the tags
      *   call a plain paragraph is left as one. Use this when a PDF's heading tags are present but wrong
      *   or flat.
+     * - 'tags': only a heading the document itself tags is a heading. On the tagged path a heading
+     *   keeps its tagged level, as under 'auto'; text assembled from geometry (an untagged PDF, a page
+     *   whose tag tree covers too little of its text, text outside the tags on a tagged page, or every
+     *   page under `useTags: false`) is never a heading. The text is the same as under 'auto': only
+     *   whether a block is a `heading` or a `paragraph` differs.
      * - 'off': never emit headings; every block is a paragraph.
+     *
+     * Under 'auto', a heading says which of the two decided its level in
+     * `HeadingMetadata.levelSource`.
      *
      * Default is 'auto'.
      */
-    headingDetection?: 'auto' | 'font-size' | 'off';
+    headingDetection?: 'auto' | 'font-size' | 'tags' | 'off';
     /**
      * Restrict parsing to a subset of pages, e.g. '1-3,7' or '2,4,6'. Pages are 1-based and the
      * output keeps their original page numbers. An empty string parses all pages; an unparseable or
@@ -1284,7 +1333,7 @@ export type OfficeConverterConfig<D extends string = string, T extends Supported
 /**
  * Deeply required type helper.
  */
-export type DeepRequired<T> = T extends Function | Date | Buffer | RegExp
+export type DeepRequired<T> = T extends Function | Date | Buffer | RegExp | Uint8Array | ArrayBuffer
     ? T
     : T extends Array<infer U>
     ? Array<DeepRequired<U>>
@@ -1472,13 +1521,59 @@ export interface PdfGeneratorConfig {
      *   only hand back HTML rather than PDF bytes.
      * - `'native'`: lay the AST out directly with `pdf-lib` (an optional peer dependency) - no
      *   browser required, works identically in Node and the browser (so it can produce real PDF bytes
-     *   client-side), and is much lighter. The trade-off is fidelity: it draws in the Standard-14
-     *   Helvetica and Courier fonts rather than the document's own and performs a clean reflow rather
-     *   than matching the HTML renderer pixel for pixel. `tagged`/`outline` do not apply to it.
+     *   client-side), and is much lighter. The trade-off is fidelity: it draws in the fonts given in
+     *   `fonts` and `fallbackFonts` (the Standard-14 Helvetica and Courier fonts when none are given)
+     *   rather than the document's own, and performs a clean reflow rather than matching the HTML
+     *   renderer pixel for pixel. `tagged` does not apply to it.
      *
      * Defaults to `'html'`.
      */
     engine?: 'html' | 'native';
+    /**
+     * Fonts the `'native'` engine draws in, each the bytes of a TrueType or OpenType file (`.ttf`,
+     * `.otf`), one per style. Without them the engine draws in the Standard-14 Helvetica and Courier
+     * fonts, which have Western European characters only: every other character is drawn as `?` and
+     * reported in one `CONTENT_NOT_REPRESENTABLE` warning. A style given no font is drawn in `regular`
+     * when that is given (so bold text is not bold unless `bold` is given too); code stays in Courier
+     * unless `mono` is given. A character a style's font lacks is looked for in `regular`, then in
+     * `fallbackFonts`, then in the Standard-14 font of the style.
+     *
+     * Embedding a font needs the optional peer dependency `@pdf-lib/fontkit`. A file that cannot be
+     * read as a font fails the conversion with `PDF_GENERATION_FAILED`; a value that is not a file's
+     * bytes (a file name, an empty file), or `fonts` given as anything but an object of styles, is
+     * reported (`INVALID_CONFIG_VALUE`) and the style drawn as if none were given, and a style name not
+     * listed here is reported as `UNRECOGNIZED_CONFIG_OPTION`. Ignored by the `'html'` engine.
+     *
+     * Defaults to no fonts.
+     */
+    fonts?: {
+        regular?: Uint8Array | ArrayBuffer | null;
+        bold?: Uint8Array | ArrayBuffer | null;
+        italic?: Uint8Array | ArrayBuffer | null;
+        boldItalic?: Uint8Array | ArrayBuffer | null;
+        mono?: Uint8Array | ArrayBuffer | null;
+    };
+    /**
+     * More fonts for the `'native'` engine, tried in order for each character the style's own font and
+     * `fonts.regular` lack, so one document can mix scripts (Latin, Devanagari, Chinese) by listing a
+     * font for each. Each is the bytes of a TrueType or OpenType file. Given with no `fonts`, text
+     * stays in the Standard-14 fonts (bold and italic included) and these draw only the characters
+     * those lack.
+     *
+     * Words are shaped by the font (ligatures, Arabic joining, Indic conjuncts) and a right-to-left
+     * line is laid out from the right edge, its words in visual order. Marks a font places with its
+     * positioning table (`GPOS`) are drawn at their default offsets.
+     *
+     * A value that is not a list, or an entry that is not a file's bytes, is reported
+     * (`INVALID_CONFIG_VALUE`) and left out. Defaults to none.
+     */
+    fallbackFonts?: (Uint8Array | ArrayBuffer)[];
+    /**
+     * Embed only the glyphs the document uses of each font given in `fonts` and `fallbackFonts`
+     * (`'native'` engine). Set false to embed whole font files, for a font whose subset a viewer does
+     * not draw. Defaults to true.
+     */
+    subsetFonts?: boolean;
     /**
      * Emit a tagged (accessible / PDF-UA-friendly) PDF, so screen readers can follow the document
      * structure. Passed through to the rendering engine; ignored by engines that do not support it.
@@ -1486,8 +1581,8 @@ export interface PdfGeneratorConfig {
      */
     tagged?: boolean;
     /**
-     * Emit a bookmark outline built from the document's headings (experimental in the rendering
-     * engine). Defaults to false.
+     * Emit a bookmark outline built from the document's headings, nested by heading level. Both
+     * engines write one (it is experimental in the `'html'` engine's browser). Defaults to false.
      */
     outline?: boolean;
     /** Paper format. Defaults to 'A4'. See {@link PaperFormat}. */
@@ -2253,36 +2348,155 @@ export interface OfficeChunk {
 
 // ─── End Chunking Types ────────────────────────────────────────────────────────
 
-/** A single value substituted for a template placeholder. `null`/`undefined` render as empty text. */
-export type TemplateValue = string | number | boolean | Date | null | undefined;
+/**
+ * A value in a template's data. Text, numbers, true/false and dates fill a field (`null`/`undefined`
+ * render as empty text); a list is what `{{ for item in list }}` repeats over; an object holds named
+ * values reached by a path (`{{ customer.address.city }}`).
+ */
+export type TemplateValue = string | number | boolean | Date | null | undefined | readonly TemplateValue[] | { readonly [key: string]: TemplateValue };
 
 /**
- * A flat map of placeholder name to value for {@link OfficeTemplate.render}. A key `name` fills the
- * placeholder `{{name}}` (see `delimiters`). Keys absent from the map are governed by `onMissing`.
+ * The data for one document from {@link OfficeTemplate.render}. A key `name` fills the field
+ * `{{name}}` (see `delimiters`), and a path `{{ a.b }}` reads `b` of the object at `a`; a key that
+ * itself holds a dot (`"invoice.total"`) is read as typed before it is read as a path. Fields absent
+ * from the data are governed by `onMissing`.
  */
 export type TemplateData = Record<string, TemplateValue>;
+
+/** Why a template's tags were rejected with `TEMPLATE_SYNTAX`. */
+export type TemplateSyntaxReason =
+    /**
+     * A tag cannot be read; `detail` says why. Text that only starts like a block tag (`{{ If you call }}`)
+     * stays text, and is named so only when the blocks around it fail to pair. Named at once: a block
+     * keyword spelt as other template languages spell it (`elseif`, `elif`, `end if`), and a filter
+     * given what it does not take (`format` with a picture that cannot be read, `upper "x"`).
+     */
+    | 'unreadable'
+    /** A block's opening tag has no closing tag. */
+    | 'unclosed'
+    /** A closing tag, or an `else`, has no block to belong to. */
+    | 'unopened'
+    /** A closing tag closes a different kind of block than the one open (`endfor` for an `if`). */
+    | 'mismatched'
+    /** An `else` or `else if` follows the block's `else`. */
+    | 'else-after-else'
+    /** A block's tags sit where no content lies between them as a whole: in different tables, cells across tables, a text box and the text around it, different parts, or inside an element a block cannot be cut at; `detail` names it. */
+    | 'crossing'
+    /** An `else` or `else if` in a table shares a row with another of the block's tags; in a table each branch is its own rows. */
+    | 'row-branch'
+    /** Two blocks overlap without one holding the other. */
+    | 'overlap'
+    /** The part holding block tags is not well-formed XML. */
+    | 'malformed-xml';
+
+/** The `details` of a `TEMPLATE_SYNTAX` error. */
+export interface TemplateSyntaxDetails {
+    reason: TemplateSyntaxReason;
+    /** The tag as typed, delimiters included. */
+    tag: string;
+    /** The document part holding it, e.g. `word/document.xml`. */
+    part: string;
+    /** More about the reason, where there is more to say. */
+    detail?: string;
+}
+
+/** Why a template's data was rejected with `TEMPLATE_DATA_INVALID`. */
+export type TemplateDataReason =
+    /** A `for` tag's list is not a list. */
+    | 'not-a-list'
+    /** A field's value (or the value a case filter changes) is a list, an object, a function or a symbol, which has no text of its own. */
+    | 'not-text'
+    /** A condition compares two values of different kinds (text with a number), or a list or object. */
+    | 'incomparable'
+    /** A filter cannot write the value: a number picture given text that is not a number, a date picture given one that is not a date. */
+    | 'unformattable';
+
+/** The `details` of a `TEMPLATE_DATA_INVALID` error. */
+export interface TemplateDataDetails {
+    reason: TemplateDataReason;
+    /** The tag as typed, delimiters included. */
+    tag: string;
+    /** The document part holding it. */
+    part: string;
+    /** The kind of the value (`text`, `number`, `true/false`, `date`, `list`, `object`, `function`, `symbol`, `empty`). */
+    kind: string;
+    /** For `incomparable`, the kind of the other value. */
+    otherKind?: string;
+    /** For `unformattable`, the filter, and what it takes (`number` or `date` for `format`). */
+    filter?: string;
+    takes?: string;
+}
+
+/**
+ * A filter of the caller's own, named in `TemplateConfig.formatters` and written in a tag after `|`
+ * (`{{ name | initials }}`, `{{ total | round 2 }}`). It is given the field's value as the data holds it
+ * (a list or an object too) and the strings and numbers written after its name, and returns the value
+ * to write (or to pass to the next filter).
+ */
+export type TemplateFormatter = (value: TemplateValue, ...args: (string | number)[]) => TemplateValue;
+
+/** The words a date picture writes: month and day names, in full and short, and the AM/PM markers. */
+export interface TemplateDateNames {
+    /** Twelve names, January first (`MMMM`). */
+    months?: string[];
+    /** Twelve short names (`MMM`). */
+    monthsShort?: string[];
+    /** Seven names, Sunday first (`dddd`). */
+    days?: string[];
+    /** Seven short names (`ddd`). */
+    daysShort?: string[];
+    /** The markers `AM/PM` writes (`am/pm` writes them in lower case, `A/P` their first letter). */
+    am?: string;
+    pm?: string;
+}
 
 /**
  * Options for {@link OfficeTemplate.render}. `data` is the only required field: a single
  * {@link TemplateData} produces one document, an array of them produces one document per entry
- * (a mail-merge).
+ * (a mail-merge). An option render does not take, at the top or inside `delimiters`,
+ * `numberSeparators`, `dateNames` or `decompressionLimits`, is reported (`UNRECOGNIZED_CONFIG_OPTION`).
  */
 export interface TemplateConfig {
     /** The field values. One object -> one rendered document; an array -> one document per entry. */
     data: TemplateData | TemplateData[];
     /**
-     * Placeholder delimiters. Defaults to `{{` and `}}`, so `{{name}}` is a placeholder. A placeholder
-     * name is matched even when the source splits it across several runs (a common Word quirk).
+     * Tag delimiters. Defaults to `{{` and `}}`, so `{{name}}` is a field and `{{ if paid }}` a block
+     * tag. A tag is matched even when the source splits it across several runs (a common Word quirk).
+     * Delimiters that are not an object, or one that is not text, are refused (`IMPROPER_ARGUMENTS`).
      */
     delimiters?: { start: string; end: string };
     /**
-     * What to do with a placeholder whose name is absent from `data`:
-     * - `'keep'` (default): leave the placeholder text untouched.
-     * - `'empty'`: replace it with nothing.
+     * What to do with a field the data does not have, in a placeholder, a condition or a loop's list:
+     * - `'keep'` (default): leave it as typed. A placeholder keeps its text; a block (`if` or `for`)
+     *   whose condition or list uses the field is left exactly as typed, tags and content included.
+     * - `'empty'`: treat it as empty. A placeholder is replaced with nothing; in a condition the field
+     *   is `null`; a loop over it repeats nothing.
      * - `'error'`: reject with `TEMPLATE_FIELD_MISSING`.
-     * A key that is present but `null`/`undefined` always renders as empty (it is not "missing").
+     * A key that is present but `null`/`undefined` is not missing: it renders as empty, is `null` in a
+     * condition, and a loop over it repeats nothing. Another value is reported (`INVALID_CONFIG_VALUE`)
+     * and `'keep'` used.
      */
     onMissing?: 'keep' | 'empty' | 'error';
+    /**
+     * The separators a number picture (`{{ total | format "#,##0.00" }}`) writes. A picture is always
+     * written with `,` for groups and `.` for the decimal point, as in Word; these are what appear in
+     * the document. Default `{ decimal: '.', group: ',' }` (`{ decimal: ',', group: '.' }` writes
+     * `1.250,50`). A value that is not an object of text is refused (`IMPROPER_ARGUMENTS`).
+     */
+    numberSeparators?: { decimal?: string; group?: string };
+    /**
+     * The month and day names and AM/PM markers a date picture writes. Default English. A value that is
+     * not an object of names, or a list of the wrong length, is refused (`IMPROPER_ARGUMENTS`).
+     */
+    dateNames?: TemplateDateNames;
+    /**
+     * Minutes added to UTC before a date picture writes a date: 0 (the default) writes dates in UTC, 330
+     * in India's time, -300 in New York's in winter. A fixed offset, the same on every machine, unlike
+     * the machine's own time zone.
+     */
+    utcOffsetMinutes?: number;
+    /** Filters of the caller's own, by name, beside the built-in `format`, `upper` and `lower` (see {@link TemplateFormatter}). */
+    formatters?: Record<string, TemplateFormatter>;
     /**
      * Password, if the template document is itself encrypted; it is decrypted before rendering. Note
      * the rendered output is the plain (unencrypted) document.
@@ -2293,10 +2507,12 @@ export interface TemplateConfig {
      * parser's `onPassword`. Called with `'required'` when the template is encrypted and no password
      * was given, or `'incorrect'` when the last attempt was wrong. Return a password (sync or async) to
      * retry, or `undefined` to give up (rejecting with `PASSWORD_REQUIRED`/`PASSWORD_INCORRECT`).
-     * The callback is asked at most 3 times in total, so one that keeps returning a wrong password
-     * cannot loop forever.
+     * The callback is asked at most `maxPasswordAttempts` times in total, so one that keeps returning a
+     * wrong password cannot loop forever.
      */
     onPassword?: (reason: 'required' | 'incorrect') => string | undefined | Promise<string | undefined>;
+    /** How many times `onPassword` is asked before the render rejects, as the parser's option of the same name. Default is 3. */
+    maxPasswordAttempts?: number;
     /**
      * Optional hint for the template's format. DOCX is the only supported template format today, and the
      * format is always detected from the bytes, so this hint does not influence detection: it only
@@ -2306,10 +2522,14 @@ export interface TemplateConfig {
     fileType?: 'docx';
     /**
      * Limits on decompressing the (untrusted) template zip, same shape and defaults as the parser's.
-     * Guards against zip-bomb templates. Defaults to 512 MiB / 10000 entries. `maxRepeatedContent`
-     * (16 MiB) bounds what a document's values add by repetition: each use of a value after its first
-     * adds what the value outgrows its placeholder by, and past the limit the render rejects with
-     * `OUTPUT_TOO_LARGE` (a million placeholders of one value would otherwise write a copy at each).
+     * Guards against zip-bomb templates. Defaults to 512 MiB / 10000 entries. `maxXmlElements` (2,000,000)
+     * bounds the elements the template's parts hold, as for parsing, and its tags and their tokens with them (`XML_ELEMENT_LIMIT_EXCEEDED`). `maxRepeatedContent`
+     * (16 MiB) bounds what a document adds by repetition: each copy of a loop's content after its first,
+     * each copy of a note a repeated reference points at, each use of a value after its first (what the
+     * value outgrows its placeholder by), each block or field written again as typed, and each field, loop
+     * or branch evaluated (a few characters, plus its condition's size). Past the
+     * limit the render rejects with `OUTPUT_TOO_LARGE` (nested loops over a long list, or a million
+     * placeholders of one value, would otherwise write without bound).
      */
     decompressionLimits?: DecompressionLimits;
     /**
@@ -2519,6 +2739,14 @@ export interface IndentationMetadata {
 export interface HeadingMetadata {
     /** The heading level (e.g., 1 for H1). */
     level: number;
+    /**
+     * What decided that this block is a heading and at which level, where a format has more than one
+     * way to decide it. Set on PDF headings only:
+     * - 'tags': the document's own structure tree tags it as a heading (`H`, `H1`..`H6`).
+     * - 'font-size': the font-size and weight heuristic made it one. That is every heading of text
+     *   assembled from geometry, and a tagged heading re-leveled under `headingDetection: 'font-size'`.
+     */
+    levelSource?: 'tags' | 'font-size';
     /** The alignment of the heading. */
     alignment?: TextAlignment;
     /** The style of the heading. */

@@ -1,7 +1,8 @@
-import { ChunkingConfig, CsvGeneratorConfig, DeepRequired, DocumentStructureChunkingConfig, DocxGeneratorConfig, FixedSizeChunkingConfig, FullGeneratorConfig, HtmlGeneratorConfig, HtmlParserConfig, MdGeneratorConfig, OcrConfig, OcrTimeoutConfig, OdtGeneratorConfig, OfficeParserConfig, PdfGeneratorConfig, PdfParserConfig, SemanticChunkingConfig, TexGeneratorConfig, TexParserConfig, TextGeneratorConfig } from './types.js';
+import { ChunkingConfig, CsvGeneratorConfig, DeepRequired, DocumentStructureChunkingConfig, DocxGeneratorConfig, FixedSizeChunkingConfig, FullGeneratorConfig, HtmlGeneratorConfig, HtmlParserConfig, MdGeneratorConfig, OcrConfig, OcrTimeoutConfig, OdtGeneratorConfig, OfficeParserConfig, PdfGeneratorConfig, PdfParserConfig, SemanticChunkingConfig, TemplateConfig, TemplateDateNames, TexGeneratorConfig, TexParserConfig, TextGeneratorConfig } from './types.js';
 
 const PDFJS_VERSION = '6.2.108';
-const DEFAULT_PDF_WORKER_SRC = typeof __SLIM__ !== 'undefined' && __SLIM__ ? '' : `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
+/** The pdf.js worker address the non-slim builds fall back to (see `allowRemoteAssets`). Empty in the slim builds. */
+export const DEFAULT_PDF_WORKER_SRC = typeof __SLIM__ !== 'undefined' && __SLIM__ ? '' : `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
 
 /**
  * The default regex used for identifying sentence boundaries.
@@ -30,6 +31,7 @@ const DEFAULT_OCR_CONFIG: DeepRequired<OcrConfig> = {
     workerPath: '',
     corePath: '',
     langPath: '',
+    cacheMethod: 'write',
     preserveLayout: true,
     timeout: DEFAULT_OCR_TIMEOUT,
     abortSignal: null,
@@ -86,6 +88,8 @@ export const DEFAULT_OFFICE_PARSER_CONFIG: DeepRequired<OfficeParserConfig> = {
     // No-op default returns undefined, i.e. "no password to offer", so an encrypted document without
     // a valid `password` throws exactly as it would with the callback unset.
     onPassword: () => undefined,
+    maxPasswordAttempts: 3,
+    allowRemoteAssets: true,
     newlineDelimiter: '\n',
     ignoreNotes: false,
     ignoreComments: false,
@@ -118,6 +122,28 @@ export const DEFAULT_OFFICE_PARSER_CONFIG: DeepRequired<OfficeParserConfig> = {
 };
 
 /**
+ * Defaults for {@link OfficeTemplate.render}: the tag delimiters, what a missing field does, what a
+ * picture writes (separators, English month and day names, dates in UTC), and what a render may add by
+ * repetition (the parser's own `maxRepeatedContent`, so the two never drift).
+ */
+export const DEFAULT_TEMPLATE_CONFIG: Required<Pick<TemplateConfig, 'delimiters' | 'onMissing' | 'utcOffsetMinutes'>>
+    & { numberSeparators: Required<NonNullable<TemplateConfig['numberSeparators']>>; dateNames: Required<TemplateDateNames>; maxRepeatedContent: number } = {
+    delimiters: { start: '{{', end: '}}' },
+    onMissing: 'keep',
+    numberSeparators: { decimal: '.', group: ',' },
+    dateNames: {
+        months: ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'],
+        monthsShort: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'],
+        days: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'],
+        daysShort: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
+        am: 'AM',
+        pm: 'PM',
+    },
+    utcOffsetMinutes: 0,
+    maxRepeatedContent: DEFAULT_OFFICE_PARSER_CONFIG.decompressionLimits.maxRepeatedContent,
+};
+
+/**
  * Default configuration for HTML generation.
  */
 const DEFAULT_HTML_GENERATOR_CONFIG: DeepRequired<HtmlGeneratorConfig> = {
@@ -141,6 +167,9 @@ const DEFAULT_HTML_GENERATOR_CONFIG: DeepRequired<HtmlGeneratorConfig> = {
  */
 const DEFAULT_PDF_GENERATOR_CONFIG: DeepRequired<PdfGeneratorConfig> = {
     engine: 'html',
+    fonts: { regular: null, bold: null, italic: null, boldItalic: null, mono: null },
+    fallbackFonts: [],
+    subsetFonts: true,
     tagged: true,
     outline: false,
     format: 'A4',

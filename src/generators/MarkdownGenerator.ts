@@ -1,5 +1,5 @@
 import { AdmonitionMetadata, AdmonitionSyntax, AttributeListSyntax, BreakMetadata, CitationSyntax, CodeMetadata, ConversionResult, DefinitionListSyntax, DeprecatedAdmonitionFlavor, EmbedMetadata, EmbedSyntax, FallbackToHtmlConfig, FootnoteSyntax, GeneratorConfig, HeadingMetadata, HighlightSyntax, ImageMetadata, ListMetadata, MarkdownDialectConfig, MarkdownDialectPreset, NoteMetadata, OfficeContentNode, OfficeParserAST, OfficeWarningType, StrikethroughSyntax, TableMetadata, TextFormatting, TextMetadata, WikilinkSyntax } from '../types.js';
-import { escapeHtml, markdownEscapeInline, markdownEscapePlain, markdownEscapeTags, markdownEscapeText, sanitizeCommentText, sanitizeCssValue, sanitizeImageUrl, sanitizeMarkdownUrl, sanitizeUrl } from '../utils/sanitize.js';
+import { escapeHtml, isCssLength, isVideoId, markdownEscapeInline, markdownEscapePlain, markdownEscapeTags, markdownEscapeText, sanitizeCommentText, sanitizeCssValue, sanitizeImageUrl, sanitizeMarkdownUrl, sanitizeUrl } from '../utils/sanitize.js';
 import { isDefaultHighlight } from '../utils/colorUtils.js';
 import { isSourceComment } from '../utils/commentUtils.js';
 import { base64ByteLength, resolveEmbed } from '../utils/officeGenUtils.js';
@@ -1033,6 +1033,10 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                     // `<hr>` survives a save instead of collapsing to whitespace. Every other breakType -
                     // notably 'page', which Markdown has no syntax for - keeps emitting a bare newline.
                     const meta = node.metadata as BreakMetadata | undefined;
+                    // In a pipe-table cell (one line of Markdown) a line break is written as the `<br>` it
+                    // becomes there, not as a hard break turned into one later: trimming the cell's edges
+                    // dropped a break that began or ended the cell, and a cell holding only one came back empty.
+                    if (isLineBreakType(meta?.breakType) && this.inPipeTableCell) return this.resolvedFallbackToHtml.cellLineBreaks ? '<br>' : ' ';
                     // Where the break starts a line (after another break), two trailing spaces would
                     // make a whitespace-only line, which ends the paragraph: a backslash does not.
                     // Among blocks (no line of text around it) a line break is nothing Markdown can show.
@@ -1150,14 +1154,21 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                     const mode = this.inOneLine ? 'link' : this.resolvedEmbeds;
                     // A directive label sits inside `::name[...]`: on one line, escaped (its brackets
                     // too, which would end it), as the parser decodes it. A link label is link text,
-                    // escaped as text. An attribute value sits inside `{...}`; percent-encode the
-                    // space/brace chars that would break out (widths/aligns/ids never contain them,
-                    // but a src can).
+                    // escaped as text. An attribute value sits inside `{...}`, bare: a src has the
+                    // space/brace chars that would break out percent-encoded, and every other value is
+                    // written only when it is what its key holds (a CSS length, a video id, an
+                    // alignment). A width taken from a file as `<img onerror=...>` was written as is, raw
+                    // HTML in the Markdown.
                     const dirLabel = markdownEscapePlain(foldLines(meta?.label || '').trim()).replace(/[[\]]/g, '\\$&');
                     const linkLabel = (fallback: string) => markdownEscapeInline(foldLines(meta?.label || fallback));
                     const dirUrl = (u: string) => sanitizeMarkdownUrl(u).replace(/[{}\s]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
+                    const attrValueOk = (key: string, value: string): boolean =>
+                        key === 'width' || key === 'height' ? isCssLength(value)
+                            : key === 'id' ? isVideoId(value)
+                                : key === 'align' ? value === 'left' || value === 'center' || value === 'right'
+                                    : !/[\s{}<>"'`]/.test(value);
                     const attrList = (pairs: Array<[string, string | undefined]>) => {
-                        const kv = pairs.filter(([, v]) => v !== undefined && v !== '').map(([k, v]) => `${k}=${v}`);
+                        const kv = pairs.filter(([k, v]) => v !== undefined && v !== '' && attrValueOk(k, v)).map(([k, v]) => `${k}=${v}`);
                         return kv.length ? `{${kv.join(' ')}}` : '';
                     };
 

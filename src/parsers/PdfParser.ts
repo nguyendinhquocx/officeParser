@@ -30,7 +30,8 @@
  */
 
 import { zlibSync } from 'fflate';
-import { DEFAULT_OFFICE_PARSER_CONFIG } from '../defaults.js';
+import { passwordAttemptLimit } from '../crypto/decryptContainer.js';
+import { DEFAULT_OFFICE_PARSER_CONFIG, DEFAULT_PDF_WORKER_SRC } from '../defaults.js';
 import { FullOfficeParserConfig, ImageMetadata, OfficeAttachment, OfficeContentNode, OfficeErrorType, OfficeMetadata, OfficeParserAST, OfficeWarningType, TextFormatting, TextMetadata } from '../types.js';
 import { createAST } from '../utils/astUtils.js';
 import { parseOfficeDate } from '../utils/dateUtils.js';
@@ -1330,7 +1331,15 @@ export const parsePdf = async (buffer: Buffer, config: FullOfficeParserConfig): 
 
     // --- Worker configuration ---
     const workerSrc = config.pdfWorkerSrc;
+    // The address the library has built in is used only when the caller allows it: an application that
+    // must talk to no other site gets an error naming the option it forgot, not a request to a CDN.
+    const blockRemoteWorker = () => {
+        if (config.allowRemoteAssets === false && workerSrc !== '' && workerSrc === DEFAULT_PDF_WORKER_SRC) {
+            throw getOfficeError(OfficeErrorType.REMOTE_ASSET_BLOCKED, config, { asset: 'The pdf.js worker', options: ['pdfWorkerSrc'] });
+        }
+    };
     if (isBrowser) {
+        blockRemoteWorker();
         pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
     } else {
         assertNode('pdf-worker-auto-resolution', config);
@@ -1351,7 +1360,10 @@ export const parsePdf = async (buffer: Buffer, config: FullOfficeParserConfig): 
                 logWarning(OfficeWarningType.PDF_WORKER_FALLBACK, config, undefined, e);
             }
         }
-        if (!resolved) pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
+        if (!resolved) {
+            blockRemoteWorker();
+            pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
+        }
     }
 
     // Bound how many pixels pdf.js will decode per image. When we never read image bytes, set 1 so
@@ -1389,7 +1401,7 @@ async function readPdf(pdfjs: any, buffer: Buffer, config: FullOfficeParserConfi
     // the same way the OOXML/ODF decryptors do.
     const onPassword = config.onPassword;
     // Cap callback-driven retries so an onPassword that keeps returning a wrong password can't loop.
-    const MAX_PASSWORD_ATTEMPTS = 3;
+    const MAX_PASSWORD_ATTEMPTS = passwordAttemptLimit(config);
     let password: string | undefined = config.password || undefined;
     let passwordAttempts = 0;
     // The separate process ending while in use (out of memory, above all) fails the parse, and

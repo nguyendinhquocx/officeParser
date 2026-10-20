@@ -62,7 +62,7 @@ const knownParserBooleans = new Set([
     'ocr', 'extractAttachments', 'ignoreNotes', 'ignoreComments',
     'ignoreHeadersAndFooters', 'ignoreSlideMasters', 'ignoreInternalLinks',
     'includeRawContent', 'serializeRawContent', 'preserveXmlWhitespace', 'includeBreakNodes',
-    'ignorePageGeometry',
+    'ignorePageGeometry', 'allowRemoteAssets',
     // Dotted boolean keys are listed so a bare `--group.flag` does not swallow the following file
     // argument as its value (the isKnownBoolean check keys off the full dotted name).
     'htmlParserConfig.preserveAttributes', 'htmlParserConfig.preserveIframes', 'htmlParserConfig.embedFolkForms',
@@ -75,7 +75,7 @@ const knownParserBooleans = new Set([
 const knownGeneratorBooleans = new Set([
     'includeFormatting', 'generateIds', 'renderMetadata', 'includeImages', 'includeCharts', 'ignoreInternalLinks',
     // Dotted generator booleans, same rationale as the parser set above.
-    'pdfConfig.tagged', 'pdfConfig.outline', 'pdfConfig.landscape', 'pdfConfig.printBackground', 'pdfConfig.displayHeaderFooter',
+    'pdfConfig.tagged', 'pdfConfig.outline', 'pdfConfig.subsetFonts', 'pdfConfig.landscape', 'pdfConfig.printBackground', 'pdfConfig.displayHeaderFooter',
     'docxConfig.landscape', 'odtConfig.landscape',
     'texConfig.standalone', 'texConfig.bundle', 'texConfig.embedImages', 'texConfig.numberSections', 'texConfig.landscape',
     'textConfig.preserveLayout', 'textConfig.renderNotes',
@@ -246,9 +246,35 @@ function numbersAsNumbers(target: Record<string, any>, defaults: unknown): void 
     }
 }
 
+/**
+ * The native PDF engine's fonts are given on the command line as paths to font files
+ * (`--pdfConfig.fonts.regular=NotoSans-Regular.ttf`, `--pdfConfig.fallbackFonts=a.ttf,b.otf`); the
+ * generator takes their bytes. A path that cannot be read ends the run, naming the option.
+ */
+function fontPathsAsBytes(pdfConfig: Record<string, any> | undefined): void {
+    if (!pdfConfig) return;
+    const read = (option: string, file: unknown): Uint8Array => {
+        try {
+            return new Uint8Array(fs.readFileSync(String(file)));
+        } catch (e: any) {
+            console.error(`Could not read the font file given as --pdfConfig.${option}: ${file} (${e?.code || e?.message})`);
+            process.exit(1);
+        }
+    };
+    if (pdfConfig.fonts && typeof pdfConfig.fonts === 'object') {
+        for (const style of Object.keys(pdfConfig.fonts)) {
+            if (typeof pdfConfig.fonts[style] === 'string') pdfConfig.fonts[style] = read(`fonts.${style}`, pdfConfig.fonts[style]);
+        }
+    }
+    if (typeof pdfConfig.fallbackFonts === 'string') {
+        pdfConfig.fallbackFonts = pdfConfig.fallbackFonts.split(',').map((file: string) => file.trim()).filter(Boolean).map((file: string) => read('fallbackFonts', file));
+    }
+}
+
 if (fileArg && !showHelp) {
     numbersAsNumbers(config, DEFAULT_OFFICE_PARSER_CONFIG);
     numbersAsNumbers(generatorConfig, DEFAULT_GENERATOR_CONFIG);
+    fontPathsAsBytes(generatorConfig.pdfConfig);
     // Resolve output format prioritizing: --to > --format
     let outputFormat: string | undefined;
     if (toFlagOption) {
@@ -382,6 +408,8 @@ if (fileArg && !showHelp) {
     console.log('  --csvDelimiter=char                         Custom CSV delimiter (default: ,)');
     console.log('  --password=secret                           Password for an encrypted document (PDF, OOXML, or ODF)');
     console.log('                                              (or set OFFICEPARSER_PASSWORD to keep it out of the process list)');
+    console.log('  --allowRemoteAssets=false                   Fail, not fetch, where the pdf.js worker or OCR files would come from a CDN (default: true)');
+    console.log('  --ocrConfig.cacheMethod=none                Where OCR keeps language data: write | readOnly | refresh | none (default: write)');
     console.log('  --htmlParserConfig.preserveIframes          Keep non-YouTube <iframe> embeds (dropped by default)');
     console.log('  --htmlParserConfig.preserveComments         Keep HTML/EPUB <!-- --> comments as comment nodes (default: false)');
     console.log('  --texParserConfig.today="May 1, 2024"       What \\today prints in LaTeX input (default: the date of the parse)');
@@ -391,7 +419,7 @@ if (fileArg && !showHelp) {
     console.log('  --pdfParserConfig.useTags=false             Ignore the tagged-structure tree, use geometry only (default: true)');
     console.log('  --pdfParserConfig.detectColumns=false       Disable multi-column reading-order detection (default: true)');
     console.log('  --pdfParserConfig.pageRange=1-3,7           Parse only the given pages (default: all)');
-    console.log('  --pdfParserConfig.headingDetection=off      Heading detection: auto | font-size | off (default: auto)');
+    console.log('  --pdfParserConfig.headingDetection=off      Heading detection: auto | font-size | tags | off (default: auto)');
     console.log('  --pdfParserConfig.mergeHyphenatedWords=false Keep words hyphenated across line breaks (default: true)');
     console.log('  --pdfParserConfig.normalizeText=false       Skip Unicode/ligature normalization of PDF text (default: true)');
     console.log('  --pdfParserConfig.extractTextColor          Record each PDF run\'s fill colour in formatting.color (default: true; set false to skip)');
@@ -413,6 +441,10 @@ if (fileArg && !showHelp) {
     console.log('');
     console.log('Advanced Nested Config Examples:');
     console.log('  --pdfConfig.engine=native                   PDF engine: html (Puppeteer) | native (pdf-lib, no browser) (default: html)');
+    console.log('  --pdfConfig.fonts.regular=Sans.ttf          Font file the native engine draws in; also .bold, .italic, .boldItalic, .mono');
+    console.log('  --pdfConfig.fallbackFonts=a.ttf,b.otf       Font files tried, in order, for characters the fonts before them lack (native engine)');
+    console.log('  --pdfConfig.subsetFonts=false               Embed whole font files, not only the glyphs used (default: true)');
+    console.log('  --pdfConfig.outline                         Write a bookmark outline from the headings (default: false)');
     console.log('  --pdfConfig.format=Letter                   PDF paper format (A4 | Letter | Legal | A3 ...), both engines');
     console.log('  --chunksConfig.strategy=fixed-size          Chunking strategy (fixed-size | document-structure | semantic)');
     console.log('  --mdConfig.dialect=github                   Markdown dialect (extended | github | gitlab | obsidian | pandoc | commonmark)');

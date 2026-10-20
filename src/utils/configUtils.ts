@@ -1,5 +1,5 @@
 import { DEFAULT_DOCUMENT_STRUCTURE_CHUNKING_CONFIG, DEFAULT_FIXED_SIZE_CHUNKING_CONFIG, DEFAULT_GENERATOR_CONFIG, DEFAULT_OFFICE_PARSER_CONFIG, DEFAULT_SEMANTIC_CHUNKING_CONFIG } from '../defaults.js';
-import { FullGeneratorConfig, FullOfficeParserConfig, GeneratorConfig, OfficeIssue, OfficeParserConfig, OfficeWarningType } from '../types.js';
+import { DecompressionLimits, FullGeneratorConfig, FullOfficeParserConfig, GeneratorConfig, OfficeIssue, OfficeParserConfig, OfficeWarningType } from '../types.js';
 import { logWarning } from './errorUtils.js';
 import { PAPER_FORMAT_NAMES } from './officeGenUtils.js';
 import { lookupTable } from './lookupUtils.js';
@@ -133,16 +133,60 @@ export function isFullGeneratorConfig(config: any): config is FullGeneratorConfi
         'onNode' in config);
 }
 
+/** Whether `value` holds every key `defaults` has, and, where a default is an object of options, every key of that too. */
+function hasEveryKey(value: any, defaults: Record<string, any>): boolean {
+    for (const key of Object.keys(defaults)) {
+        if (!(key in value)) return false;
+        const fallback = defaults[key];
+        const nested = fallback && typeof fallback === 'object' && !Array.isArray(fallback) && !ArrayBuffer.isView(fallback);
+        if (nested && (!value[key] || typeof value[key] !== 'object' || !hasEveryKey(value[key], fallback))) return false;
+    }
+    return true;
+}
+
 /**
- * Checks if a configuration object is a FullOfficeParserConfig.
+ * Checks if a configuration object is a FullOfficeParserConfig: one holding every option the defaults
+ * have, nested options included, as a resolved config does. A config naming only some (such as an
+ * ocrConfig with its language and workerPath) is a caller's partial one, merged with the defaults:
+ * taken for a full one, it kept none of them and was checked for nothing.
  */
 export function isFullParserConfig(config: any): config is FullOfficeParserConfig {
-    return !!(config &&
-        typeof config === 'object' &&
-        'ocrConfig' in config &&
-        typeof config.ocrConfig === 'object' &&
-        'language' in config.ocrConfig &&
-        'workerPath' in config.ocrConfig);
+    return !!config && typeof config === 'object' && hasEveryKey(config, DEFAULT_OFFICE_PARSER_CONFIG);
+}
+
+/**
+ * `decompressionLimits` with each limit as given when it is a number of 0 or more (Infinity turns a bound
+ * off); another value is reported (INVALID_CONFIG_VALUE) and the default used. Compared with NaN or text,
+ * a bound never fired. Shared by the parser and OfficeTemplate.render.
+ */
+export function decompressionLimitsOf(limits: DecompressionLimits | undefined, config: Pick<OfficeParserConfig, 'onWarning'>): Required<DecompressionLimits> {
+    const defaults = DEFAULT_OFFICE_PARSER_CONFIG.decompressionLimits;
+    const out = { ...defaults } as Required<DecompressionLimits>;
+    // Not an object of limits at all (`'x'`, a list): reported, and every default used.
+    if (limits !== undefined && limits !== null && (typeof limits !== 'object' || Array.isArray(limits))) {
+        logWarning(OfficeWarningType.INVALID_CONFIG_VALUE, config as OfficeParserConfig, { option: 'decompressionLimits', value: limits, expected: 'an object of limits by name', fallback: undefined });
+        return out;
+    }
+    for (const key of Object.keys(defaults) as (keyof Required<DecompressionLimits>)[]) {
+        const value = limits?.[key];
+        if (value === undefined) continue; // left out (or set to undefined): the default
+        if (typeof value === 'number' && value >= 0) { out[key] = value; continue; }
+        logWarning(OfficeWarningType.INVALID_CONFIG_VALUE, config as OfficeParserConfig, { option: `decompressionLimits.${key}`, value, expected: 'a number of 0 or more', fallback: defaults[key] });
+    }
+    return out;
+}
+
+/**
+ * `maxPasswordAttempts` as given, when it is a whole number of 0 or more; another value is reported
+ * (INVALID_CONFIG_VALUE) and the default used. Shared by the parser and OfficeTemplate.render.
+ */
+export function maxPasswordAttemptsOf(config: { maxPasswordAttempts?: unknown } & Pick<OfficeParserConfig, 'onWarning'>): number {
+    const value = config.maxPasswordAttempts;
+    const fallback = DEFAULT_OFFICE_PARSER_CONFIG.maxPasswordAttempts;
+    if (value === undefined) return fallback;
+    if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return value;
+    logWarning(OfficeWarningType.INVALID_CONFIG_VALUE, config as OfficeParserConfig, { option: 'maxPasswordAttempts', value, expected: 'a whole number of 0 or more', fallback });
+    return fallback;
 }
 
 /**
@@ -182,6 +226,7 @@ export function resolveParserConfig(
         if (userConfig.texParserConfig) {
             resolved.texParserConfig = { ...userConfig.texParserConfig };
         }
+        checkResolved(resolved);
         return resolved;
     }
 
@@ -215,12 +260,7 @@ export function resolveParserConfig(
         logWarning(OfficeWarningType.UNRECOGNIZED_CONFIG_OPTION, config, { keys: unknownKeys, renames: RENAMED_PARSER_KEYS });
     }
 
-    if (decompressionLimits) {
-        config.decompressionLimits = {
-            ...config.decompressionLimits,
-            ...decompressionLimits,
-        };
-    }
+    if (decompressionLimits) config.decompressionLimits = decompressionLimitsOf(decompressionLimits, config);
 
     if (htmlParserConfig) {
         config.htmlParserConfig = {
@@ -261,13 +301,37 @@ export function resolveParserConfig(
         };
     }
 
-    // 3. Propagate the top-level abortSignal to ocrConfig so the OCR subsystem is aware of it
+    checkResolved(config);
+    return config;
+}
+
+/**
+ * The checks every resolved config passes, merged from a partial one or given full: a value an option
+ * does not take is reported (INVALID_CONFIG_VALUE) and its default used, not passed on to fail (or be
+ * ignored) further in; and the top-level abortSignal reaches the OCR subsystem.
+ */
+function checkResolved(config: FullOfficeParserConfig): void {
+    const oneOf = (option: string, value: unknown, allowed: readonly string[], fallback: string): boolean => {
+        if (value === undefined || allowed.includes(value as string)) return true;
+        logWarning(OfficeWarningType.INVALID_CONFIG_VALUE, config, { option, value, expected: `one of ${allowed.join(', ')}`, fallback });
+        return false;
+    };
+    if (config.pdfParserConfig && !oneOf('pdfParserConfig.headingDetection', config.pdfParserConfig.headingDetection, PDF_HEADING_DETECTION, DEFAULT_OFFICE_PARSER_CONFIG.pdfParserConfig.headingDetection)) {
+        config.pdfParserConfig.headingDetection = DEFAULT_OFFICE_PARSER_CONFIG.pdfParserConfig.headingDetection;
+    }
+    if (!oneOf('ocrConfig.cacheMethod', config.ocrConfig.cacheMethod, OCR_CACHE_METHODS, DEFAULT_OFFICE_PARSER_CONFIG.ocrConfig.cacheMethod)) {
+        config.ocrConfig.cacheMethod = DEFAULT_OFFICE_PARSER_CONFIG.ocrConfig.cacheMethod;
+    }
+    config.decompressionLimits = decompressionLimitsOf(config.decompressionLimits, config);
+    config.maxPasswordAttempts = maxPasswordAttemptsOf(config);
     if (config.abortSignal) {
         config.ocrConfig.abortSignal = config.abortSignal;
     }
-
-    return config;
 }
+
+/** The values `pdfParserConfig.headingDetection` and `ocrConfig.cacheMethod` take. */
+const PDF_HEADING_DETECTION = ['auto', 'font-size', 'tags', 'off'] as const;
+const OCR_CACHE_METHODS = ['write', 'readOnly', 'refresh', 'none'] as const;
 
 /** The per-destination and metadata sub-objects a generator config groups its settings into. */
 const GENERATOR_CONFIG_CONTAINERS = [
@@ -308,6 +372,8 @@ const RECOGNIZED_NESTED_GENERATOR_KEYS: Record<string, Set<string>> = lookupTabl
         ...Object.keys(DEFAULT_SEMANTIC_CHUNKING_CONFIG), 'embeddingFunction',
     ]),
     metadataOverrides: new Set(['title', 'author', 'description', 'subject', 'keywords', 'lastModifiedBy', 'created', 'modified', 'language', 'custom']),
+    // A container inside one: its keys are checked as well.
+    'pdfConfig.fonts': new Set(Object.keys(DEFAULT_GENERATOR_CONFIG.pdfConfig.fonts)),
 });
 
 /**
@@ -323,7 +389,14 @@ function unknownGeneratorKeys(userConfig: Record<string, any>): string[] {
         const container = userConfig[key];
         if (!recognized || !container || typeof container !== 'object' || Array.isArray(container)) continue;
         for (const inner of Object.keys(container)) {
-            if (!PROTOTYPE_POLLUTION_KEYS.has(inner) && !recognized.has(inner)) unknown.push(`${key}.${inner}`);
+            if (PROTOTYPE_POLLUTION_KEYS.has(inner)) continue;
+            if (!recognized.has(inner)) { unknown.push(`${key}.${inner}`); continue; }
+            const deeper = RECOGNIZED_NESTED_GENERATOR_KEYS[`${key}.${inner}`];
+            const nested = container[inner];
+            if (!deeper || !nested || typeof nested !== 'object' || Array.isArray(nested) || ArrayBuffer.isView(nested)) continue;
+            for (const leaf of Object.keys(nested)) {
+                if (!PROTOTYPE_POLLUTION_KEYS.has(leaf) && !deeper.has(leaf)) unknown.push(`${key}.${inner}.${leaf}`);
+            }
         }
     }
     return unknown;
@@ -404,7 +477,9 @@ export function resolveGeneratorConfig<D extends string>(
                         !(source[key] instanceof Function) &&
                         !(source[key] instanceof Date) &&
                         !(source[key] instanceof RegExp) &&
-                        !(source[key] instanceof Buffer)
+                        // A font's bytes are a value, not a container to merge key by key.
+                        !ArrayBuffer.isView(source[key]) &&
+                        !(source[key] instanceof ArrayBuffer)
                     ) {
                         if (!target[key] || typeof target[key] !== 'object') {
                             target[key] = {};
@@ -433,6 +508,13 @@ export function resolveGeneratorConfig<D extends string>(
     // 3. Inherit from AST config if not explicitly provided
     const refusedDelimiters: { option: string; value: unknown; expected: string; fallback: string }[] = [];
     if (astConfig) {
+        // A parse told to use none of the library's built-in addresses writes none either: the chart
+        // script's CDN address is left out of HTML (and of the HTML a PDF is printed from) unless the
+        // caller names one.
+        if (astConfig.allowRemoteAssets === false && (userConfig as any)?.htmlConfig?.chartJsSrc === undefined) {
+            config.htmlConfig.chartJsSrc = '';
+        }
+
         if (userConfig?.onWarning === undefined) {
             config.onWarning = astConfig.onWarning || config.onWarning;
         }
