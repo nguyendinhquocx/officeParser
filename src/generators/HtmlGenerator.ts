@@ -1,7 +1,7 @@
 import { AdmonitionMetadata, CellMetadata, CodeMetadata, ConversionResult, EmbedMetadata, GeneratorConfig, HeadingMetadata, ImageMetadata, ListMetadata, NoteMetadata, OfficeAttachment, OfficeContentNode, OfficeParserAST, OfficeWarningType, PageMetadata, SlideMetadata, StandaloneConfig, TableMetadata, TextMetadata } from '../types.js';
 import { BaseGenerator } from './BaseGenerator.js';
 import { checkAbortSignal } from '../utils/errorUtils.js';
-import { base64ByteLength, documentLanguage, isHeaderRow, resolveEmbed } from '../utils/officeGenUtils.js';
+import { base64ByteLength, documentLanguage, isHeaderRow, resolveEmbed, writableSpacing } from '../utils/officeGenUtils.js';
 import { escapeHtml, isSafeHtmlAttributeName, isSafeStyleMapTag, sanitizeCommentText, sanitizeCssValue, sanitizeUrl, sanitizeImageUrl, serializeForInlineScript } from '../utils/sanitize.js';
 import { isDefaultHighlight } from '../utils/colorUtils.js';
 import { isSourceComment } from '../utils/commentUtils.js';
@@ -468,7 +468,8 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
             metaTags = this.renderMetaTags();
         }
 
-        const styleBlock = sa.styles === 'none' ? '' : `<style>${
+        // Marked as the writer's own defaults, which a reader leaves out of the document's look.
+        const styleBlock = sa.styles === 'none' ? '' : `<style data-default-styles>${
             sa.styles === 'scoped'
                 ? this.getScopedPremiumStyles(this.isSpreadsheetMode, isPresentation, isPdf)
                 : this.getPremiumStyles(this.isSpreadsheetMode, isPresentation, isPdf)
@@ -674,6 +675,8 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                 this.onNodeSkipped.add(node);
                 continue;
             }
+            // A shape drawn on a slide (ShapeMetadata) writes nothing, and no gap around it either.
+            if (node.type === 'drawing' && !node.children?.length && typeof override !== 'string') continue;
 
             // A top-level footnote/endnote note is an orphan definition (the MarkdownParser
             // recovers unreferenced `[^id]: ...` defs as trailing note nodes). Route it into the
@@ -857,6 +860,8 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
         if (actualOverride === false) {
             return '';
         }
+        // A shape drawn on a slide (ShapeMetadata) writes nothing: its text is in the nodes after it.
+        if (node.type === 'drawing' && !node.children?.length && typeof actualOverride !== 'string') return '';
 
         // Returning a string overrides default rendering and recursion
         if (typeof actualOverride === 'string') {
@@ -1302,9 +1307,15 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
 
             case 'break': {
                 const breakType = (node.metadata as any)?.breakType;
+                // A section starting on a new page: a page break, as the HTML reader reads it and print breaks
+                // the page, but no rule on screen (it is the document's structure, not a break the author typed).
+                // (Styled in place too: without this writer's stylesheet, in EPUB or a fragment, it was a rule.)
+                if (breakType === 'page' && typeof (node.metadata as any)?.section === 'number') return `${extraAnchors}<hr class="page-break section-start"${idAttr} style="border:none;height:0;margin:0;break-after:page">`;
                 if (breakType === 'page') return `${extraAnchors}<hr class="page-break"${idAttr}>`;
                 // A thematic break is a plain rule; the parser reads a bare <hr> back as one.
                 if (breakType === 'thematic') return `${extraAnchors}<hr${idAttr}>`;
+                // A section starting on the same page (its columns) breaks no text.
+                if (breakType === 'section') return extraAnchors;
                 return '<br>';
             }
 
@@ -1917,6 +1928,12 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
             // so `HtmlParser` reads it back and the pipe-table markers survive AST -> HTML -> AST.
             // An unaligned cell (no `align`) adds nothing, keeping its HTML byte-identical.
             if (node.type === 'cell' && meta.align) pushSafe('text-align', meta.align);
+            // A list item's own marker (`a)`, `iv.`, `◦`) as a CSS string, every character but a letter,
+            // a digit or a space escaped, so nothing in it can end the string or the attribute.
+            if (node.type === 'list' && typeof meta.marker === 'string' && !meta.isTask) {
+                const escaped = [...meta.marker].slice(0, 32).map(ch => /^[\p{L}\p{N} ]$/u.test(ch) ? ch : `\\${ch.codePointAt(0)!.toString(16)} `).join('');
+                styles.push(`list-style-type: '${escaped}${meta.marker ? ' ' : ''}'`);
+            }
             if (meta.backgroundColor) pushSafe('background-color', meta.backgroundColor);
             if (meta.verticalAlign) pushSafe('vertical-align', meta.verticalAlign);
             if (meta.paragraphIndentation) {
@@ -1924,6 +1941,14 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                 if (ind.left) styles.push(`margin-left: ${ind.left / 20}pt`);
                 if (ind.right) styles.push(`margin-right: ${ind.right / 20}pt`);
                 if (ind.firstLine) styles.push(`text-indent: ${ind.firstLine / 20}pt`);
+            }
+            const spacing = writableSpacing(meta);
+            if (spacing) {
+                if (spacing.before !== undefined) styles.push(`margin-top: ${+spacing.before.toFixed(2)}pt`);
+                if (spacing.after !== undefined) styles.push(`margin-bottom: ${+spacing.after.toFixed(2)}pt`);
+                // A fixed line height is written as one; CSS has no least height for a line.
+                if (spacing.lineMultiple) styles.push(`line-height: ${+spacing.lineMultiple.toFixed(3)}`);
+                else if (spacing.lineHeight) styles.push(`line-height: ${+spacing.lineHeight.toFixed(2)}pt`);
             }
         }
 
@@ -2405,6 +2430,8 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
             
             .page-break { border: none; border-top: 2px dashed var(--border-color); margin: 40px 0; position: relative; }
             .page-break::after { content: 'PAGE BREAK'; position: absolute; top: -10px; left: 50%; transform: translateX(-50%); background: white; padding: 0 15px; font-size: 10px; color: #b2bec3; font-weight: bold; letter-spacing: 1px; }
+            .page-break.section-start { border: none; height: 0; margin: 0; }
+            .page-break.section-start::after { content: none; }
 
             /* Metadata Styles */
             .metadata-summary { 

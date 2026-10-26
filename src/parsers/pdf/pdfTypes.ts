@@ -7,11 +7,11 @@
  *
  * @module parsers/pdf/pdfTypes
  */
-
 import { NodeBounds, TextFormatting, TextMetadata } from '../../types.js';
+import type { PdfShape } from './pdfShapes.js';
 
-/** A run's writing angle after snapping to the nearest quarter turn. */
-export type RunAngle = 0 | 90 | 180 | 270;
+/** A run's writing angle after snapping to the nearest quarter turn, or -1 for one between them. */
+export type RunAngle = 0 | 90 | 180 | 270 | -1;
 
 /** Resolved font attributes for one pdf.js font id, looked up once per document. */
 export interface ResolvedFont {
@@ -43,6 +43,8 @@ export interface RawRun {
     dir: 'ltr' | 'rtl' | 'ttb';
     /** Snapped writing angle. Only 0 goes through the normal flow; others are appended after. */
     angle: RunAngle;
+    /** The angle the run is turned at on the page, in whole degrees clockwise (0 for level text). */
+    turn: number;
     /** Marked-content id for the tagged path, or null. */
     mcid: string | null;
     /** True when the run sits inside an Artifact scope (running header/footer, decoration). */
@@ -75,6 +77,10 @@ export interface PdfLine {
     /** True when the line's visible text ends in a hyphen (candidate for de-hyphenation). */
     endsWithHyphen: boolean;
     dir: 'ltr' | 'rtl';
+    /** True when the line reads right to left, as its paragraph does (see textLayout's directionsOf). */
+    rtl?: boolean;
+    /** The x of a column gutter the line was cut at, beside it (see textLayout's columnGutters). */
+    gutter?: number;
 }
 
 /** An image placed on a page, in viewport space. */
@@ -111,6 +117,8 @@ export interface PageExtract {
     images: PdfImage[];
     /** Raw pdf.js struct tree for the tagged path; null when untagged/unavailable. */
     structTree: unknown | null;
+    /** The shapes the page draws (see pdfShapes): bullets drawn as shapes, tables' ruling lines. */
+    shapes?: PdfShape[];
 }
 
 /** Resolved PDF-specific knobs, read from `config.pdfParserConfig` with numeric coercion done. */
@@ -124,6 +132,8 @@ export interface PdfLayoutConfig {
     normalizeText: boolean;
     /** Extract per-run fill color from the operator list into `formatting.color` (costs an op-list fetch per page). */
     extractTextColor: boolean;
+    /** Running headers and footers stay in their page's content instead of `auxiliary`. */
+    keepHeadersAndFootersInPages: boolean;
     /** When false, geometry is not written onto emitted nodes. */
     includeBounds: boolean;
     /** Run pdf.js's worker in a separate process (Node), under `processMemoryMb` of heap. */

@@ -153,6 +153,8 @@ const FULL_CONFIG: DeepRequired<OfficeParserConfig> = {
         pageRange: '',
         normalizeText: true,
         extractTextColor: true,
+        // In auxiliary, as headers and footers: the most the AST says of them.
+        keepHeadersAndFootersInPages: false,
         maxTextItems: 20_000,
         maxOperators: 250_000,
         maxAnnotations: 10_000,
@@ -592,7 +594,7 @@ function applyOdpParityAdjustments(
 ): { adjusted: FeatureMetrics, notes: Record<string, string> } {
     const adjusted = { ...actual, lists: { ...actual.lists }, tables: { ...actual.tables }, attachments: { ...actual.attachments } };
     const notes: Record<string, string> = {};
-    const { emptyLists, tablePadding, mergedCells, splitLists, layoutLists, referencedAttachments } = getOdpVirtualDiscrepancies(ast);
+    const { emptyLists, tablePadding, splitLists, layoutLists, referencedAttachments } = getOdpVirtualDiscrepancies(ast);
 
     // 1. Attachments: Filter unused media
     const actualAttachments = ast.attachments || [];
@@ -603,10 +605,10 @@ function applyOdpParityAdjustments(
         adjusted.attachments.withOCR = actualAttachments.filter(a => referencedAttachments.has(a.name || '') && a.ocrText !== undefined).length;
     }
 
-    // 2. Tables: Account for merged cells and padding
-    if (mergedCells > 0 || tablePadding > 0) {
-        notes['Tables - Cells'] = `ODP table cells adjusted. Adjusted for ${tablePadding} implicit empty trailing cells, ${mergedCells} merged/spanned cells`;
-        adjusted.tables.cells += (mergedCells + tablePadding);
+    // 2. Tables: Account for padding (positions a merged cell covers are no cells in either format)
+    if (tablePadding > 0) {
+        notes['Tables - Cells'] = `ODP table cells adjusted. Adjusted for ${tablePadding} implicit empty trailing cells`;
+        adjusted.tables.cells += tablePadding;
     }
 
     // 3. Lists: Exclude placeholders and layout-wrap lists
@@ -3395,13 +3397,17 @@ async function testPdfSmoke(): Promise<FeatureTest[]> {
         const fsH = collectHeadings(await OfficeParser.parseOffice(getFilePath('pdf'), { ocr: false, pdfParserConfig: { headingDetection: 'font-size' } }));
         // 'auto' trusts the tags: the calibre fixture tags many body-sized headings (e.g. "Text Formatting").
         add("headingDetection:'auto' trusts tagged headings", isH(autoH, 'Text Formatting'), '"Text Formatting" is a heading', isH(autoH, 'Text Formatting') ? 'heading' : 'not heading');
-        // 'font-size' ignores the tag levels and applies the size/weight heuristic instead, so a body-sized
-        // tagged heading is demoted and the count drops below 'auto'. Before the option was wired up, this
-        // produced the identical result to 'auto' (the option did nothing).
+        // 'font-size' ignores the tag levels and applies the size/weight heuristic instead: the fixture's
+        // headings are a point or two larger than its text and bold (14pt and 13pt over 12pt), so it finds
+        // the same ones, levelled by their sizes (the 26pt title first), not by the tags (which make the
+        // title and "Text Formatting" both level 1). Before the option was wired up, this produced the
+        // identical result to 'auto' (the option did nothing).
+        const levelOf = (hs: any[], t: string) => hs.find((h: any) => String(h.text || '').startsWith(t))?.metadata?.level;
+        const fsLevels = [levelOf(fsH, 'Demonstration'), levelOf(fsH, 'Text Formatting'), levelOf(fsH, 'Inline formatting')];
         add("headingDetection:'font-size' overrides tags via size heuristic",
-            fsH.length > 0 && fsH.length < autoH.length && !isH(fsH, 'Text Formatting'),
-            `fewer than ${autoH.length} headings, "Text Formatting" demoted`,
-            `${fsH.length} headings, "Text Formatting" heading=${isH(fsH, 'Text Formatting')}`);
+            fsH.length === autoH.length && JSON.stringify(fsLevels) === '[1,2,3]' && levelOf(autoH, 'Text Formatting') === 1 && fsH.every((h: any) => h.metadata?.levelSource === 'font-size'),
+            `${autoH.length} headings, levelled 1, 2, 3 by size`,
+            `${fsH.length} headings, levels ${JSON.stringify(fsLevels)}`);
     } catch (e: any) {
         add("headingDetection font-size", false, 'ran', e?.message || String(e));
     }
@@ -3588,6 +3594,18 @@ async function testPdfSmoke(): Promise<FeatureTest[]> {
                 !(dropped.auxiliary as any)?.headers && !(dropped.auxiliary as any)?.footers && droppedText.includes('WATERMARK DRAFT'),
                 'no headers/footers, watermark kept',
                 `headers=${((dropped.auxiliary as any)?.headers || []).length} watermark=${droppedText.includes('WATERMARK DRAFT')}`);
+            // Kept in the page on request: the header before the page's text, the footer after it, and in
+            // a writer that writes no running headers (a slide per page) too.
+            const kept = await OfficeParser.parseOffice(path.join(pdfDir, `${name}.pdf`), { ocr: false, pdfParserConfig: { keepHeadersAndFootersInPages: true } });
+            const keptText = textOf(kept).replace(/\s+/g, ' ');
+            const order = ['RUNNING HEADER', 'FIRST BODY PARAGRAPH', 'WATERMARK DRAFT', 'SECOND BODY PARAGRAPH', 'RUNNING FOOTER'].map(t => keptText.indexOf(t));
+            add(`${name}: keepHeadersAndFootersInPages keeps them in the page, in place`,
+                !(kept.auxiliary as any)?.headers && !(kept.auxiliary as any)?.footers && order.every((at, i) => at >= 0 && (i === 0 || at > order[i - 1])),
+                'header, body, footer in page order', `${JSON.stringify(order)} ${keptText.slice(0, 120)}`);
+            const slide = String((await kept.to('text')).value);
+            add(`${name}: a kept header reaches a writer of no running headers`, slide.includes('RUNNING HEADER') && slide.includes('RUNNING FOOTER'), 'both in the text output', slide.replace(/\s+/g, ' ').slice(0, 120));
+            const keptDropped = await OfficeParser.parseOffice(path.join(pdfDir, `${name}.pdf`), { ocr: false, ignoreHeadersAndFooters: true, pdfParserConfig: { keepHeadersAndFootersInPages: true } });
+            add(`${name}: ignoreHeadersAndFooters still drops kept headers`, !textOf(keptDropped).includes('RUNNING HEADER') && textOf(keptDropped).includes('WATERMARK DRAFT'), 'no header text', textOf(keptDropped).replace(/\s+/g, ' ').slice(0, 120));
         } catch (e: any) {
             add(`${name} parse`, false, 'parsed', e?.message || String(e));
         }

@@ -9,7 +9,8 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { strFromU8, unzipSync, zipSync, zlibSync } from 'fflate';
+import { strFromU8, unzipSync, unzlibSync, zipSync, zlibSync } from 'fflate';
+import { PDFDocument, PDFName, PDFRawStream } from 'pdf-lib';
 import { OfficeGenerator } from '../../src/OfficeGenerator';
 import { OfficeParser } from '../../src/OfficeParser';
 import { OfficeTemplate } from '../../src/OfficeTemplate';
@@ -28,6 +29,7 @@ import { terminateOcr } from '../../src/utils/ocrUtils';
 import { OfficeErrorType } from '../../src/types';
 import { buildTaggedNodes } from '../../src/parsers/pdf/structTree';
 import { computeDocContext } from '../../src/parsers/pdf/textLayout';
+import { MarkedContent } from '../../src/parsers/pdf/actualText';
 
 let passed = 0;
 let failed = 0;
@@ -692,7 +694,7 @@ async function markdownTests() {
         ['5,000 cells along a diagonal', sheetOf(Array.from({ length: 5_000 }, (_, i) => ({ type: 'row', children: [{ type: 'cell', metadata: { row: i, col: i }, children: [T0('d' + i)] }] })))],
         ['a span of a billion columns', sheetOf([{ type: 'row', children: [{ type: 'cell', metadata: { row: 0, col: 0, colSpan: 1e9, rowSpan: 1e9 }, children: [T0('wide')] }] }])],
     ] as const) {
-        for (const format of ['html', 'csv', 'md', 'tex', 'docx', 'odt', 'rtf', 'text', 'epub'] as const) {
+        for (const format of ['html', 'csv', 'md', 'tex', 'docx', 'odt', 'rtf', 'text', 'epub', 'xlsx', 'ods', 'pptx', 'odp'] as const) {
             // Bounded by the grid budget: the size is the check (a budget not kept would not finish).
             const out: any = (await OfficeGenerator.generate(ast, format, { onWarning: () => {} } as any)).value;
             const size = typeof out === 'string' ? out.length : out.length ?? out.byteLength;
@@ -708,7 +710,7 @@ async function markdownTests() {
     const handSpan = { type: 'docx', metadata: {}, attachments: [], content: [{ type: 'table', children: [{ type: 'row', children: [{ type: 'cell', metadata: { colSpan: 1e8, rowSpan: 1e8 }, children: [T0('x')] }] }, { type: 'row', children: [{ type: 'cell', children: [T0('y')] }] }] }] } as any;
     const manySheets = { type: 'xlsx', metadata: {}, attachments: [], content: Array.from({ length: 20 }, () => sheetOf([{ type: 'row', children: [{ type: 'cell', metadata: { row: 0, col: 0 }, children: [T0('a')] }] }, { type: 'row', children: [{ type: 'cell', metadata: { row: 1999, col: 999 }, children: [T0('b')] }] }]).content[0]) } as any;
     for (const [label, ast] of [['a span of 100 million on a cell without coordinates', handSpan], ['20 sheets each holding 2 million positions', manySheets]] as const) {
-        for (const format of ['html', 'md', 'csv', 'tex', 'docx', 'odt', 'epub', 'pdf'] as const) {
+        for (const format of ['html', 'md', 'csv', 'tex', 'docx', 'odt', 'epub', 'pdf', 'xlsx', 'ods', 'pptx', 'odp'] as const) {
             const out: any = (await OfficeGenerator.generate(ast, format, { onWarning: () => {}, pdfConfig: { engine: 'native' } } as any)).value;
             const size = typeof out === 'string' ? out.length : out.length ?? out.byteLength;
             check(`${format}: ${label} is written bounded`, size < 20_000_000, `${size} bytes`);
@@ -760,6 +762,12 @@ async function markdownTests() {
         });
         check(`md: ${label} parses and serializes`, outcome === 'ok', outcome);
     }
+    // A document's stylesheet is bounded: its rules, the rules tried for each element and the ancestors
+    // looked through, so a thousand descendant rules over deeply nested elements cost in proportion.
+    const rules = Array.from({ length: 2000 }, (_, i) => `.a .a .a .b${i % 50}, div div div div div span.c { color: #${(i % 4096).toString(16).padStart(3, '0')} }`).join('\n');
+    await linear('html: a stylesheet of 4,000 descendant selectors over 20,000 nested elements', () => OfficeParser.parseOffice(Buffer.from(`<style>${rules}</style>`
+        + `${'<div class="a">'.repeat(200)}${'<span class="c b1">x</span>'.repeat(n(20_000))}${'</div>'.repeat(200)}`), { fileType: 'html' } as any));
+    await linear('html: a stylesheet of one unclosed block parses', () => OfficeParser.parseOffice(Buffer.from(`<style>${'p { color: red; '.repeat(n(50_000))}</style><p>x</p>`), { fileType: 'html' } as any));
     // A table cell's alignment wrappers are found once each, not searched for a closing tag from each.
     await linear('md: a cell of 80,000 unclosed alignment wrappers parses', () => OfficeParser.parseOffice(Buffer.from(`| a |\n| - |\n| ${'<div style="text-align: left">x'.repeat(n(80_000))} |`), { fileType: 'md' } as any));
     // Writing many blocks, or a paragraph of many runs, never reads back all it has written: reading
@@ -776,6 +784,14 @@ async function markdownTests() {
             await linear(`${format}: 100,000 ${label} are written`, () => OfficeGenerator.generate(astWith(content() as any), format, { onWarning: () => { } } as any));
         }
     }
+    // A section's end goes in its last paragraph (DOCX), and each one rewrote all written before it.
+    await linear('docx: 20,000 sections are written', () => OfficeGenerator.generate(astWith(Array.from({ length: n(20_000) }, (_, i) => [
+        { type: 'paragraph', children: [{ type: 'text', text: `s${i}` }] },
+        { type: 'break', metadata: { breakType: i % 2 ? 'section' : 'page', section: i + 1 } }]).flat() as any), 'docx', { onWarning: () => { } } as any));
+    // (Blocks an onNode string gives too: each section's end looked back past all of them.)
+    await linear('docx: 20,000 sections after onNode blocks are written', () => OfficeGenerator.generate(astWith(Array.from({ length: n(20_000) }, (_, i) => [
+        { type: 'paragraph', children: [{ type: 'text', text: `o${i}` }] },
+        { type: 'break', metadata: { breakType: 'page', section: i + 1 } }]).flat() as any), 'docx', { onWarning: () => { }, onNode: (node: any) => node.type === 'paragraph' ? '<w:p><w:r><w:t>given</w:t></w:r></w:p>' : undefined } as any));
     // A colour table found each run's colour by scanning it.
     const colours = () => astWith([{ type: 'paragraph', children: Array.from({ length: n(many) }, (_, i) => ({ type: 'text', text: `r${i} `, formatting: { color: `#${i.toString(16).padStart(6, '0')}` } })) }] as any);
     await linear('rtf: 100,000 runs of distinct colours are written', () => OfficeGenerator.generate(colours(), 'rtf', { onWarning: () => { } } as any));
@@ -2639,6 +2655,11 @@ async function parserHardeningTests() {
     await timed('xlsx: 160k unclosed rows parse', () => parseQuiet(withSheetData('<row r="1"><c r="A1"><v>1</v></c>'.repeat(n(160000))), 'xlsx'));
     await timed('xlsx: a row of 160k unclosed cells parses', () => parseQuiet(withSheetData('<row r="1">' + '<c r="A1"><v>1</v>'.repeat(n(160000)) + '</row>'), 'xlsx'));
     await timed('xlsx: a cell of 160k unclosed values parses', () => parseQuiet(withSheetData('<row r="1"><c r="A1" t="inlineStr"><is>' + '<t>1'.repeat(n(160000)) + '</is></c></row>'), 'xlsx'));
+    // A sheet's hyperlinks are bounded by the positions they visit: one range of 100k cells repeated
+    // thousands of times marked nothing new and visited all of it each time.
+    await timed('xlsx: a hyperlink range repeated 6,400 times parses', () => parseQuiet(repack('test.xlsx', z => {
+        z['xl/worksheets/sheet1.xml'] = enc(sheetXml.replace(/<\/worksheet>/, `<hyperlinks>${'<hyperlink ref="A1:A99990" location="Sheet1!A1"/>'.repeat(n(6400))}</hyperlinks></worksheet>`));
+    }), 'xlsx'));
     // A number format is classified once per format with one forward pass. At 100k `[` the old
     // backtracking strip took 4.5 s, so 200k keeps it well past the limit.
     const withStyles = (formatCode: string, cellFormats: number) => repack('test.xlsx', z => {
@@ -2661,6 +2682,122 @@ async function parserHardeningTests() {
     await timed('csv: a 1 MB run of digits is checked as a formula', async () => csvSafeCell('1'.repeat(n(1_000_000)) + 'x', ','));
     await timed('xlsx: 1 MB of & in an inline string decodes', () => parseQuiet(withSheetData('<row r="1"><c r="A1" t="inlineStr"><is><t>' + '&amp;'.repeat(n(200000)) + '</t></is></c></row>'), 'xlsx'));
     await timed('docx: an image width of 200 KB of spaces is written', () => OfficeGenerator.generate(astWith([{ type: 'paragraph', children: [{ type: 'image', metadata: { url: 'a.png', width: '1' + ' '.repeat(n(200000)) + 'x' } }] }]), 'docx' as any, { onWarning: () => {} } as any));
+    // A GIF or BMP the native PDF engine turns into PNG is held to its pixel budget before any pixel is
+    // allocated, and noise as LZW data decodes in time linear in its length.
+    const gifWith = (w: number, h: number, data: Buffer) => Buffer.concat([Buffer.from('GIF89a'), Buffer.from([w & 255, w >> 8, h & 255, h >> 8, 0x80, 0, 0]), Buffer.alloc(6, 0xAA),
+        Buffer.from([0x2C, 0, 0, 0, 0, w & 255, w >> 8, h & 255, h >> 8, 0, 8]), ...Array.from({ length: Math.ceil(data.length / 255) }, (_, i) => { const part = data.subarray(i * 255, i * 255 + 255); return Buffer.concat([Buffer.from([part.length]), part]); }), Buffer.from([0, 0x3B])]);
+    const pictureAst = (data: Buffer) => ({ type: 'docx', metadata: {}, content: [{ type: 'paragraph', children: [{ type: 'image', metadata: { attachmentName: 'p.gif', altText: 'alt' } }] }], attachments: [{ type: 'image', name: 'p.gif', mimeType: 'image/gif', extension: 'gif', data: data.toString('base64') }] }) as any;
+    const bigGif = await OfficeGenerator.generate(pictureAst(gifWith(65535, 65535, Buffer.alloc(16))), 'pdf' as any, { pdfConfig: { engine: 'native' }, onWarning: () => {} } as any);
+    check('pdf: a GIF declaring 65535 x 65535 pixels is refused before decoding, its alt text drawn', (bigGif.messages || []).some((m: any) => m.code === 'IMAGE_PROCESSING_FAILED'), JSON.stringify(bigGif.messages));
+    await timed('pdf: a 2000 x 2000 GIF of 1 MB of noise is decoded', () => OfficeGenerator.generate(pictureAst(gifWith(n(2000), n(2000), Buffer.from(Array.from({ length: n(1_000_000) }, (_, i) => (i * 2654435761) >>> 24)))), 'pdf' as any, { pdfConfig: { engine: 'native' }, onWarning: () => {} } as any));
+    // An SVG drawn by the native PDF engine: a path, a polyline and text of hundreds of thousands of parts
+    // drawn in time in proportion (their operators pushed a slice at a time, never spread into one call),
+    // numbers no page holds written finite, and groups nested far past the limit stopped and reported.
+    const svgAst = (svg: string) => ({ type: 'docx', metadata: {}, content: [{ type: 'image', metadata: { attachmentName: 'a.svg' } }], attachments: [{ type: 'image', name: 'a.svg', mimeType: 'image/svg+xml', extension: 'svg', data: Buffer.from(svg).toString('base64') }] }) as any;
+    const svgOf = (body: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">${body}</svg>`;
+    await timed('pdf: an SVG path of 400k segments is drawn', () => OfficeGenerator.generate(svgAst(svgOf(`<path stroke="black" d="M0 0${' L1 1'.repeat(n(400_000))}"/>`)), 'pdf' as any, { pdfConfig: { engine: 'native' }, onWarning: () => {} } as any));
+    await timed('pdf: an SVG polyline of 300k points is drawn', () => OfficeGenerator.generate(svgAst(svgOf(`<polyline stroke="black" points="${'1 1 '.repeat(n(300_000))}"/>`)), 'pdf' as any, { pdfConfig: { engine: 'native' }, onWarning: () => {} } as any));
+    // A document of thousands of sections, each with a header of its own, is written in time in proportion
+    // (each section's own looked for among all of them, and each master page among all made).
+    const sectionsAst = () => {
+        const count = n(4_000);
+        return { type: 'docx', metadata: {}, attachments: [], auxiliary: { headers: Array.from({ length: count }, (_, i) => ({ type: 'header', metadata: { type: 'default', section: i }, children: [{ type: 'paragraph', children: [{ type: 'text', text: `H${i}` }] }] })) },
+            content: Array.from({ length: count }, (_, i) => [...(i ? [{ type: 'break', metadata: { breakType: 'page', section: i, pageSetup: { width: 612, height: 792 } } }] : []), { type: 'paragraph', children: [{ type: 'text', text: `S${i}` }] }]).flat() } as any;
+    };
+    for (const format of ['docx', 'odt', 'rtf'] as const) await timed(`${format}: 4,000 sections each with its own header are written`, () => OfficeGenerator.generate(sectionsAst(), format, { onWarning: () => {} } as any));
+    await timed('rtf: 50,000 sections are read', () => OfficeParser.parseOffice(Buffer.from(`{\\rtf1\\ansi ${'x\\par\\sect\\sectd\\pgwsxn15840\\pghsxn12240\\cols2 '.repeat(n(50_000))}}`), { fileType: 'rtf', includeBreakNodes: true } as any));
+    // Every value read as a number, a length or a transform in time in proportion to it (each took time in
+    // its square: digits matched two ways, spaces before and after a unit, an unclosed transform read on).
+    const svgRun = (svg: string) => () => OfficeGenerator.generate(svgAst(svg), 'pdf' as any, { pdfConfig: { engine: 'native' }, onWarning: () => {} } as any);
+    await timed('pdf: an SVG width of 80k digits is read', svgRun(svgOf(`<rect width="${'1'.repeat(n(80_000))}x" height="5"/>`)));
+    await timed('pdf: an SVG width of 200k spaces is read', svgRun(svgOf(`<rect width="5${' '.repeat(n(200_000))}x" height="5"/>`)));
+    await timed('pdf: an SVG root width of 80k digits is read', svgRun(`<svg xmlns="http://www.w3.org/2000/svg" width="${'1'.repeat(n(80_000))}x" height="10"><rect width="5" height="5"/></svg>`));
+    await timed('pdf: an SVG transform of 80k unclosed scale( is read', svgRun(svgOf(`<g transform="${'scale(1 '.repeat(n(80_000))}"><rect width="5" height="5"/></g>`)));
+    await timed('pdf: an SVG stylesheet rule of 200k repeated classes is matched', svgRun(svgOf(`<style>${'.a'.repeat(n(200_000))}{fill:red}</style>${'<rect class="a" width="1" height="1"/>'.repeat(n(5_000))}`)));
+    // 2,000 rules matching every element, over thousands of elements: the properties each kind of element
+    // takes are kept once, not every rule's declarations for every element (which ran out of memory).
+    const ruleDecl = 'fill:red;stroke:blue;stroke-width:1;opacity:1;fill-opacity:1;stroke-opacity:1;font-size:3px;font-family:a;';
+    for (const [label, selector, attrs] of [['*', '*', ''], ['type', 'rect', ''], ['class', '.a', ' class="a"']] as const) {
+        await linear(`pdf: 2,000 SVG ${label} rules over 10,000 elements are matched`, svgRun(svgOf(`<style>${`${selector}{${ruleDecl}}`.repeat(2000)}</style>${`<rect${attrs} width="1" height="1"/>`.repeat(n(10_000))}`)),
+            { label: `pdf: 2,000 SVG ${label} rules over 10,000 elements hold the heap`, limit: 300e6 });
+    }
+    // A use of text or a picture copied ten thousand times: bounded (characters drawn, the picture embedded once).
+    const fanSvg = (leaf: string, levels: number) => svgOf('<defs><g id="a0">' + leaf + '</g>' + Array.from({ length: levels }, (_, i) => `<g id="a${i + 1}">` + '<use href="#a' + i + '"/>'.repeat(10) + '</g>').join('') + `</defs><use href="#a${levels}"/>`);
+    await timed('pdf: SVG text used ten thousand times is drawn within its bound', svgRun(fanSvg(`<text x="1" y="10">${'W'.repeat(n(16_000))}</text>`, 4)));
+    const pngData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const usedPicture = Buffer.from((await svgRun(fanSvg(`<image width="5" height="5" href="data:image/png;base64,${pngData}${' '.repeat(100_000)}"/>`, 3))()).value as Uint8Array);
+    check('pdf: an SVG picture used a thousand times is embedded once', usedPicture.length < 200_000, `${usedPicture.length} bytes`);
+    await timed('pdf: an SVG text of 50k spans is drawn', () => OfficeGenerator.generate(svgAst(svgOf(`<text x="1" y="20">${'<tspan dx="1">w</tspan>'.repeat(n(50_000))}</text>`)), 'pdf' as any, { pdfConfig: { engine: 'native' }, onWarning: () => {} } as any));
+    const lostLong = await OfficeGenerator.generate(svgAst(svgOf(`<path stroke="black" d="M0 0${' L1 1'.repeat(100_000)}"/>`)), 'pdf' as any, { pdfConfig: { engine: 'native' }, onWarning: () => {} } as any);
+    check('pdf: an SVG path of 100k segments is drawn, not lost', !(lostLong.messages || []).some((m: any) => m.code === 'IMAGE_PROCESSING_FAILED'), JSON.stringify(lostLong.messages));
+    const deepSvg = await OfficeGenerator.generate(svgAst(svgOf('<g>'.repeat(5000) + '<rect width="1" height="1"/>' + '</g>'.repeat(5000))), 'pdf' as any, { pdfConfig: { engine: 'native' }, onWarning: () => {} } as any);
+    check('pdf: SVG groups nested 5,000 deep are stopped at the limit and reported', (deepSvg.messages || []).some((m: any) => /nested past/.test(m.details?.feature ?? '')), JSON.stringify(deepSvg.messages));
+    const hugeSvg = Buffer.from((await OfficeGenerator.generate(svgAst(svgOf('<rect width="1e999" height="1e308"/><g transform="scale(1e300) scale(1e300)"><circle r="1e999"/></g><text x="1e999" y="-1e999" font-size="1e999">x</text>')), 'pdf' as any, { pdfConfig: { engine: 'native' }, onWarning: () => {} } as any)).value as Uint8Array);
+    const hugeDoc = await PDFDocument.load(hugeSvg);
+    const nonFinite = hugeDoc.context.enumerateIndirectObjects().some(([, obj]: any) => obj instanceof PDFRawStream && /NaN|Infinity|\de[+-]\d/.test(Buffer.from((() => { try { return String(obj.dict.get(PDFName.of('Filter'))) === '/FlateDecode' ? unzlibSync(obj.contents) : obj.contents; } catch { return obj.contents; } })()).toString('latin1')));
+    check('pdf: numbers in an SVG no page holds are written finite', !nonFinite);
+    // A gradient painting ten thousand use copies, each of its stops read once; rules of many classes over
+    // many use copies, each element's matched once.
+    const stops = (count: number) => Array.from({ length: count }, (_, i) => `<stop offset="${i / count}" stop-color="#${(i % 256).toString(16).padStart(2, '0')}0000"/>`).join('');
+    await timed('pdf: an SVG gradient of 4,000 stops painting 10,000 use copies is drawn', svgRun(fanSvg('<rect width="5" height="5" fill="url(#g)"/>', 4).replace('<defs>', `<defs><linearGradient id="g">${stops(n(4_000))}</linearGradient>`)));
+    await timed('pdf: 2,000 SVG rules of classes over 10,000 use copies are matched', svgRun(fanSvg('<rect class="c0 c1 c2 c3" width="5" height="5"/>', 4).replace('<defs>', `<defs><style>${Array.from({ length: n(2_000) }, (_, i) => `.c${i % 4}.x${i}{fill:red}`).join('')}</style>`)));
+    // Sections of their own headers and footers: measured on one page outside the document's, each page put
+    // at its end directly, identical parts written once.
+    const ownSections = () => astWith([{ type: 'paragraph', children: [{ type: 'text', text: 'Start' }] }, ...Array.from({ length: n(4_000) }, (_, i) => [{ type: 'break', metadata: { breakType: 'page', section: i + 1 } }, { type: 'paragraph', children: [{ type: 'text', text: `S${i}` }] }]).flat()]);
+    const withParts = () => { const ast = ownSections() as any; ast.auxiliary = { headers: Array.from({ length: n(4_000) }, (_, i) => ({ type: 'header', metadata: { type: 'default', section: i + 1 }, children: [{ type: 'paragraph', children: [{ type: 'text', text: 'H' }] }] })), footers: Array.from({ length: n(4_000) }, (_, i) => ({ type: 'footer', metadata: { type: 'default', section: i + 1 }, children: [{ type: 'paragraph', children: [{ type: 'text', text: 'F' }] }] })) }; return ast; };
+    for (const format of ['pdf', 'docx', 'odt', 'rtf'] as const) await timed(`${format}: 4,000 sections of their own headers and footers are written`, () => OfficeGenerator.generate(withParts(), format as any, { pdfConfig: { engine: 'native' }, onWarning: () => {} } as any));
+    // An RTF of pages and columns no page holds is read held to a page, in time in proportion to it.
+    await timed('rtf: 20,000 column widths of a hundred million twips are read', () => OfficeParser.parseOffice(Buffer.from('{\\rtf1\\ansi\\sectd\\cols16' + '\\colno3\\colw99999999'.repeat(n(20_000)) + ' x\\par}'), { fileType: 'rtf' } as any));
+    const heldRtf = await OfficeParser.parseOffice(Buffer.from('{\\rtf1\\ansi\\paperw12240\\paperh15840\\margl99999999\\sectd\\cols16\\colsx99999999 x\\par}'), { fileType: 'rtf' } as any) as OfficeParserAST;
+    const held = heldRtf.metadata.pageSetup!;
+    check('rtf: margins and a column gap no page holds are held to it', held.margin!.left <= Math.min(held.width!, held.height!) / 3 && held.columns!.gap <= held.width! / 4, JSON.stringify(held));
+    // Footnotes are measured once each and given a page as they are cited: many of them, each cited
+    // once, cost in proportion; a stylesheet of many rules over many elements too (see the HTML cases).
+    const footnoted = () => astWith(Array.from({ length: n(3000) }, (_, i) => ({ type: 'paragraph', children: [{ type: 'text', text: `Cited ${i}`, notes: [{ type: 'note', metadata: { noteType: i % 3 ? 'footnote' : 'endnote' }, children: [{ type: 'paragraph', children: [{ type: 'text', text: `Note ${i} text.` }] }] }] }] })));
+    await timed('pdf: 3,000 cited footnotes and endnotes are placed', () => OfficeGenerator.generate(footnoted(), 'pdf' as any, { pdfConfig: { engine: 'native' }, onWarning: () => {} } as any));
+    // A number format is read once for all the cells sharing it, and hidden columns are found by halving.
+    const shownCells = Array.from({ length: n(100000) }, (_, i) => `<row r="${i + 1}"><c r="A${i + 1}" s="0"><v>${i}.5</v></c></row>`).join('');
+    await timed('xlsx: 100k cells sharing a 255-character number format show their text', () => parseQuiet(repack('test.xlsx', z => {
+        z['xl/styles.xml'] = enc(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="&quot;${'x'.repeat(240)}&quot;#,##0.00"/></numFmts><cellXfs count="1"><xf numFmtId="164"/></cellXfs></styleSheet>`);
+        z['xl/worksheets/sheet1.xml'] = enc(sheetXml.replace(/<cols>[\s\S]*?<\/cols>/, '').replace(/<sheetData>[\s\S]*<\/sheetData>|<sheetData\/>/, `<sheetData>${shownCells}</sheetData>`));
+    }), 'xlsx'));
+    const columnName = (index: number) => { let name = ''; for (let k = index + 1; k > 0; k = Math.floor((k - 1) / 26)) name = String.fromCharCode(65 + ((k - 1) % 26)) + name; return name; };
+    await timed('xlsx: 8,000 hidden column ranges over 80k cells are found', () => parseQuiet(repack('test.xlsx', z => {
+        const ranges = n(8000);
+        const cols = Array.from({ length: ranges }, (_, i) => `<col min="${2 * i + 2}" max="${2 * i + 2}" hidden="1"/>`).join('');
+        const rows = Array.from({ length: n(8000) }, (_, i) => `<row r="${i + 1}">${Array.from({ length: 10 }, (_, j) => `<c r="${columnName((i * 10 + j) % (2 * ranges))}${i + 1}"><v>1</v></c>`).join('')}</row>`).join('');
+        z['xl/worksheets/sheet1.xml'] = enc(sheetXml.replace(/<cols>[\s\S]*?<\/cols>/, '').replace(/<sheetData>[\s\S]*<\/sheetData>|<sheetData\/>/, `<cols>${cols}</cols><sheetData>${rows}</sheetData>`));
+    }), 'xlsx'));
+    // A stylesheet keeps only the properties reading looks at, each once: 32 rules of 8 KB each over
+    // every element gave each element a quarter of a megabyte of style. A child combinator in a long
+    // run of spaces is found in one pass.
+    const wideRules = Array.from({ length: 32 }, (_, i) => `.w { color: red; ${Array.from({ length: 400 }, (_, j) => `--v${i}-${j}: 1`).join('; ')} }`).join('\n');
+    await linear('html: 32 wide rules over 20,000 elements give each a short style', () => OfficeParser.parseOffice(Buffer.from(`<style>${wideRules}</style>${'<p class="w">x</p>'.repeat(n(20000))}`), { fileType: 'html' } as any),
+        { label: 'html: 32 wide rules over 20,000 elements hold the heap', limit: 400e6 });
+    await timed('html: a selector of 200 KB of spaces around a > reads', () => parseQuiet(Buffer.from(`<style>.a${' '.repeat(n(200000))}>${' '.repeat(n(200000))}.b { color: red }</style><p class="a">x</p>`), 'html'));
+    await timed('html: a declaration of 200k unclosed url( reads', () => parseQuiet(Buffer.from(`<style>.a { background: ${'url('.repeat(n(200000))} }</style><p class="a">x</p>`), 'html'));
+    // A sheet of many cells is written as a workbook in time in proportion: XLSX and ODS (cells typed once,
+    // merged cells' covered positions found per row).
+    const bigSheet = () => ({ type: 'xlsx', metadata: {}, attachments: [], content: [{ type: 'sheet', metadata: { sheetName: 'Big' }, children: Array.from({ length: n(20_000) }, (_, r) => ({
+        type: 'row', children: Array.from({ length: 10 }, (_, c) => ({ type: 'cell', text: c % 3 ? `${r * c}.5` : `Row ${r}`, metadata: { row: r, col: c, ...(c === 0 && r % 50 === 0 ? { rowSpan: 2 } : {}) }, children: [{ type: 'text', text: c % 3 ? `${r * c}.5` : `Row ${r}` }] })),
+    })) }] }) as any;
+    for (const format of ['xlsx', 'ods'] as const) await timed(`${format}: a sheet of 200,000 cells is written`, () => OfficeGenerator.generate(bigSheet(), format, { onWarning: () => {} } as any));
+    // Merges that overlap (a sheet whose cells name their places) are found in time in proportion, and a link a cell.
+    const overlapping = () => ({ type: 'xlsx', metadata: {}, attachments: [], content: [{ type: 'sheet', metadata: { sheetName: 'M' }, children: Array.from({ length: n(20_000) }, (_, r) => ({
+        type: 'row', children: [{ type: 'cell', metadata: { row: r, col: 0, rowSpan: 3, colSpan: 2 }, children: [{ type: 'text', text: `R${r}`, metadata: { link: `https://example.com/${r}` } }] }] })) }] }) as any;
+    for (const format of ['xlsx', 'ods'] as const) await timed(`${format}: 20,000 overlapping merges with links are written`, () => OfficeGenerator.generate(overlapping(), format, { onWarning: () => {} } as any));
+    // A deck in time in proportion: a sheet's rows cut into slides, a long document flowed onto slides,
+    // a page of many lines (each line found by its place, grouped by its left edge), a placed table.
+    const placedPage = () => ({ type: 'pdf', metadata: {}, attachments: [], content: [{ type: 'page', metadata: { pageWidth: 612, pageHeight: 792 }, children: [
+        { type: 'paragraph', bounds: { x: 72, y: 72, width: 400, height: 600 }, children: Array.from({ length: n(40_000) }, (_, i) => ({ type: 'text', text: `line ${i} `, bounds: { x: i % 7 ? 72 : 200, y: 72 + i * 0.01, width: 300, height: 0.005 } })) },
+        { type: 'table', bounds: { x: 72, y: 700, width: 400, height: 60 }, children: Array.from({ length: n(5_000) }, (_, r) => ({ type: 'row', children: [0, 1, 2].map(c => ({ type: 'cell', metadata: { row: r, col: c }, bounds: { x: 72 + c * 100, y: 700 + r * 0.01, width: 100, height: 0.01 }, children: [{ type: 'text', text: `${r}.${c}` }] })) })) },
+    ] }] }) as any;
+    const longDoc = () => astWith([...Array.from({ length: n(20_000) }, (_, i) => i % 50 ? { type: 'paragraph', children: [{ type: 'text', text: `Point ${i} of a long section, with words enough to wrap a line or two.` }] } : { type: 'heading', metadata: { level: 2 }, children: [{ type: 'text', text: `Section ${i}` }] })]);
+    for (const format of ['pptx', 'odp'] as const) {
+        await timed(`${format}: a sheet of 200,000 cells is written`, () => OfficeGenerator.generate(bigSheet(), format, { onWarning: () => {} } as any));
+        await timed(`${format}: a document of 20,000 paragraphs is written`, () => OfficeGenerator.generate(longDoc(), format, { onWarning: () => {} } as any));
+        await timed(`${format}: a page of 40,000 placed runs and a placed table of 5,000 rows is written`, () => OfficeGenerator.generate(placedPage(), format, { onWarning: () => {} } as any));
+    }
     await timed('md: block math of 200 KB of spaces is written inline', () => OfficeGenerator.generate(astWith([{ type: 'paragraph', children: [{ type: 'text', text: 'a' }, { type: 'code', text: 'x' + ' '.repeat(n(200000)) + 'y', metadata: { math: 'block' } }] }]), 'md' as any, { onWarning: () => {} } as any));
 
     // Raw HTML in Markdown, read as links and pictures, passes the writers' URL checks like any other.
@@ -3138,7 +3275,7 @@ async function parserHardeningTests() {
     // A table of contents' dot leaders (tagged TOCI) collapse in time linear in the entry, however its
     // dots and spaces run: an entry four times as long takes about four times as long.
     const tocMs = (text: string) => {
-        const run: any = { text, x: 72, yTop: 90, yBaseline: 100, width: 300, height: 12, fontSize: 10, dir: 'ltr', angle: 0, mcid: 'm0', inArtifact: false, formatting: {} };
+        const run: any = { text, x: 72, yTop: 90, yBaseline: 100, width: 300, height: 12, fontSize: 10, dir: 'ltr', angle: 0, turn: 0, mcid: 'm0', inArtifact: false, formatting: {} };
         const layout: any = { useTags: true, detectColumns: true, mergeHyphenatedWords: true, lineToleranceFactor: 0.35, spaceToleranceFactor: 0.25, headingDetection: 'auto', normalizeText: true, extractTextColor: false, includeBounds: true };
         const begun = performance.now();
         buildTaggedNodes({ role: 'Root', children: [{ role: 'TOCI', children: [{ type: 'content', id: 'm0' }] }] }, new Map([['m0', [run]]]), { pageNumber: 1, authoredW: 612, authoredH: 792, rotation: 0 }, computeDocContext([run], layout, '\n'), { ignoreNotes: false, listCounter: { n: 0 } });
@@ -4025,6 +4162,82 @@ async function pdfProcessTests(h: {
     // (Separate processes first: pdf.js in this process comes last, at the end.)
     const plan = notes(20, true);
     const planned = await read(plan);
+    // A page of thousands of crossing rules (grid paper, a dense chart) is read in time in proportion: its
+    // rules are joined once, their crossings tested within a bound, and a grid too large is no table.
+    const ruledPage = (count: number) => {
+        let body = '0.5 w\n';
+        for (let i = 0; i < count; i++) body += `20 ${20 + (i * 7) % 800} m 580 ${20 + (i * 7) % 800} l S ${20 + (i * 3) % 560} 20 m ${20 + (i * 3) % 560} 820 l S\n`;
+        body += 'BT /F1 10 Tf 40 830 Td (Grid page) Tj ET\n';
+        return pdfFrom(['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [5 0 R] /Count 1 >>', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>', flate(Buffer.from(body)),
+            '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>']);
+    };
+    let ruled = { error: '', text: '' } as { error: string; text: string };
+    await linear('pdf: a page of 16,000 crossing rules is read', async () => { ruled = await read(ruledPage(n(8000))); });
+    check('pdf: a page of crossing rules keeps its text', !ruled.error && ruled.text.includes('Grid page'), ruled.error);
+    // A ruled table each of whose rows is one string across all its rules: each cut at them in time in
+    // proportion to the rows (its word boundaries found once, each rule's by halving).
+    const cutPage = (rows: number) => {
+        let body = '0.5 w\n';
+        for (let r = 0; r <= rows; r++) body += `20 ${800 - r * 10} m 580 ${800 - r * 10} l S\n`;
+        for (let c = 0; c <= 56; c++) body += `${20 + c * 10} 800 m ${20 + c * 10} ${800 - rows * 10} l S\n`;
+        body += 'BT /F1 4 Tf\n';
+        for (let r = 0; r < rows; r++) body += `1 0 0 1 22 ${802 - (r + 1) * 10} Tm (${Array.from({ length: 56 }, (_, c) => `w${c}`).join(' ')}) Tj\n`;
+        body += '1 0 0 1 40 820 Tm (Cut page) Tj ET\n';
+        return pdfFrom(['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [5 0 R] /Count 1 >>', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>', flate(Buffer.from(body)),
+            '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>']);
+    };
+    let cut = { error: '', text: '' } as { error: string; text: string };
+    await linear('pdf: a ruled table of rows drawn as one string across 56 rules is read', async () => { cut = await read(cutPage(n(76))); });
+    check('pdf: a table of rows drawn across its rules keeps its text', !cut.error && cut.text.includes('Cut page') && cut.text.includes('w55'), cut.error || cut.text.slice(0, 80));
+    // A page's marked content is read for its ActualText (see actualText): in time in proportion to its
+    // operators, and within its bound on what it inflates (a stream of zeros inflating far past it).
+    const markedPage = (body: Buffer) => pdfFrom(['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [5 0 R] /Count 1 >>', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>', flate(body),
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>']);
+    let marked = { error: '', text: '' } as { error: string; text: string };
+    await linear('pdf: a page of 2,000 marked-content spans with ActualText is read', async () => {
+        let body = 'BT /F1 10 Tf 40 800 Td\n';
+        for (let i = 0; i < n(2_000); i++) body += `/Span << /ActualText (a${i % 10}) >> BDC (x) Tj EMC\n`;
+        marked = await read(markedPage(Buffer.from(body + 'ET\n')));
+    });
+    check('pdf: marked-content spans read as their ActualText', !marked.error && marked.text.includes('a1') && !marked.text.includes('x'), marked.error || marked.text.slice(0, 80));
+    // A word of a hundred thousand digits ending in a letter is no number: telling took time in its square.
+    let longWord = { error: '', text: '' } as { error: string; text: string };
+    await linear('pdf: marked content holding a word of 160,000 digits is read', async () => {
+        longWord = await read(markedPage(Buffer.from(`BT /F1 12 Tf 72 700 Td /P BMC (Long word page) Tj EMC ET\n${'7'.repeat(n(160_000))}x\n`)));
+    });
+    check('pdf: a page with a long digit word keeps its text', !longWord.error && longWord.text.includes('Long word page'), longWord.error || longWord.text.slice(0, 80));
+    const zeros = Buffer.alloc(96 * 1024 * 1024, 0x20);
+    zeros.write('BT /F1 10 Tf 40 800 Td (Past the zeros) Tj ET', zeros.length - 64);
+    const bombRun = await withinTime(20_000, () => read(markedPage(zeros)));
+    check('pdf: a content stream inflating past the marked-content bound is read in time', !bombRun.result.error && bombRun.within && bombRun.result.text.includes('Past the zeros'), `${bombRun.ms}ms ${bombRun.result.error}`);
+    // Marked content is read for a page as it is read: a form of marked content drawn by many pages, or one
+    // stream they share, is read once, the document's events bounded (a 187 KB file of a form drawn by a
+    // thousand pages ran the process out of memory, every page's events made at once), and a page range
+    // reads its own pages alone. Inflating stops at its bound: a megabyte inflating to a gigabyte was
+    // inflated whole, then dropped.
+    const formPages = (pages: number, marks: number) => pdfFrom(['<< /Type /Catalog /Pages 2 0 R >>',
+        `<< /Type /Pages /Kids [${Array.from({ length: pages }, (_, i) => `${6 + i} 0 R`).join(' ')}] /Count ${pages} >>`,
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>', flate(Buffer.from('BT /F1 10 Tf 40 800 Td (Shared page) Tj ET /X0 Do')),
+        flate(Buffer.from('/A BMC EMC\n'.repeat(marks)), '/Type /XObject /Subtype /Form /BBox [0 0 10 10]'),
+        ...Array.from({ length: pages }, () => '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 842] /Resources << /Font << /F1 3 0 R >> /XObject << /X0 5 0 R >> >> /Contents 4 0 R >>')]);
+    await linear('pdf: a form of 20,000 marked-content spans drawn by 400 pages is read page by page', () => {
+        const pages = n(400), mc = new MarkedContent(new Uint8Array(formPages(pages, 20_000)), pages);
+        for (let i = 0; i < pages; i++) mc.eventsOf(i);
+    }, { label: 'pdf: a form drawn by 400 pages holds the heap', limit: 400e6 });
+    const ofThousand = formPages(1000, 250_000);
+    const allPages = new MarkedContent(new Uint8Array(ofThousand), 1000);
+    let documentEvents = 0;
+    for (let i = 0; i < 1000; i++) documentEvents += allPages.eventsOf(i)?.length ?? 0;
+    check('pdf: a document\'s marked-content events are bounded', documentEvents <= 10_500_000, `${documentEvents}`);
+    const rangeRun = await withinTime(5_000, () => read(ofThousand, { pdfParserConfig: { pageRange: '1' } }));
+    check('pdf: a page range reads the marked content of its pages alone', !rangeRun.result.error && rangeRun.within && rangeRun.result.text.includes('Shared page'), `${rangeRun.ms}ms ${rangeRun.result.error}`);
+    const quarterGigabyte = (require('zlib') as typeof import('zlib')).deflateSync(Buffer.alloc(256 * 1024 * 1024, 0x20), { level: 9 });
+    const bombDoc = pdfFrom(['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>', '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>',
+        Buffer.concat([Buffer.from(`<< /Length ${quarterGigabyte.length} /Filter /FlateDecode >>\nstream\n`), quarterGigabyte, Buffer.from('\nendstream')])]);
+    const buffersBefore = process.memoryUsage().arrayBuffers, inflateStarted = performance.now();
+    new MarkedContent(new Uint8Array(bombDoc), 1).eventsOf(0);
+    const inflateMs = performance.now() - inflateStarted, inflateGrew = process.memoryUsage().arrayBuffers - buffersBefore;
+    check('pdf: a stream inflating to 256 MB is read no further than the inflate bound', inflateMs < 1500 && inflateGrew < 200e6, `${Math.round(inflateMs)}ms ${Math.round(inflateGrew / 1e6)}MB`);
     check('pdf: a plan of 3,000 symbols is read whole, its paths costing none of the operator budget', !planned.error && planned.pages === 21 && planned.text.includes('Note 20.50') && !planned.codes.includes('PDF_CONTENT_LIMIT_EXCEEDED') && !planned.codes.includes('PDF_NO_TEXT_EXTRACTED'), `${planned.pages} pages ${planned.codes} ${planned.error}`);
     const operatorChecks = async (separateProcess: boolean) => {
         const where = separateProcess ? 'separate process' : 'in process';

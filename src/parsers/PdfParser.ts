@@ -32,7 +32,7 @@
 import { zlibSync } from 'fflate';
 import { passwordAttemptLimit } from '../crypto/decryptContainer.js';
 import { DEFAULT_OFFICE_PARSER_CONFIG, DEFAULT_PDF_WORKER_SRC } from '../defaults.js';
-import { FullOfficeParserConfig, ImageMetadata, OfficeAttachment, OfficeContentNode, OfficeErrorType, OfficeMetadata, OfficeParserAST, OfficeWarningType, TextFormatting, TextMetadata } from '../types.js';
+import { FullOfficeParserConfig, ImageMetadata, OfficeAttachment, OfficeContentNode, OfficeErrorType, OfficeMetadata, OfficeParserAST, OfficeWarningType, ParagraphMetadata, TextFormatting, TextMetadata } from '../types.js';
 import { createAST } from '../utils/astUtils.js';
 import { parseOfficeDate } from '../utils/dateUtils.js';
 import { assertNode, isBrowser } from '../utils/envUtils.js';
@@ -41,13 +41,28 @@ import { crc32, createAttachment } from '../utils/imageUtils.js';
 import { loadPdfJs } from '../utils/moduleLoader.js';
 import { ocrDuringParse } from '../utils/ocrUtils.js';
 import { collectColorMarks, ColorLookup, makeColorLookup } from './pdf/pdfColor.js';
+import { collectShapes, PdfShape, shapeBullets } from './pdf/pdfShapes.js';
+import { MarkedContent, readableItems } from './pdf/actualText.js';
+import { ruledFrames, ruledTables, shadeCells } from './pdf/rulings.js';
 import { computeRunBox, identityMatrix, mulMatrix, roundBounds, rotateBoundsToRendered, toMatrix6, unionAll } from './pdf/geometry.js';
 import { PageExtract, PdfImage, PdfLayoutConfig, RawRun, ResolvedFont } from './pdf/pdfTypes.js';
-import { blockToNodes, buildLines, computeDocContext, detectTables, DocContext, PageContext, recoverTaggedGrids, runsToParagraph, segmentIntoBlocks } from './pdf/textLayout.js';
+import { blockToNodes, buildLines, computeDocContext, detectTables, DocContext, emitBounds, indentLevels as indentLevelsOf, joinMarkerLines, leadingMarker, ListCarry, markerLefts, PageContext, lineDirections, recoverTaggedGrids, rightToLeftLean, relevelHeadings, runsToParagraph, segmentIntoBlocks } from './pdf/textLayout.js';
 import { buildTaggedNodes } from './pdf/structTree.js';
 import { setOwn } from '../utils/lookupUtils.js';
 import { acquirePdfProcess, PdfProcess } from './pdf/pdfProcess.js';
 import { appendAll } from '../utils/nodeListUtils.js';
+
+/**
+ * Look-alikes of CJK ideographs, which a PDF's font maps text to (Chromium's PDF of 日本語 reads as
+ * ⽇本語, a Kangxi radical first): the Kangxi radicals, the CJK radicals supplement and the
+ * compatibility ideographs. Each is read as the unified ideograph it stands for (its NFKC form), as
+ * pdftotext does, so search, copying and spelling see the text. Nothing else is normalized.
+ */
+const IDEOGRAPH_LOOKALIKE = /[\u2E80-\u2EFF\u2F00-\u2FDF\uF900-\uFAFF]|[\u{2F800}-\u{2FA1F}]/u;
+const IDEOGRAPH_LOOKALIKES = new RegExp(IDEOGRAPH_LOOKALIKE.source, 'gu');
+export function unifyIdeographs(text: string): string {
+    return IDEOGRAPH_LOOKALIKE.test(text) ? text.replace(IDEOGRAPH_LOOKALIKES, ch => ch.normalize('NFKC')) : text;
+}
 
 /** Type guard for a pdf.js TextItem (marked-content items lack `str`/`transform`). */
 function isTextItem(item: any): item is { str: string; transform: number[]; width: number; height: number; fontName: string; dir?: string; hasEOL?: boolean } {
@@ -227,6 +242,7 @@ function resolvePdfLayoutConfig(config: FullOfficeParserConfig): PdfLayoutConfig
         headingDetection: p.headingDetection ?? 'auto',
         normalizeText: p.normalizeText !== false,
         extractTextColor: p.extractTextColor !== false, // default true, matching defaults.ts and its siblings
+        keepHeadersAndFootersInPages: p.keepHeadersAndFootersInPages === true,
         includeBounds: !config.ignorePageGeometry,
         separateProcess: p.separateProcess !== false,
         processMemoryMb: memory(),
@@ -269,8 +285,10 @@ async function resolveFont(fontKey: string, commonObjs: any, styles: Record<stri
     const resolved: ResolvedFont = {
         bold: false,
         italic: false,
-        ascent: typeof style.ascent === 'number' ? style.ascent : 0.8,
-        descent: typeof style.descent === 'number' ? style.descent : -0.2,
+        // A font's ascent and descent as pdf.js gives them, where they are numbers a font has (pdf.js gives NaN
+        // for some fallback fonts: every box of their text was NaN, and a table took it, or it was lost).
+        ascent: Number.isFinite(style.ascent) && style.ascent > 0 && style.ascent <= 2 ? style.ascent : 0.8,
+        descent: Number.isFinite(style.descent) && style.descent <= 0 && style.descent >= -1 ? style.descent : -0.2,
     };
     try {
         if (commonObjs?.has?.(fontKey)) {
@@ -946,7 +964,24 @@ async function readTextContent(page: any, params: object, work: PdfWorkBudget): 
     return { items, styles };
 }
 
-/** The operators the image and color readers use; the rest (paths, above all) are not kept. */
+/** At most this many path operators are kept on a page, for its shapes (see readOperatorList). */
+const MAX_PATHS_KEPT = 40_000;
+/** At most this many operators are kept on a page read for its shapes alone, past which it is left unread. */
+const MAX_SHAPE_OPERATORS = 200_000;
+
+/** The operators the shape reader uses: paths, their widths and colours, and the state that places them. */
+const shapeOperatorsCache = new WeakMap<object, Set<number>>();
+const shapeOperators = (OPS: any): Set<number> => {
+    let kept = shapeOperatorsCache.get(OPS);
+    if (!kept) {
+        kept = new Set(['save', 'restore', 'transform', 'paintFormXObjectBegin', 'paintFormXObjectEnd', 'constructPath', 'setLineWidth',
+            'setFillRGBColor', 'setFillColorN', 'setFillTransparent', 'setStrokeRGBColor', 'setStrokeColorN', 'setStrokeTransparent'].map(name => OPS[name]).filter((op): op is number => typeof op === 'number'));
+        shapeOperatorsCache.set(OPS, kept);
+    }
+    return kept;
+};
+
+/** The operators the image, color and shape readers use (paths with their paint and width); the rest are not kept. */
 const keptOperatorsCache = new WeakMap<object, Set<number>>();
 const keptOperators = (OPS: any): Set<number> => {
     let kept = keptOperatorsCache.get(OPS);
@@ -955,7 +990,7 @@ const keptOperators = (OPS: any): Set<number> => {
             'paintImageXObject', 'paintImageXObjectRepeat', 'paintInlineImageXObject',
             'setFillRGBColor', 'setFillColorN', 'setFillTransparent', 'setStrokeRGBColor', 'setStrokeColorN', 'setStrokeTransparent',
             'beginText', 'setTextMatrix', 'moveText', 'setLeadingMoveText', 'setLeading', 'nextLine', 'setTextRise',
-            'setTextRenderingMode', 'showText'].map(name => OPS[name]).filter((op): op is number => typeof op === 'number'));
+            'setTextRenderingMode', 'showText', 'constructPath', 'setLineWidth'].map(name => OPS[name]).filter((op): op is number => typeof op === 'number'));
         keptOperatorsCache.set(OPS, kept);
     }
     return kept;
@@ -970,10 +1005,17 @@ const keptOperators = (OPS: any): Set<number> => {
  * of the list is left unread (see PdfWorkBudget.leaveUnread) and the page keeps what was read of it;
  * later pages read none.
  */
-async function readOperatorList(pdfjs: any, page: any, work: PdfWorkBudget, keep: 'none' | 'drawing', fonts: readonly string[] = []): Promise<any | null> {
+async function readOperatorList(pdfjs: any, page: any, work: PdfWorkBudget, keep: 'none' | 'drawing' | 'shapes', fonts: readonly string[] = []): Promise<any | null> {
     if (work.spent || work.operatorsSpent) return null;
-    const kept = keep === 'drawing' ? keptOperators(pdfjs.OPS) : null;
+    // ('shapes': the page's paths alone, for its bullets and tables: kept outside the budget, up to
+    // MAX_SHAPE_OPERATORS, and the rest left unread once the fonts are known.)
+    const kept = keep === 'drawing' ? keptOperators(pdfjs.OPS) : keep === 'shapes' ? shapeOperators(pdfjs.OPS) : null;
+    let shapeOps = 0;
     const showText = pdfjs.OPS.showText;
+    // Paths (and their widths) are kept for the page's shapes, a bounded number of them, costing none of
+    // the budget, as when they were not kept: a plan stamping one symbol thousands of times stays whole.
+    const pathOps = new Set([pdfjs.OPS.constructPath, pdfjs.OPS.setLineWidth]);
+    let pathsKept = 0;
     let stopped!: (partial: any) => void;
     const stop = new Promise<any>(resolve => { stopped = resolve; });
     let done = false;
@@ -993,22 +1035,25 @@ async function readOperatorList(pdfjs: any, page: any, work: PdfWorkBudget, keep
             if (done) return;
             const fnArray: number[] = [];
             const argsArray: unknown[] = [];
-            let weight = 0;
+            let weight = 0, free = 0;
             if (kept) {
                 for (let i = 0; i < chunk.length; i++) {
                     const fn = chunk.fnArray[i];
                     if (!kept.has(fn)) continue;
+                    if (pathOps.has(fn)) { if (pathsKept >= MAX_PATHS_KEPT) continue; pathsKept++; free++; }
                     const args = chunk.argsArray[i];
                     fnArray.push(fn);
                     argsArray.push(args);
                     if (fn === showText && Array.isArray(args?.[0])) weight += Math.floor(args[0].length / 64);
                 }
             }
-            if (!work.takeOperators(fnArray.length + weight, page.pageNumber)) { leave(intentState); return; }
+            if (keep === 'shapes') shapeOps += fnArray.length;
+            else if (!work.takeOperators(fnArray.length - free + weight, page.pageNumber)) { leave(intentState); return; }
             const result = original.call(this, { ...chunk, fnArray, argsArray, length: fnArray.length }, intentState);
-            // Read only for the page's fonts: once pdf.js has sent them (it sends a font before the
-            // operators using it), the rest of the list is not needed, and is left unread.
-            if (!kept && !chunk.lastChunk) {
+            // Read only for the page's fonts (or for its shapes, past as many as are kept): once pdf.js has
+            // sent them (it sends a font before the operators using it), the rest of the list is not needed,
+            // and is left unread.
+            if ((!kept || (keep === 'shapes' && shapeOps >= MAX_SHAPE_OPERATORS)) && !chunk.lastChunk) {
                 while (fontsSent < fonts.length && page.commonObjs?.has?.(fonts[fontsSent])) fontsSent++;
                 if (fontsSent === fonts.length) leave(intentState);
             }
@@ -1025,7 +1070,7 @@ async function readOperatorList(pdfjs: any, page: any, work: PdfWorkBudget, keep
 async function collectPage(
     pdfjs: any, pdfDocument: any, pageNumber: number, config: FullOfficeParserConfig,
     pdfCfg: PdfLayoutConfig, fontCache: Map<string, ResolvedFont>, destCache: Map<string, SectionTarget | null>,
-    sectionLinks: SectionLinks, work: PdfWorkBudget,
+    sectionLinks: SectionLinks, work: PdfWorkBudget, markedContent?: MarkedContent,
 ): Promise<PageExtract | undefined> {
     const page = await work.within(pdfDocument.getPage(pageNumber) as Promise<any>);
     if (!page) return undefined;
@@ -1053,9 +1098,9 @@ async function collectPage(
     let ops: any = null;
     // Not `config.ocr`: page-image OCR runs over collected images, which require extractAttachments, so
     // ocr alone needs no operator list (and must not fetch one just to discard it).
-    if (newFonts.length || config.extractAttachments || pdfCfg.extractTextColor) {
-        ops = await readOperatorList(pdfjs, page, work, config.extractAttachments || pdfCfg.extractTextColor ? 'drawing' : 'none', newFonts);
-    }
+    // The page's drawing is read too: its shapes (a bullet drawn as a disc, a table's ruling lines) tell
+    // what its text alone does not.
+    ops = await readOperatorList(pdfjs, page, work, config.extractAttachments || pdfCfg.extractTextColor ? 'drawing' : 'shapes', newFonts);
     for (const key of seen) if (!fontCache.has(key)) fontCache.set(key, await resolveFont(key, page.commonObjs, styles));
 
     // Per-run fill color (opt-in): recovered from the operator list, which is now fetched above.
@@ -1074,7 +1119,10 @@ async function collectPage(
     // thousands deep took time in the square of the page.
     const stack: { mcid: string | null; artifact: boolean }[] = [];
     const runs: RawRun[] = [];
-    for (const item of textContent.items) {
+    // The text a producer gave its glyph clusters (ActualText), where the glyphs map to none of it.
+    // Read from the file only for a page whose text has marked content, and once its budget allows.
+    const hasMarked = !work.spent && textContent.items.some((it: any) => it.type === 'beginMarkedContentProps' || it.type === 'beginMarkedContent');
+    for (const item of readableItems(textContent.items, hasMarked ? markedContent?.eventsOf(pageNumber - 1) : undefined, pdfCfg.normalizeText)) {
         if (!isTextItem(item)) {
             const type = (item as any).type as string | undefined;
             if (type === 'beginMarkedContent' || type === 'beginMarkedContentProps') {
@@ -1090,6 +1138,15 @@ async function collectPage(
         const font = fontCache.get(item.fontName) || { bold: false, italic: false, ascent: 0.8, descent: -0.2 };
         const m = pdfjs.Util.transform(layoutViewport.transform, item.transform);
         const box = computeRunBox(m, item.width || 0, font.ascent, font.descent);
+        // A run placed nowhere a number says (a matrix of NaN or infinities): after the run before it, on its line.
+        if (!Number.isFinite(box.x) || !Number.isFinite(box.yBaseline)) {
+            const prev = runs[runs.length - 1];
+            box.x = prev ? prev.x + prev.width : 0;
+            box.yBaseline = prev ? prev.yBaseline : box.fontSize;
+            box.yTop = box.yBaseline - 0.8 * box.fontSize;
+            box.height = box.fontSize;
+            box.angle = 0;
+        }
 
         const formatting: TextFormatting = {};
         if (font.name) formatting.font = font.name;
@@ -1114,7 +1171,10 @@ async function collectPage(
         const mcid = top?.mcid ?? null, inArtifact = !!top?.artifact;
 
         const dir = (item.dir === 'rtl' || item.dir === 'ttb') ? item.dir : 'ltr';
-        const angle = box.angle === -1 ? 0 : box.angle;
+        // A run at an angle no quarter turn is keeps it: read as level text at its origin, it was
+        // scrambled into the lines around it, or lost.
+        const angle = box.angle;
+        const turn = (Math.round(Math.atan2(m[1], m[0]) * 180 / Math.PI) % 360 + 360) % 360;
 
         // Split the item at annotation x-boundaries so a link only covers the characters it actually
         // spans, instead of the whole phrase run it merely grazes. Adjacent unlinked segments re-merge
@@ -1124,7 +1184,7 @@ async function collectPage(
             ? segmentByLinks(box.x, box.width, box.yTop, box.height, len, links)
             : [{ start: 0, end: len, link: linkForBox(box.x, box.yTop, box.width, box.height, links) }];
         for (const seg of segments) {
-            const segText = item.str.slice(seg.start, seg.end);
+            const segText = unifyIdeographs(item.str.slice(seg.start, seg.end));
             if (!segText) continue;
             const segX = box.x + (len ? (seg.start / len) * box.width : 0);
             const segW = len ? ((seg.end - seg.start) / len) * box.width : box.width;
@@ -1134,6 +1194,7 @@ async function collectPage(
                 fontSize: box.fontSize,
                 dir,
                 angle,
+                turn,
                 mcid, inArtifact,
                 formatting,
                 link: seg.link,
@@ -1155,7 +1216,9 @@ async function collectPage(
 
     if (typeof page.cleanup === 'function' && !work.spent) { try { page.cleanup(); } catch { /* best effort */ } }
 
-    return { pageNumber, width, height, authoredW, authoredH, authoredY1, rotation, runs, images, structTree };
+    const shapes = ops ? collectShapes(ops, layoutViewport.transform, pdfjs.OPS) : [];
+
+    return { pageNumber, width, height, authoredW, authoredH, authoredY1, rotation, runs, images, structTree, shapes };
 }
 
 /** Extracts images from a page's operator list, positioned in layout-viewport space. */
@@ -1459,7 +1522,7 @@ async function readPdf(pdfjs: any, buffer: Buffer, config: FullOfficeParserConfi
             // Every request to pdf.js goes through the document's budget, from the first (see PdfWorkBudget).
             const budget = work = new PdfWorkBudget(pdfDocument, config, pdfCfg, buffer.length, pdfProcess);
             try {
-                return await whileAlive(buildAst(pdfjs, pdfDocument, config, pdfCfg, budget));
+                return await whileAlive(buildAst(pdfjs, pdfDocument, config, pdfCfg, budget, buffer));
             } finally {
                 // Whatever ended the parse, the read ends with it (see PdfWorkBudget.cancel).
                 budget.cancel();
@@ -1483,7 +1546,7 @@ async function readPdf(pdfjs: any, buffer: Buffer, config: FullOfficeParserConfi
 }
 
 /** Assembles the AST from an opened document. Separated so the caller can guarantee task cleanup. */
-async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserConfig, pdfCfg: PdfLayoutConfig, work: PdfWorkBudget): Promise<OfficeParserAST> {
+async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserConfig, pdfCfg: PdfLayoutConfig, work: PdfWorkBudget, buffer: Buffer): Promise<OfficeParserAST> {
     const content: OfficeContentNode[] = [];
     const attachments: OfficeAttachment[] = [];
     const numPages = pdfDocument.numPages;
@@ -1604,11 +1667,14 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
     const destCache = new Map<string, SectionTarget | null>();
     const sectionLinks = new SectionLinks();
     const extracts: PageExtract[] = [];
+    // Each page's marked content, read from the file for the ActualText pdf.js leaves out (see actualText),
+    // as each page read asks for it.
+    const markedContent = new MarkedContent(buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer), numPages);
     for (const pageNum of pageNumbers) {
         checkAbortSignal(config.abortSignal);
         if (work.spent) break;
         try {
-            const extract = await collectPage(pdfjs, pdfDocument, pageNum, config, pdfCfg, fontCache, destCache, sectionLinks, work);
+            const extract = await collectPage(pdfjs, pdfDocument, pageNum, config, pdfCfg, fontCache, destCache, sectionLinks, work, markedContent);
             if (extract) extracts.push(extract);
         } catch (e: any) {
             // A page failing because its parse has ended (its process ended with it) is not reported.
@@ -1665,7 +1731,9 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
     for (const extract of extracts) {
         checkAbortSignal(config.abortSignal);
         work.throwIfCancelled();
-        const pageCtx: PageContext = { pageNumber: extract.pageNumber, authoredW: extract.authoredW, authoredH: extract.authoredH, rotation: extract.rotation };
+        const pageCtx: PageContext = { pageNumber: extract.pageNumber, authoredW: extract.authoredW, authoredH: extract.authoredH, rotation: extract.rotation, rtl: rightToLeftLean(extract.runs) };
+        let directions: Map<RawRun, boolean> | undefined;
+        pageCtx.lineDirections = () => directions ??= lineDirections(extract.runs, pdfCfg, pageCtx.rtl);
         // The frame every node is built in: authored space, so a `/Rotate` page's boxes stay
         // comparable to the runs they came from. `finalizeBounds` maps them at the end of the page.
         const layoutCtx: PageContext = { ...pageCtx, rotation: 0 };
@@ -1717,13 +1785,18 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
                     // evidence of a broken one: only untagged *body* text warrants the warning.
                     if (leftover.some(r => !r.inArtifact)) warnStruct('some text on a page was outside the tag tree');
                 }
+                // Turned text the tags cover, which their lines (level text alone) leave out: after the
+                // page's text, with its angle, as the geometric path keeps it. A turned label on a slide,
+                // a chart's axis title, was lost from a tagged PDF (as a browser prints one).
+                appendAll(pageContent, rotatedTextNodes(bodyRuns.filter(r => r.angle !== 0 && r.mcid && coveredMcids.has(r.mcid)), pageCtx, pdfCfg));
             } else {
                 warnStruct('the tag tree covered too little of the page text');
             }
         }
 
         // Geometric fallback (untagged, distrusted, or low coverage).
-        if (!pageContent) pageContent = geometricNodes(bodyRuns, layoutCtx, docCtx, layoutCfg);
+        // A bullet drawn as a shape reads as its glyph (see shapeBullets).
+        if (!pageContent) pageContent = geometricNodes([...bodyRuns, ...shapeBullets(extract.shapes, bodyRuns)], layoutCtx, docCtx, layoutCfg, true, extract.shapes);
 
         // Hybrid recovery: on the tagged path, additionally fold a contiguous run of loose sibling
         // paragraphs whose geometry forms a clean grid (a calendar tagged as one paragraph per day,
@@ -1732,6 +1805,14 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
         // parity. Runs on authored boxes here, before finalizeBounds, so it works under
         // ignorePageGeometry too.
         if (fromTags) pageContent = recoverTaggedGrids(pageContent);
+        // Tables' cells shaded as the page shades them (a header row's white text on its colour).
+        shadeCells(pageContent, extract.shapes, pageCtx.authoredW, pageCtx.authoredH);
+
+        // A running header and footer kept in the page: before its content and after it, as an untagged
+        // PDF's read, and before its images are placed (a logo beside the header stays with it).
+        if (!config.ignoreHeadersAndFooters && pdfCfg.keepHeadersAndFootersInPages) {
+            pageContent = [...geometricNodes(headerRuns, layoutCtx, docCtx, layoutCfg, false), ...pageContent, ...geometricNodes(footerRuns, layoutCtx, docCtx, layoutCfg, false)];
+        }
 
         // Images: emit as attachments/OCR, then splice each into the flow before the first text node
         // that sits lower on the page, so reading order is preserved without reordering text.
@@ -1743,12 +1824,13 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
             if (at < 0) pageContent.push(node); else pageContent.splice(at, 0, node);
         }
 
-        // Running headers/footers route to auxiliary unless the caller asked for them to be dropped.
-        if (!config.ignoreHeadersAndFooters) {
+        // Running headers/footers route to auxiliary unless the caller asked for them to be dropped,
+        // or kept in the page (see above).
+        if (!config.ignoreHeadersAndFooters && !pdfCfg.keepHeadersAndFootersInPages) {
             const pageHeaders: OfficeContentNode[] = [];
             const pageFooters: OfficeContentNode[] = [];
-            for (const node of geometricNodes(headerRuns, layoutCtx, docCtx, layoutCfg, false)) pageHeaders.push(retypeAsHeaderFooter(node, 'header'));
-            for (const node of geometricNodes(footerRuns, layoutCtx, docCtx, layoutCfg, false)) pageFooters.push(retypeAsHeaderFooter(node, 'footer'));
+            for (const node of geometricNodes(headerRuns, layoutCtx, docCtx, layoutCfg, false)) pageHeaders.push(retypeAsHeaderFooter(node, 'header', extract.pageNumber));
+            for (const node of geometricNodes(footerRuns, layoutCtx, docCtx, layoutCfg, false)) pageFooters.push(retypeAsHeaderFooter(node, 'footer', extract.pageNumber));
             finalizeBounds(pageHeaders, pageCtx, pdfCfg.includeBounds);
             finalizeBounds(pageFooters, pageCtx, pdfCfg.includeBounds);
             appendAll(auxHeaders, pageHeaders);
@@ -1767,6 +1849,8 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
             pageNode.metadata.pageWidth = Math.round(extract.width * 100) / 100;
             pageNode.metadata.pageHeight = Math.round(extract.height * 100) / 100;
             if (extract.rotation) pageNode.metadata.rotation = extract.rotation;
+            // The document's page, for the writers that lay out pages (DOCX, ODT and PDF output kept A4).
+            if (!metadata.pageSetup && extract.width > 0 && extract.height > 0) metadata.pageSetup = { width: pageNode.metadata.pageWidth, height: pageNode.metadata.pageHeight };
         }
         if (pageNode.type === 'page' && pageNode.metadata) {
             const label = pageLabels?.[extract.pageNumber - 1];
@@ -1788,6 +1872,8 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
     // Now that every page's headings and their positions are known, point each internal link at the
     // nearest heading on its target page (falling back to the page itself), rather than a page jump.
     resolveSectionLinks(content, extracts, sectionLinks, [content, auxHeaders, auxFooters, outline ?? []]);
+    // The headings read by size and weight, levelled by the sizes of those headings (see relevelHeadings).
+    relevelHeadings(content);
 
     const auxiliary = (auxHeaders.length || auxFooters.length || outline)
         ? { ...(auxHeaders.length ? { headers: auxHeaders } : {}), ...(auxFooters.length ? { footers: auxFooters } : {}), ...(outline ? { outline } : {}) }
@@ -1801,15 +1887,33 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
  * tables from the lines before column segmentation (off for margin artifacts, which are never
  * tables).
  */
-function geometricNodes(runs: RawRun[], pageCtx: PageContext, docCtx: DocContext, pdfCfg: PdfLayoutConfig, detectGridTables = true): OfficeContentNode[] {
-    const lines = buildLines(runs, pdfCfg);
+function geometricNodes(runs: RawRun[], pageCtx: PageContext, docCtx: DocContext, pdfCfg: PdfLayoutConfig, detectGridTables = true, shapes?: PdfShape[]): OfficeContentNode[] {
+    // Tables drawn with ruling lines first, from the lines themselves (see rulings); their text is theirs.
+    const ruled = detectGridTables ? ruledTables(ruledFrames(shapes, pageCtx.authoredW, pageCtx.authoredH), runs, {
+        cfg: pdfCfg,
+        content: cellRuns => blockToNodes(joinMarkerLines(buildLines(cellRuns, pdfCfg, pageCtx.rtl)), pageCtx, docCtx),
+        bounds: box => emitBounds(box, pageCtx, pdfCfg),
+    }) : { tables: [], consumed: new Set<RawRun>() };
+    if (ruled.consumed.size) runs = runs.filter(r => !ruled.consumed.has(r));
+    // Tables are found before a list's markers are joined to their text: a table's first column of numbers
+    // (`1.`, `2.`) joined to the cell beside it gave each row a cell fewer than its header.
+    const built = buildLines(runs, pdfCfg, pageCtx.rtl);
     const { tables, consumed } = detectGridTables
-        ? detectTables(lines, pageCtx, docCtx)
-        : { tables: [] as { node: OfficeContentNode; y: number }[], consumed: new Set<typeof lines[number]>() };
-    const remaining = consumed.size ? lines.filter(l => !consumed.has(l)) : lines;
+        ? detectTables(built, pageCtx, docCtx)
+        : { tables: [] as { node: OfficeContentNode; y: number }[], consumed: new Set<typeof built[number]>() };
+    for (const node of ruled.tables) tables.push({ node, y: node.bounds?.y ?? Infinity });
+    const remaining = joinMarkerLines(consumed.size ? built.filter(l => !consumed.has(l)) : built);
 
     const out: OfficeContentNode[] = [];
-    for (const block of segmentIntoBlocks(remaining, pdfCfg)) appendAll(out, blockToNodes(block, pageCtx, docCtx));
+    // A list runs on from block to block, and its levels are the page's (see ListCarry).
+    const blocks = segmentIntoBlocks(remaining, pdfCfg);
+    const lefts = markerLefts(remaining);
+    const carry: ListCarry = { listId: null, type: null, left: 0, bottom: 0, lineHeight: 12, itemInList: 0, prev: null, next: null, ...(lefts.length ? { levelFor: indentLevelsOf(lefts) } : {}) };
+    blocks.forEach((block, k) => {
+        carry.next = k + 1 < blocks.length ? leadingMarker(blocks[k + 1]) : null;
+        carry.nextLine = k + 1 < blocks.length ? blocks[k + 1][0] : null;
+        appendAll(out, blockToNodes(block, pageCtx, docCtx, carry));
+    });
     // Splice each detected table into the flow at its vertical position.
     for (const t of tables) {
         const ty = t.node.bounds?.y ?? Infinity;
@@ -1823,12 +1927,19 @@ function geometricNodes(runs: RawRun[], pageCtx: PageContext, docCtx: DocContext
     return out;
 }
 
-/** Recovers rotated (90/180/270) runs as trailing paragraphs, one per angle, in content order. */
+/**
+ * Recovers turned runs (a quarter turn, or any other angle) as trailing paragraphs, one per angle, in
+ * content order, each with its angle (ParagraphMetadata.rotation).
+ */
 function rotatedTextNodes(runs: RawRun[], pageCtx: PageContext, pdfCfg: PdfLayoutConfig): OfficeContentNode[] {
     const out: OfficeContentNode[] = [];
-    for (const angle of [90, 270, 180] as const) {
-        const group = runs.filter(r => r.angle === angle && r.text.trim().length > 0);
-        if (!group.length) continue;
+    const byTurn = new Map<number, RawRun[]>();
+    for (const r of runs) {
+        if (r.angle === 0 || !r.text.trim().length) continue;
+        const group = byTurn.get(r.turn);
+        if (group) group.push(r); else byTurn.set(r.turn, [r]);
+    }
+    for (const [turn, group] of byTurn) {
         // Joined once, a space between runs that do not already meet at one; testing the end of the
         // growing text for each run instead copied all of it every time.
         const parts: string[] = [];
@@ -1840,7 +1951,7 @@ function rotatedTextNodes(runs: RawRun[], pageCtx: PageContext, pdfCfg: PdfLayou
         }
         const text = parts.join('').replace(/\s+/g, ' ').trim();
         if (!text) continue;
-        const node: OfficeContentNode = { type: 'paragraph', text, children: [{ type: 'text', text }] };
+        const node: OfficeContentNode = { type: 'paragraph', text, children: [{ type: 'text', text }], metadata: { rotation: turn } as ParagraphMetadata };
         const box = unionAll(group.map(r => ({ x: r.x, y: r.yTop, width: r.width, height: r.height })));
         if (pdfCfg.includeBounds && box) {
             const rendered = roundBounds(rotateBoundsToRendered(box, pageCtx.rotation, pageCtx.authoredW, pageCtx.authoredH));
@@ -1899,8 +2010,8 @@ function finalizeBounds(nodes: OfficeContentNode[], page: PageContext, includeBo
 }
 
 /** Wraps a paragraph produced from margin artifacts as a header/footer node. */
-function retypeAsHeaderFooter(node: OfficeContentNode, type: 'header' | 'footer'): OfficeContentNode {
-    return { type, text: node.text, children: node.children, bounds: node.bounds, metadata: { type: 'default' } };
+function retypeAsHeaderFooter(node: OfficeContentNode, type: 'header' | 'footer', page: number): OfficeContentNode {
+    return { type, text: node.text, children: node.children, bounds: node.bounds, metadata: { type: 'default', page } };
 }
 
 /**

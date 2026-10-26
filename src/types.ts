@@ -497,7 +497,10 @@ export interface CommonOfficeParserConfig {
      * ODF (`fo:break-before`/`fo:break-after`, `text:soft-page-break`) and LaTeX (`\newpage`, `\clearpage`),
      * where breaks are otherwise invisible. A line break the author typed is content and always a `break`
      * node: Word's `w:br` (text wrapping) and `w:cr`, ODF's `text:line-break`, HTML's `<br>`, a Markdown hard break; so are HTML and
-     * Markdown's `<hr>`/`---` (a `thematic`/`page` break). This flag does not gate those.
+     * Markdown's `<hr>`/`---` (a `thematic`/`page` break). This flag does not gate those. Nor does it gate
+     * a section's start (a break with BreakMetadata.section: a Word, RTF or ODF text document's next
+     * section): that is the document's structure, and always a node (none where nothing comes after it).
+     * Text and Markdown output show a section's start as nothing, HTML as a new page in print.
      */
     includeBreakNodes?: boolean;
     /**
@@ -526,8 +529,12 @@ export interface CommonOfficeParserConfig {
      */
     fileType?: SupportedFileType | FileTypeAlias | null;
     /**
-     * Custom delimiter for CSV files.
-     * Defaults to ',' but can be overridden (e.g., ';', '\t').
+     * The delimiter a CSV file's fields are separated by. `'auto'` (the default) reads it from the file:
+     * of `,`, `;`, tab and `|`, counted outside quotes over the first 50 records, the one that splits
+     * the most of them into the same number of fields, and `,` when none does. European spreadsheets
+     * write `;` with decimal commas (`Müller;1.234,56`), which a comma split. Any other text is used as
+     * given (e.g. `';'`, `'\t'`). After a parse, the AST's `config.csvDelimiter` is the delimiter the
+     * file was read with, and CSV output written from it uses the same one.
      */
     csvDelimiter?: string;
     /**
@@ -542,8 +549,11 @@ export interface CommonOfficeParserConfig {
      * By default a parser that knows the geometry attaches, to every content node, a
      * {@link NodeBounds} box (`node.bounds`: the node's `{ x, y, width, height }` rectangle on its
      * page, in points) and, to each page node, the page dimensions ({@link PageMetadata.pageWidth},
-     * `pageHeight`, `rotation`). Today only the PDF parser produces any of this. Set this flag to
-     * drop all of it, giving a smaller AST that matches the pre-8.0 output shape.
+     * `pageHeight`, `rotation`). A document's pages (`pageSetup`), slides' shapes and a floating frame's
+     * place ({@link ShapeMetadata.float}, its text then read where it stands) are geometry too. Set this
+     * flag to drop all of it, giving a smaller AST that matches the pre-8.0 output shape. What is not
+     * geometry stays: a text document's `pageSetup` keeps how each section numbers its pages and whether
+     * its first page has a header of its own (PageSetup.pageNumberFormat, `differentFirstPage`).
      *
      * Note this also turns off the layout-faithful `.to('text')` rendering, which needs the boxes to
      * align columns and tables; without them the text generator falls back to plain flowing text.
@@ -671,6 +681,20 @@ export interface PdfParserConfig {
      */
     extractTextColor?: boolean;
     /**
+     * Keep each page's running header and footer in that page's content, where they stand on the
+     * page (the header first, the footer last), instead of in `auxiliary.headers` and
+     * `auxiliary.footers`. A tagged PDF marks its running headers and footers as artifacts, outside its
+     * structure: they are read into `auxiliary`, as a word processor's header is, so a writer that lays
+     * out pages (Word, ODT, RTF, LaTeX, PDF) repeats the first page's on every page and one that does
+     * not (text, Markdown, HTML, EPUB, PowerPoint) leaves them out. Turn this on for a writer that
+     * shows each page as it was, a slide per page, so a page keeps its own header and footer text (a
+     * page number, a chapter title) in its place. An untagged PDF's headers and footers are page text
+     * already. `ignoreHeadersAndFooters` still drops them.
+     *
+     * Default is false.
+     */
+    keepHeadersAndFootersInPages?: boolean;
+    /**
      * Base of the text items one PDF may yield; the limit is this plus one per byte of the file, and an
      * item counts once more for each 64 characters it holds (a form drawing one 1 MB string a hundred
      * times took 13 seconds as a hundred items). A form
@@ -686,8 +710,9 @@ export interface PdfParserConfig {
     maxTextItems?: number;
     /**
      * Base of the drawing operators kept from one PDF (for images, text color and font styles); the
-     * limit is this plus four per byte of the file. Only what is kept counts: paths, which are not,
-     * cost nothing, so a drawing of thousands of shapes is read whole, and a shown string counts once
+     * limit is this plus four per byte of the file. Paths do not count (they are read, up to a bound of
+     * their own, for tables' ruling lines, cells' shading and bullets drawn as shapes), so a drawing of
+     * thousands of shapes is read whole, and a shown string counts once
      * more for each 64 glyphs it holds. Nested forms multiply operators as they multiply text items
      * (see `maxTextItems`). Past the limit no more operators are read: from that page on, the
      * document's images, text colors and font styles are missing, its text is still read, and a
@@ -996,6 +1021,10 @@ type ConversionValue<D extends string> =
     CanonicalFormat<D> extends 'epub' ? Uint8Array :
     CanonicalFormat<D> extends 'docx' ? Uint8Array :
     CanonicalFormat<D> extends 'odt' ? Uint8Array :
+    CanonicalFormat<D> extends 'xlsx' ? Uint8Array :
+    CanonicalFormat<D> extends 'ods' ? Uint8Array :
+    CanonicalFormat<D> extends 'pptx' ? Uint8Array :
+    CanonicalFormat<D> extends 'odp' ? Uint8Array :
     CanonicalFormat<D> extends 'tex' ? string | Uint8Array :
     string;
 
@@ -1009,7 +1038,7 @@ export interface ConversionResult<D extends string> {
 /**
  * Universal formats supported by all source types for generation.
  */
-export type UniversalGeneratorFormat = 'text' | 'md' | 'html' | 'pdf' | 'csv' | 'rtf' | 'chunks' | 'epub' | 'docx' | 'odt' | 'tex';
+export type UniversalGeneratorFormat = 'text' | 'md' | 'html' | 'pdf' | 'csv' | 'rtf' | 'chunks' | 'epub' | 'docx' | 'odt' | 'tex' | 'xlsx' | 'ods' | 'pptx' | 'odp';
 
 /**
  * Other names the generators accept for a format: `'txt'` for `'text'`, `'markdown'` for `'md'` and
@@ -1245,7 +1274,7 @@ export interface CommonGeneratorConfig {
      * Whether to ignore all internal (anchor) links and anchor IDs during generation.
      * When true, all bookmarks, cross-references, and internal document jumps are stripped.
      * Specifically for Markdown, this removes the {#id} block from headings.
-     * Applies to HTML, Markdown, DOCX, ODT and RTF. Defaults to false.
+     * Applies to HTML, Markdown, DOCX, ODT, RTF and the native PDF engine. Defaults to false.
      */
     ignoreInternalLinks?: boolean;
     /**
@@ -1273,6 +1302,10 @@ type GeneratorSpecificConfigOf<D extends string> =
     D extends 'rtf' ? { rtfConfig?: RtfGeneratorConfig } :
     D extends 'docx' ? { docxConfig?: DocxGeneratorConfig } :
     D extends 'odt' ? { odtConfig?: OdtGeneratorConfig } :
+    D extends 'xlsx' ? { xlsxConfig?: XlsxGeneratorConfig } :
+    D extends 'ods' ? { odsConfig?: OdsGeneratorConfig } :
+    D extends 'pptx' ? { pptxConfig?: PptxGeneratorConfig } :
+    D extends 'odp' ? { odpConfig?: OdpGeneratorConfig } :
     D extends 'tex' ? { texConfig?: TexGeneratorConfig } :
     D extends 'chunks' ? { chunksConfig?: ChunkingConfig } :
     Partial<{
@@ -1284,6 +1317,10 @@ type GeneratorSpecificConfigOf<D extends string> =
         rtfConfig: RtfGeneratorConfig;
         docxConfig: DocxGeneratorConfig;
         odtConfig: OdtGeneratorConfig;
+        xlsxConfig: XlsxGeneratorConfig;
+        odsConfig: OdsGeneratorConfig;
+        pptxConfig: PptxGeneratorConfig;
+        odpConfig: OdpGeneratorConfig;
         texConfig: TexGeneratorConfig;
         chunksConfig: ChunkingConfig;
     }>;
@@ -1358,6 +1395,10 @@ export type FullGeneratorConfig = DeepRequired<Omit<CommonGeneratorConfig, 'meta
     rtfConfig: RtfGeneratorConfig;
     docxConfig: DocxGeneratorConfig;
     odtConfig: OdtGeneratorConfig;
+    xlsxConfig: XlsxGeneratorConfig;
+    odsConfig: OdsGeneratorConfig;
+    pptxConfig: PptxGeneratorConfig;
+    odpConfig: OdpGeneratorConfig;
     texConfig: TexGeneratorConfig;
 }> & {
     chunksConfig: ChunkingConfig;
@@ -1506,7 +1547,61 @@ export interface HtmlGeneratorConfig {
  */
 export type PaperFormat =
     'letter' | 'legal' | 'tabloid' | 'ledger' | 'a0' | 'a1' | 'a2' | 'a3' | 'a4' | 'a5' | 'a6' |
-    'Letter' | 'Legal' | 'Tabloid' | 'Ledger' | 'A0' | 'A1' | 'A2' | 'A3' | 'A4' | 'A5' | 'A6';
+    'Letter' | 'Legal' | 'Tabloid' | 'Ledger' | 'A0' | 'A1' | 'A2' | 'A3' | 'A4' | 'A5' | 'A6' |
+    /** The document's own page ({@link OfficeMetadata.pageSetup}, and each section's own where the output has sections), else A4. */
+    'auto';
+
+/**
+ * A page's size and margins, in points, as a document sets them for a run of its pages: a Word section,
+ * an ODF page style, a presentation's slides, a sheet's print setup.
+ */
+export interface PageSetup {
+    /**
+     * Width in points (the page is landscape when it is wider than it is tall). Width and height are
+     * absent where the document does not set its page (an RTF section that only numbers its pages in
+     * roman, a Word section with no `w:pgSz`) or under `ignorePageGeometry`: the section's other
+     * properties still apply, on the document's page (its size, margins and header and footer distances).
+     */
+    width?: number;
+    /** Height in points (absent with the width). */
+    height?: number;
+    /** The margins around the body, in points. */
+    margin?: { top: number; right: number; bottom: number; left: number };
+    /** From the page's top edge to its header, in points. */
+    headerDistance?: number;
+    /** From the page's bottom edge to its footer, in points. */
+    footerDistance?: number;
+    /**
+     * The first of these pages has a header and footer of its own (Word's "different first page"): a
+     * first-page header (HeaderFooterMetadata type `first`) is used on it, here or carried on from an
+     * earlier section; without it, none is.
+     */
+    differentFirstPage?: boolean;
+    /**
+     * The body's columns, where it is set in more than one: their number, the gap between them (in
+     * points), their widths where they differ (in points, left to right), and whether a line is drawn
+     * between them.
+     */
+    columns?: { count: number; gap: number; widths?: number[]; separator?: boolean };
+    /**
+     * How the section numbers its pages (Word's `w:pgNumType w:fmt`, RTF's `\pgndec`, `\pgnlcrm` and the
+     * like, an ODF page layout's `style:num-format`): `decimal` unless it says otherwise, a front matter's
+     * i, ii, iii in `lowerRoman`. A reader that knows it writes it, decimal included; absent where the
+     * section numbers its pages in a format none of PageNumberFormat's is (the saved number's form kept). A
+     * page field in the section with no format of its own (TextMetadata.fieldFormat) prints its page in it.
+     */
+    pageNumberFormat?: PageNumberFormat;
+}
+
+/**
+ * How a page number is written: 1, i, I, a, A (27 is `aa`), 1st, one, first, a hexadecimal number, the
+ * number between dashes (`- 1 -`), or digits of a script of its own (full-width, Arabic-Indic, Extended
+ * Arabic-Indic (Persian), Devanagari, Thai). Plain digits (`decimal`, `decimalDash`, `ordinal`) are
+ * written in the script the page number was saved in. A section or field in a format none of these is
+ * (Hebrew letters, CJK counting) has none: the saved number's own form is kept.
+ */
+export type PageNumberFormat = 'decimal' | 'lowerRoman' | 'upperRoman' | 'lowerLetter' | 'upperLetter' | 'ordinal' | 'cardinalText' | 'ordinalText' | 'hex' | 'decimalDash'
+    | 'decimalFullWidth' | 'decimalArabicIndic' | 'decimalExtendedArabicIndic' | 'decimalDevanagari' | 'decimalThai';
 
 /**
  * Configuration options for PDF generation.
@@ -1561,8 +1656,10 @@ export interface PdfGeneratorConfig {
      * those lack.
      *
      * Words are shaped by the font (ligatures, Arabic joining, Indic conjuncts) and a right-to-left
-     * line is laid out from the right edge, its words in visual order. Marks a font places with its
-     * positioning table (`GPOS`) are drawn at their default offsets.
+     * line is laid out from the right edge, its words in visual order. Text of the Indic and Southeast
+     * Asian scripts, and letters with combining marks, is drawn with each glyph where the font places
+     * it (through its positioning table, `GPOS`) and marked with what it says (`/ActualText`), so it
+     * copies in the order it is written.
      *
      * A value that is not a list, or an entry that is not a file's bytes, is reported
      * (`INVALID_CONFIG_VALUE`) and left out. Defaults to none.
@@ -1571,9 +1668,23 @@ export interface PdfGeneratorConfig {
     /**
      * Embed only the glyphs the document uses of each font given in `fonts` and `fallbackFonts`
      * (`'native'` engine). Set false to embed whole font files, for a font whose subset a viewer does
-     * not draw. Defaults to true.
+     * not draw. An OpenType font of CFF outlines (`.otf` starting `OTTO`) is embedded whole either way:
+     * its subset is not one viewers draw. Defaults to true.
      */
     subsetFonts?: boolean;
+    /**
+     * Print a spreadsheet's hidden sheets, rows and columns. A spreadsheet's printout leaves them out,
+     * and so does PDF output by default (both engines): they are marked when read
+     * (SheetMetadata.hidden, RowMetadata.hidden, CellMetadata.hidden) and kept as data by every other
+     * format. Defaults to false.
+     */
+    printHidden?: boolean;
+    /**
+     * Print each slide's speaker notes under it. A PDF of slides leaves them out, as PowerPoint's and
+     * LibreOffice's do, and so does PDF output by default (both engines); every other format keeps them
+     * after their slide. Defaults to false.
+     */
+    printSpeakerNotes?: boolean;
     /**
      * Emit a tagged (accessible / PDF-UA-friendly) PDF, so screen readers can follow the document
      * structure. Passed through to the rendering engine; ignored by engines that do not support it.
@@ -1585,7 +1696,12 @@ export interface PdfGeneratorConfig {
      * engines write one (it is experimental in the `'html'` engine's browser). Defaults to false.
      */
     outline?: boolean;
-    /** Paper format. Defaults to 'A4'. See {@link PaperFormat}. */
+    /**
+     * Paper format. Defaults to 'auto': the document's own pages ({@link OfficeMetadata.pageSetup}; the
+     * native engine gives each section its own, BreakMetadata.pageSetup, and takes the margins left
+     * unset from it), else A4. `landscape` turns a document's portrait page; a `width` or `height`
+     * given is used instead. See {@link PaperFormat}.
+     */
     format?: PaperFormat;
     /** Paper width, accepts values labeled with units (e.g., '5in', '3cm') or numbers (in pixels). */
     width?: string | number;
@@ -1710,17 +1826,57 @@ export interface StructuredStyleMapping {
 export interface DocxGeneratorConfig {
     /**
      * Page size for the document section (`w:pgSz`). One of the shared {@link PaperFormat} names,
-     * the same set and spelling {@link PdfGeneratorConfig.format} accepts. Defaults to `'A4'`.
+     * the same set and spelling {@link PdfGeneratorConfig.format} accepts. Defaults to `'auto'`: the document's own page ({@link OfficeMetadata.pageSetup}), else A4.
      */
     format?: PaperFormat;
     /** Landscape orientation (swaps the page dimensions and sets `w:orient`). Defaults to false. */
     landscape?: boolean;
     /**
      * Page margins, converted to twips for `w:pgMar`. Each side is a number of points (1/72 inch) or
-     * a unit-labeled string (`'1in'`, `'2cm'`, `'36pt'`, `'48px'`); a bare number is points. Defaults
-     * to 72 (Word's standard one inch) on every side.
+     * a unit-labeled string (`'1in'`, `'2cm'`, `'36pt'`, `'48px'`); a bare number is points. By default
+     * a side left unset is the document's own margin under `format: 'auto'`, else 72 (one inch).
      */
     margin?: { top?: number | string; right?: number | string; bottom?: number | string; left?: number | string };
+}
+
+/**
+ * Configuration options for XLSX (Excel workbook) generation. A spreadsheet is written sheet for sheet,
+ * its values typed and shown in their formats; a document is written as its tables, each a sheet, and
+ * its text outside them on a sheet of its own.
+ */
+export interface XlsxGeneratorConfig {
+    /** Each of a document's tables on a sheet of its own, named after the heading before it (true), or all on one sheet, an empty row between them (false). Defaults to true. */
+    sheetPerTable?: boolean;
+    /** A document's text outside its tables, a block a row, on a sheet named Text. Defaults to true. */
+    includeText?: boolean;
+}
+
+/** Configuration options for ODS (OpenDocument spreadsheet) generation, as {@link XlsxGeneratorConfig}'s. */
+export interface OdsGeneratorConfig {
+    /** Each of a document's tables on a sheet of its own (true), or all on one sheet (false). Defaults to true. */
+    sheetPerTable?: boolean;
+    /** A document's text outside its tables on a sheet named Text. Defaults to true. */
+    includeText?: boolean;
+}
+
+/**
+ * Configuration options for PPTX (PowerPoint) generation. A deck is written slide for slide; a PDF's
+ * pages a slide each, each paragraph a text box where it stood; a flowing document's headings a slide
+ * each, its text as bullets.
+ */
+export interface PptxGeneratorConfig {
+    /**
+     * A picture for each page (PNG or JPEG bytes, in page order; null or undefined for a page without
+     * one), drawn as its slide's background under its text: a PDF's page drawn without its text, so its
+     * shapes, backgrounds, charts and gradients look as they did, with its text over it to edit.
+     */
+    backgrounds?: (Uint8Array | null | undefined)[];
+}
+
+/** Configuration options for ODP (OpenDocument presentation) generation, as {@link PptxGeneratorConfig}'s. */
+export interface OdpGeneratorConfig {
+    /** A picture for each page (PNG or JPEG bytes, in page order), under its slide's text. */
+    backgrounds?: (Uint8Array | null | undefined)[];
 }
 
 /**
@@ -1729,16 +1885,16 @@ export interface DocxGeneratorConfig {
 export interface OdtGeneratorConfig {
     /**
      * Page size for the page layout (`style:page-layout` in styles.xml). One of the shared
-     * {@link PaperFormat} names, the same set {@link PdfGeneratorConfig.format} accepts. Defaults to
-     * `'A4'`.
+     * {@link PaperFormat} names, the same set {@link PdfGeneratorConfig.format} accepts.
+     * Defaults to `'auto'`: the document's own page ({@link OfficeMetadata.pageSetup}), else A4.
      */
     format?: PaperFormat;
     /** Landscape orientation (swaps page dimensions and sets `style:print-orientation`). Defaults to false. */
     landscape?: boolean;
     /**
      * Page margins, written as `fo:margin-*` lengths. Each side is a number of points (1/72 inch) or
-     * a unit-labeled string (`'1in'`, `'2cm'`, `'36pt'`, `'48px'`); a bare number is points. Defaults
-     * to 72 (the standard one inch) on every side.
+     * a unit-labeled string (`'1in'`, `'2cm'`, `'36pt'`, `'48px'`); a bare number is points. By default
+     * a side left unset is the document's own margin under `format: 'auto'`, else 72 (one inch).
      */
     margin?: { top?: number | string; right?: number | string; bottom?: number | string; left?: number | string };
 }
@@ -1797,15 +1953,15 @@ export interface TexGeneratorConfig {
     numberSections?: boolean;
     /**
      * Paper size, written as a `geometry` option. One of the shared {@link PaperFormat} names.
-     * Defaults to `'A4'`. Ignored by `beamer`, whose frame size is fixed.
+     * Defaults to `'auto'`: the document's own page ({@link OfficeMetadata.pageSetup}), else A4. Ignored by `beamer`, whose frame size is fixed.
      */
     format?: PaperFormat;
     /** Landscape orientation. Defaults to false. Ignored by `beamer`. */
     landscape?: boolean;
     /**
      * Page margins, written as `geometry` options. Each side is a number of points (1/72 inch) or a
-     * unit-labeled string (`'1in'`, `'2cm'`, `'36pt'`, `'48px'`); a bare number is points. Defaults to
-     * 72 (one inch) on every side. Ignored by `beamer`.
+     * unit-labeled string (`'1in'`, `'2cm'`, `'36pt'`, `'48px'`); a bare number is points. By default
+     * a side left unset is the document's own margin under `format: 'auto'`, else 72 (one inch). Ignored by `beamer`.
      */
     margin?: { top?: number | string; right?: number | string; bottom?: number | string; left?: number | string };
 }
@@ -2245,7 +2401,10 @@ export interface DocumentStructureChunkingConfig extends BaseChunkingConfig {
     /**
      * How to handle table nodes when splitting.
      * - 'row': Split by rows, REPEATING the header row in every chunk so the LLM
-     *   always understands what the columns mean. (Highly recommended for RAG)
+     *   always understands what the columns mean. (Highly recommended for RAG) A chunk holds as many
+     *   rows as fit beside the header, and at least one, so where the header and one row are more than
+     *   `maxChunkSize` the chunk is that much longer; a row longer than a whole chunk is cut, each piece
+     *   under the header. A header repeated past twice the table's own size is written once instead.
      * - 'flatten': Convert the table to plain text and split like a regular block.
      * Default is 'row'.
      */
@@ -2704,6 +2863,61 @@ export interface SlideMetadata {
     style?: string;
     /** Unique anchor IDs for internal linking. */
     anchorIds?: string[];
+    /** The colour the slide is filled with (its own background, else its layout's or master's), `#RRGGBB`. */
+    background?: string;
+}
+
+/**
+ * Metadata for a `drawing` node: a shape drawn on a slide (a filled box, a circle, a line), or the frame
+ * a shape's text sits in where that is turned or set within it. Its place is the node's `bounds`; the
+ * text in the shape is in the paragraphs after it that have the same bounds. Read from PPTX.
+ *
+ * In a document, a `drawing` node with `float` is a text frame or text box standing beside the text
+ * (ODT `draw:frame`, Word `wp:anchor`, RTF `\shp`): its blocks are its children, and it comes before the
+ * paragraph it is anchored to. Writers that cannot place it write its blocks where it stands.
+ */
+export interface ShapeMetadata {
+    /** The shape's outline: DrawingML's preset name (`rect`, `roundRect`, `ellipse`, `triangle`, `line`, ...). */
+    geometry?: string;
+    /** The colour it is filled with, `#RRGGBB`. */
+    fill?: string;
+    /** The colour and width (points) of its outline. */
+    line?: { color?: string; width?: number };
+    /** How far it is turned, in degrees clockwise. */
+    rotation?: number;
+    /** It is mirrored left to right, or top to bottom. */
+    flipH?: boolean;
+    flipV?: boolean;
+    /** Where its text sits from top to bottom of it. */
+    textAnchor?: 'top' | 'middle' | 'bottom';
+    /** The space between its edges and its text, in points. */
+    textInsets?: { top: number; right: number; bottom: number; left: number };
+    /** Where a document's frame stands, beside the text of the paragraph after it, and how that text goes round it. */
+    float?: ShapeFloat;
+}
+
+/**
+ * Where a frame floating in a document's text stands (see {@link ShapeMetadata.float}). Lengths are in
+ * points.
+ */
+export interface ShapeFloat {
+    /** What `x` and `align` are measured across: the text column, the page's text area (between its margins), or the page. */
+    horizontalFrom: 'column' | 'margin' | 'page';
+    /** What `y` is measured down from: the top of the paragraph it is anchored to, the page's text area, or the page. */
+    verticalFrom: 'paragraph' | 'margin' | 'page';
+    /** Its left edge from the left of what it is measured across, where `align` does not place it. */
+    x?: number;
+    /** Placed at the left, centre or right of what it is measured across, instead of at `x`. */
+    align?: 'left' | 'center' | 'right';
+    /** Its top below the top of what it is measured down from. */
+    y?: number;
+    width: number;
+    /** Its height; unset, as tall as its text. */
+    height?: number;
+    /** How the text goes round it: beside it, above and below it only, or not at all (it stands over or behind the text). */
+    wrap: 'beside' | 'aboveBelow' | 'none';
+    /** The space the text keeps from it, at its left, right, top and bottom. */
+    gap?: { top: number; right: number; bottom: number; left: number };
 }
 
 /**
@@ -2716,6 +2930,27 @@ export interface SheetMetadata {
     style?: string;
     /** Unique anchor IDs for internal linking. */
     anchorIds?: string[];
+    /**
+     * The workbook hides the sheet (XLSX `state="hidden"` or `"veryHidden"`, ODS `table:display="false"`).
+     * Its content is read as any sheet's; a printout leaves it out, as PDF output does unless
+     * `pdfConfig.printHidden` is set.
+     */
+    hidden?: boolean;
+    /**
+     * How the sheet prints: its paper, orientation and margins (XLSX `pageSetup` and `pageMargins`, an
+     * ODS sheet's master page). PDF output prints the sheet on these pages (pdfConfig.format 'auto').
+     */
+    pageSetup?: PageSetup;
+}
+
+/** Metadata for a row of a sheet. */
+export interface RowMetadata {
+    /**
+     * The sheet hides the row (XLSX `hidden`, ODS `table:visibility` of `collapse` or `filter`). Its cells
+     * are read and marked hidden too (CellMetadata.hidden); PDF output leaves them out unless
+     * `pdfConfig.printHidden` is set.
+     */
+    hidden?: boolean;
 }
 
 /**
@@ -2731,6 +2966,27 @@ export interface IndentationMetadata {
     firstLine?: number;
     /** Hanging indentation. */
     hanging?: number;
+}
+
+/**
+ * The space around a paragraph or heading and between its lines, where the document sets it (Word's
+ * `w:spacing`, ODF's `fo:margin-top`/`fo:margin-bottom`/`fo:line-height`, RTF's `\sb`/`\sa`/`\sl`,
+ * an HTML element's `margin-top`/`margin-bottom`/`line-height`).
+ */
+export interface ParagraphSpacing {
+    /** Space above, in points. */
+    before?: number;
+    /** Space below, in points. */
+    after?: number;
+    /**
+     * The distance from one line to the next as a multiple of single spacing, when it is proportional.
+     * @example 2 for double spacing, 1.5 for one and a half
+     */
+    lineMultiple?: number;
+    /** The distance from one line to the next in points, when it is fixed (at least that, where `lineAtLeast`). */
+    lineHeight?: number;
+    /** `lineHeight` is a least distance, which a taller line exceeds (Word's and ODF's "at least"). */
+    lineAtLeast?: boolean;
 }
 
 /**
@@ -2753,6 +3009,8 @@ export interface HeadingMetadata {
     style?: string;
     /** Detailed indentation information. */
     paragraphIndentation?: IndentationMetadata;
+    /** The space around the heading and between its lines. */
+    spacing?: ParagraphSpacing;
     /** Unique anchor IDs for internal linking. */
     anchorIds?: string[];
 }
@@ -2763,10 +3021,17 @@ export interface HeadingMetadata {
 export interface ParagraphMetadata {
     /** The alignment of the paragraph. */
     alignment?: TextAlignment;
+    /**
+     * The paragraph's text is turned on its page, in degrees clockwise (a PDF's label running up the
+     * page is 270, one running down 90): text read at an angle, gathered after its page's level text.
+     */
+    rotation?: number;
     /** The style of the paragraph. */
     style?: string;
     /** Detailed indentation information. */
     paragraphIndentation?: IndentationMetadata;
+    /** The space around the paragraph and between its lines. */
+    spacing?: ParagraphSpacing;
     /** Unique anchor IDs for internal linking. */
     anchorIds?: string[];
 }
@@ -2818,6 +3083,14 @@ export interface ListMetadata {
     /** Unique anchor IDs for internal linking. */
     anchorIds?: string[];
 
+    /**
+     * The item's marker as the document shows it, where that is other than its number and a dot (an
+     * ordered item) or a round bullet: a number in another format or with other punctuation (`a)`,
+     * `iv.`, `(3)`, `2.1.`), another bullet (`◦`, `▪`, `➢`), or none (`''`). Read from DOCX numbering,
+     * ODF list styles and HTML's `<ol type>` and `list-style-type`; PDF output prints it.
+     * @example 'b)'
+     */
+    marker?: string;
     /** True when this list item is a GFM task-list item (checkbox), regardless of checked state. */
     isTask?: boolean;
     /** Checked state for a task-list item. Only meaningful when isTask is true. */
@@ -2861,6 +3134,41 @@ export interface CellMetadata {
     anchorIds?: string[];
     /** Background color for this cell in hex format (e.g. #FFFFFF). */
     backgroundColor?: string;
+    /**
+     * The text the sheet shows for the cell's number, through its number format, where that differs
+     * from `text` (XLSX, which stores a number and a format: `text` is the value, 0.19, and this the
+     * `19%`, `€120.00` or `01.10.2026` a spreadsheet shows). PDF output prints it, as a spreadsheet's
+     * printout shows it; data outputs keep `text`. ODS stores the shown text itself, which is `text`.
+     */
+    shownText?: string;
+    /**
+     * The kind of value a spreadsheet's cell holds, as its file says (XLSX's cell type and number format,
+     * ODS's `office:value-type`): a number (a percentage or a currency amount included), a date (a date and
+     * time included), a time (a duration included), a truth value, an error, or text. A spreadsheet writer
+     * holds the cell as that kind: text stays text however it reads (a code `1E5`, a card number), a number
+     * is the number held. Not set where the source does not say (CSV, a document's tables), whose cells are
+     * read from their text.
+     */
+    valueType?: 'number' | 'date' | 'time' | 'boolean' | 'error' | 'text';
+    /**
+     * The value the cell holds, where it is other than `text`: a number in full (`10.456`, where ODS's `text`
+     * is what the sheet shows, `10.46`); a date's or time's count of days in the 1900 date system, as Excel
+     * counts them (`45000` for 2023-03-15, `45000.5` at noon, `0.25` for 06:00, `1.25` for a duration of 30
+     * hours), whatever text the cell shows; `true` or `false` for a truth value.
+     */
+    value?: string;
+    /**
+     * The number format the sheet shows the cell's value in, as Excel writes one (XLSX's format code:
+     * `0.0 "kg"`, `mm/dd/yyyy`, `#,##0.00 [$€-407]`), where it has one other than General. XLSX output
+     * writes it as it is; other spreadsheet output shows the value in the format read from `shownText`.
+     */
+    numberFormat?: string;
+    /**
+     * The sheet does not show the cell: its row or its column is hidden. It is read as any cell (text,
+     * CSV, chunks and every other output keep it as data); a printout leaves it out, as PDF output does
+     * unless `pdfConfig.printHidden` is set.
+     */
+    hidden?: boolean;
 }
 
 /**
@@ -3089,6 +3397,19 @@ export interface TextMetadata {
     wikilink?: boolean;
     /** Advisory link title (Markdown `[text](url "title")`, HTML `<a title>`), if any. */
     title?: string;
+    /**
+     * The run is the result of a field each page fills in: the number of the page it is on (`page`,
+     * Word's PAGE, ODF's `text:page-number`) or of pages in the document (`pages`, NUMPAGES,
+     * `text:page-count`). Its text is the number when the file was saved; PDF output writes each
+     * page's own, in the field's format (`fieldFormat`), else its section's (PageSetup.pageNumberFormat),
+     * else the one its saved text is in (digits of any script, a roman numeral, letters).
+     */
+    field?: 'page' | 'pages';
+    /**
+     * The format a page field writes its number in, where it sets one (Word's and RTF's `\* roman`,
+     * `\* ALPHABETIC` and the other switches, ODF's `style:num-format`).
+     */
+    fieldFormat?: PageNumberFormat;
 }
 
 /**
@@ -3136,8 +3457,22 @@ export interface BreakMetadata {
      * - 'thematic': A thematic break (Markdown `---`/`***`/`___`, HTML `<hr>`) - a horizontal
      *   rule separating sections, distinct from a page break. Emitted as `---` in Markdown and
      *   `<hr>` in HTML.
+     * - 'section': A section of the document starts here, on the same page (a Word continuous section,
+     *   an ODF section of its own columns), with `section` and `pageSetup` (its columns): no break in
+     *   the text.
      */
-    breakType: 'column' | 'page' | 'lastRenderedPage' | 'textWrapping' | 'carriageReturn' | 'thematic';
+    breakType: 'column' | 'page' | 'lastRenderedPage' | 'textWrapping' | 'carriageReturn' | 'thematic' | 'section';
+
+    /**
+     * On a page break that starts a section of the document (a Word or RTF section, an ODF page of another
+     * style): its number (1 for the second section) and its pages' setup (size and margins where they are
+     * set, its columns, how it numbers its pages). Always a node, whatever `includeBreakNodes` says, but
+     * for a section with nothing in it after the document's last text, which is none. (A break with a
+     * section number starts a section; an author's page break has none.)
+     */
+    section?: number;
+    /** The pages of the section this break starts (see `section`). */
+    pageSetup?: PageSetup;
 
     /**
      * Specifies the location which shall be used as the next available line when breakType
@@ -3200,13 +3535,27 @@ export interface CommentMetadata {
  * Metadata for a header or footer.
  */
 export interface HeaderFooterMetadata {
+    /** Which pages it is on: every page (`default`), a section's first, or its even ones. */
     type: 'default' | 'first' | 'even' | string;
+    /**
+     * The section it belongs to (0 for the first; see BreakMetadata.section), where a document gives
+     * each section headers and footers of its own. Absent: it is on every section's pages.
+     */
+    section?: number;
+    /**
+     * The document keeps it but does not show it: a Word first-page header in a section without a
+     * different first page, an even-page one without different odd and even pages, or a part no
+     * section refers to. PDF output leaves it out.
+     */
+    hidden?: boolean;
+    /** The page it was read from: a PDF's running header is read from each page, a node a paragraph. */
+    page?: number;
 }
 
 /**
  * Union type for content metadata.
  */
-export type ContentMetadata = SlideMetadata | SheetMetadata | HeadingMetadata | ListMetadata | CellMetadata | ImageMetadata | ChartMetadata | PageMetadata | ParagraphMetadata | TextMetadata | NoteMetadata | BreakMetadata | CodeMetadata | CommentMetadata | HeaderFooterMetadata | TableMetadata | EmbedMetadata | AdmonitionMetadata | DefinitionMetadata | undefined;
+export type ContentMetadata = SlideMetadata | SheetMetadata | RowMetadata | HeadingMetadata | ListMetadata | CellMetadata | ImageMetadata | ChartMetadata | PageMetadata | ParagraphMetadata | TextMetadata | NoteMetadata | BreakMetadata | CodeMetadata | CommentMetadata | HeaderFooterMetadata | TableMetadata | EmbedMetadata | AdmonitionMetadata | DefinitionMetadata | ShapeMetadata | undefined;
 
 
 /**
@@ -3263,7 +3612,7 @@ export interface BaseContentNode {
     /**
      * Where this node sits on its page, as an axis-aligned box in page coordinates.
      * See {@link NodeBounds} for the coordinate convention. Present only when the parser knows
-     * the geometry (currently PDF) and `ignorePageGeometry` is not set.
+     * the geometry (PDF; PPTX, a shape's box on its slide) and `ignorePageGeometry` is not set.
      */
     bounds?: NodeBounds;
 
@@ -3380,8 +3729,8 @@ export type OfficeContentNode = BaseContentNode & (
     | { type: 'header'; metadata?: HeaderFooterMetadata }
     | { type: 'footer'; metadata?: HeaderFooterMetadata }
     | { type: 'table'; metadata?: TableMetadata }
-    | { type: 'row'; metadata?: undefined }
-    | { type: 'drawing'; metadata?: undefined }
+    | { type: 'row'; metadata?: RowMetadata }
+    | { type: 'drawing'; metadata?: ShapeMetadata }
     | { type: 'slideMaster'; metadata?: SlideMetadata }
     | { type: 'embed'; metadata?: EmbedMetadata }
     | { type: 'admonition'; metadata?: AdmonitionMetadata }
@@ -3529,6 +3878,12 @@ export interface OfficeMetadata {
     subject?: string;
     /** Number of pages (if available). */
     pages?: number;
+    /**
+     * The size and margins of the document's pages (its first section's, where sections differ: each
+     * later one's is on the page break that starts it, BreakMetadata.pageSetup): a Word document's
+     * section, an ODF document's page style, a presentation's slide size, a sheet's print setup.
+     */
+    pageSetup?: PageSetup;
     /** Document-wide default formatting settings (font, size, color). */
     formatting?: Partial<TextFormatting>;
     /** Style map for styles in the document. */

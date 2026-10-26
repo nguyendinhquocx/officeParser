@@ -58,6 +58,7 @@
       "pageRange": "",
       "normalizeText": true,
       "extractTextColor": true,
+      "keepHeadersAndFootersInPages": false,
       "maxTextItems": 20000,
       "maxOperators": 250000,
       "maxAnnotations": 10000,
@@ -80,6 +81,7 @@
     },
     "title": "ODG Test Drawing",
     "author": "officeParser",
+    "lastModifiedBy": "officeParser",
     "created": "2023-12-31T23:00:00.000Z",
     "modified": "2023-12-31T23:00:00.000Z",
     "styleMap": {}

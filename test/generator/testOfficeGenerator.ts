@@ -39,7 +39,7 @@ import { isHeaderRow } from '../../src/utils/officeGenUtils.js';
 // ============================================================================
 
 /** Output formats tested (PDF excluded — slow/brittle in CI) */
-const GENERATOR_FORMATS = ['html', 'md', 'text', 'rtf', 'csv', 'chunks', 'epub', 'docx', 'odt', 'tex'] as const;
+const GENERATOR_FORMATS = ['html', 'md', 'text', 'rtf', 'csv', 'chunks', 'epub', 'docx', 'odt', 'tex', 'xlsx', 'ods', 'pptx', 'odp'] as const;
 type GeneratorFormat = typeof GENERATOR_FORMATS[number];
 
 /** Formats that support roundtrip testing (parse → generate → re-parse) */
@@ -110,6 +110,8 @@ const PARSER_CONFIG: DeepRequired<OfficeParserConfig> = {
         pageRange: '',
         normalizeText: true,
         extractTextColor: true,
+        // In auxiliary, as headers and footers: the most the AST says of them.
+        keepHeadersAndFootersInPages: false,
         maxTextItems: 20_000,
         maxOperators: 250_000,
         maxAnnotations: 10_000,
@@ -141,7 +143,7 @@ const BASELINE_MODIFIED = new Date('2024-01-01T00:00:00Z');
  * entry mtimes follow the same instant.
  */
 const deterministicConfigFor = (destFmt: string): GeneratorConfig =>
-    (destFmt === 'epub' || destFmt === 'docx' || destFmt === 'odt' ? { metadataOverrides: { modified: BASELINE_MODIFIED } } : {}) as GeneratorConfig;
+    (destFmt === 'epub' || destFmt === 'docx' || destFmt === 'odt' || isPackage(destFmt) ? { metadataOverrides: { modified: BASELINE_MODIFIED } } : {}) as GeneratorConfig;
 
 /** Generator config permutations */
 const GENERATOR_CONFIG_TESTS = [
@@ -450,6 +452,48 @@ function extractOdtMetrics(bytes: Uint8Array): GeneratedMetrics {
     };
 }
 
+/** The workbook and deck formats, written as packages and measured by {@link extractPackageMetrics}. */
+type PackageFormat = 'xlsx' | 'ods' | 'pptx' | 'odp';
+const isPackage = (fmt: string): fmt is PackageFormat => fmt === 'xlsx' || fmt === 'ods' || fmt === 'pptx' || fmt === 'odp';
+
+/** A workbook's or deck's metrics. */
+function extractPackageMetrics(bytes: Uint8Array, fmt: PackageFormat): GeneratedMetrics {
+    return fmt === 'pptx' || fmt === 'odp' ? extractDeckMetrics(bytes, fmt) : extractSheetMetrics(bytes, fmt);
+}
+
+/** A deck's metrics (PPTX, ODP): its slides as lines, its tables, its text's words. */
+function extractDeckMetrics(bytes: Uint8Array, fmt: 'pptx' | 'odp'): GeneratedMetrics {
+    const files = unzipSync(bytes);
+    const slides = fmt === 'pptx' ? Object.keys(files).filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n)).map(n => strFromU8(files[n])) : [];
+    const xml = fmt === 'pptx' ? slides.join('') : (files['content.xml'] ? strFromU8(files['content.xml']) : '');
+    const texts = fmt === 'pptx' ? (xml.match(/<a:t>[^<]*<\/a:t>/g) || []) : (xml.match(/<text:(?:p|span)[^>]*>[^<]*(?=<)/g) || []);
+    const words = texts.join(' ').replace(/<[^>]+>/g, ' ').split(/\s+/).filter(Boolean);
+    return {
+        outputLength: bytes.length,
+        hasContent: bytes.length > 0 && words.length > 0,
+        lineCount: fmt === 'pptx' ? slides.length : (xml.match(/<draw:page[ >]/g) || []).length,
+        wordCount: words.length,
+        tableCount: (xml.match(fmt === 'pptx' ? /<a:tbl>/g : /<table:table[ >]/g) || []).length,
+    };
+}
+
+/** A workbook's metrics (XLSX, ODS): its sheets as tables, its rows as lines, its cells' words. */
+function extractSheetMetrics(bytes: Uint8Array, fmt: 'xlsx' | 'ods'): GeneratedMetrics {
+    const files = unzipSync(bytes);
+    const xml = fmt === 'xlsx'
+        ? Object.keys(files).filter(n => /^xl\/worksheets\/sheet\d+\.xml$/.test(n)).map(n => strFromU8(files[n])).join('')
+        : (files['content.xml'] ? strFromU8(files['content.xml']) : '');
+    const texts = fmt === 'xlsx' ? (xml.match(/<t[^>]*>[^<]*<\/t>|<v>[^<]*<\/v>/g) || []) : (xml.match(/<text:p>[^<]*<\/text:p>|office:value="[^"]*"/g) || []);
+    const words = texts.join(' ').replace(/<[^>]+>|office:value="|"/g, ' ').split(/\s+/).filter(Boolean);
+    return {
+        outputLength: bytes.length,
+        hasContent: bytes.length > 0 && words.length > 0,
+        lineCount: (xml.match(fmt === 'xlsx' ? /<row[ >]/g : /<table:table-row[ >]/g) || []).length,
+        wordCount: words.length,
+        tableCount: (xml.match(fmt === 'xlsx' ? /<worksheet[ >]/g : /<table:table[ >]/g) || []).length,
+    };
+}
+
 function extractGeneratedMetrics(output: string, fmt: GeneratorFormat): GeneratedMetrics {
     const outputLength = output.length;
     const hasContent = outputLength > 0;
@@ -708,6 +752,9 @@ async function testGeneration(
             // ODT is always a binary ZIP (ODF) archive.
             isOdtOutput = true;
             rawOutput = '[ODT archive]';
+        } else if (isPackage(destFmt)) {
+            // A workbook or deck is always a binary ZIP archive.
+            rawOutput = `[${destFmt.toUpperCase()} archive]`;
         } else if (destFmt === 'csv') {
             if (result.value instanceof Uint8Array) {
                 // ZIP archive — convert to base64 placeholder metrics
@@ -730,6 +777,8 @@ async function testGeneration(
             actualMetrics = extractDocxMetrics(result.value as Uint8Array);
         } else if (isOdtOutput) {
             actualMetrics = extractOdtMetrics(result.value as Uint8Array);
+        } else if (isPackage(destFmt)) {
+            actualMetrics = extractPackageMetrics(result.value as Uint8Array, destFmt);
         } else if (isZipOutput) {
             // ZIP: treat as valid multi-sheet output, just validate non-empty archive
             actualMetrics = {
@@ -753,6 +802,8 @@ async function testGeneration(
             fs.writeFileSync(`${outPath}.docx`, result.value as Uint8Array);
         } else if (isOdtOutput) {
             fs.writeFileSync(`${outPath}.odt`, result.value as Uint8Array);
+        } else if (isPackage(destFmt)) {
+            fs.writeFileSync(`${outPath}.${destFmt}`, result.value as Uint8Array);
         } else if (isZipOutput) {
             fs.writeFileSync(`${outPath}.zip`, result.value as Uint8Array);
         } else {
@@ -1010,7 +1061,7 @@ async function testGeneratorConfigs(
                     }
                 });
 
-                const hasStyle = htmlVal.includes('<style>');
+                const hasStyle = /<style[\s>]/.test(htmlVal);
                 const hasEnvelopeScript = htmlVal.includes('cdn.jsdelivr.net/npm/chart.js') || htmlVal.includes('initSpreadsheetResizing');
                 const hasContainer = /<div class="[^"]*container[^"]*"/.test(htmlVal);
                 results.push({
@@ -1029,7 +1080,7 @@ async function testGeneratorConfigs(
             if (ct.id === 'G15' && destFmt === 'html') {
                 const htmlVal = typeof result.value === 'string' ? result.value : '';
                 const hasDoctype = htmlVal.includes('<!DOCTYPE');
-                const hasStyle = htmlVal.includes('<style>');
+                const hasStyle = /<style[\s>]/.test(htmlVal);
                 results.push({
                     category, feature: `${ct.id}: Styled fragment (document:false only)`, sourceFormat: srcFmt, destFormat: destFmt,
                     result: {
@@ -1980,6 +2031,7 @@ const tableGrid = (table: OfficeContentNode | null): string[][] =>
 
 /** A 1x1 GIF: a real image pdf-lib cannot embed (it handles PNG and JPEG only). */
 const GIF_1PX = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+const WEBP_1PX = 'UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA';
 /** A 1x1 PNG. */
 const PNG_1PX = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
 
@@ -2071,17 +2123,24 @@ async function runNativePdfEngineTests(): Promise<GenFeatureTest[]> {
         'CommonGeneratorConfig.onNode promises every node; the engine flattened runs without ever asking'));
 
     // --- An image the engine cannot embed degrades to its alt text, and says so ---
-    const gifAst = synthAst('docx', [{ type: 'image', metadata: { attachmentName: 'pic.gif', altText: 'A described picture' } } as OfficeContentNode],
-        [{ name: 'pic.gif', extension: 'gif', mimeType: 'image/gif', data: GIF_1PX, size: 40 }]);
-    const gifOut = await nativeText(gifAst);
-    results.push(mk('an unembeddable image (GIF) falls back to its alt text',
-        'alt text drawn', JSON.stringify(gifOut.text).slice(0, 120),
-        gifOut.text.includes('A described picture'),
+    // (A GIF is drawn: the engine turns it into PNG. A WebP is the format it cannot embed.)
+    const webpAst = synthAst('docx', [{ type: 'image', metadata: { attachmentName: 'pic.webp', altText: 'A described picture' } } as OfficeContentNode],
+        [{ name: 'pic.webp', extension: 'webp', mimeType: 'image/webp', data: WEBP_1PX, size: 42 }]);
+    const webpOut = await nativeText(webpAst);
+    results.push(mk('an unembeddable image (WebP) falls back to its alt text',
+        'alt text drawn', JSON.stringify(webpOut.text).slice(0, 120),
+        webpOut.text.includes('A described picture'),
         'pdf-lib embeds PNG/JPEG only; a bare catch drew nothing at all for every other format'));
     results.push(mk('an unembeddable image warns (IMAGE_PROCESSING_FAILED)',
-        'IMAGE_PROCESSING_FAILED', JSON.stringify(gifOut.messages.map((m: any) => m.code)),
-        gifOut.messages.some((m: any) => m.code === OfficeWarningType.IMAGE_PROCESSING_FAILED),
+        'IMAGE_PROCESSING_FAILED', JSON.stringify(webpOut.messages.map((m: any) => m.code)),
+        webpOut.messages.some((m: any) => m.code === OfficeWarningType.IMAGE_PROCESSING_FAILED),
         'DOCX and ODT warn and degrade for the same input; a silently vanishing picture is unfindable'));
+    const gifOut = await nativeText(synthAst('docx', [{ type: 'image', metadata: { attachmentName: 'pic.gif', altText: 'A described picture' } } as OfficeContentNode],
+        [{ name: 'pic.gif', extension: 'gif', mimeType: 'image/gif', data: GIF_1PX, size: 40 }]));
+    results.push(mk('a GIF picture is drawn, turned into PNG',
+        'no IMAGE_PROCESSING_FAILED', JSON.stringify(gifOut.messages.map((m: any) => m.code)),
+        !gifOut.messages.some((m: any) => m.code === OfficeWarningType.IMAGE_PROCESSING_FAILED),
+        'a PDF cannot hold a GIF; it was dropped'));
 
     const missingAst = synthAst('docx', [{ type: 'image', metadata: { attachmentName: 'gone.png', altText: 'Missing picture alt' } } as OfficeContentNode]);
     const missingOut = await nativeText(missingAst);
@@ -2108,6 +2167,15 @@ async function runNativePdfEngineTests(): Promise<GenFeatureTest[]> {
         { type: 'code', text: 'код = 1' },
     ] as OfficeContentNode[]);
     const scriptWords = ['Καλημέρα', 'Привет', 'ΩΜΕΓΑ', 'κόσμε', 'мир', 'код'];
+
+    // A break inside a paragraph (`<br>`, `w:br`, RTF's \\line) starts a new line: it was dropped,
+    // gluing "Line one" to "line two".
+    const brokenAst = await OfficeParser.parseOffice(Buffer.from('<p>Line one<br>line two</p><p>a<br><br>b</p>'), { fileType: 'html' } as any) as OfficeParserAST;
+    const broken = await native(brokenAst);
+    results.push(mk('a line break inside a paragraph starts a new line',
+        'Line one and line two on lines of their own', JSON.stringify(broken.text),
+        broken.text.includes('Line one') && broken.text.includes('line two') && !/Line one[ \t]*line two/.test(broken.text),
+        'an HTML <br> was dropped by the native PDF engine'));
 
     const plain = await native(scriptsAst);
     const plainLoss = lossOf(plain.messages);
@@ -2639,6 +2707,8 @@ async function generateBaselines(): Promise<void> {
                     metrics = extractDocxMetrics(result.value as Uint8Array);
                 } else if (destFmt === 'odt') {
                     metrics = extractOdtMetrics(result.value as Uint8Array);
+                } else if (isPackage(destFmt)) {
+                    metrics = extractPackageMetrics(result.value as Uint8Array, destFmt);
                 } else if (result.value instanceof Uint8Array) {
                     // ZIP archive (multi-sheet CSV)
                     metrics = { outputLength: result.value.length, hasContent: result.value.length > 0, lineCount: 0, wordCount: 0 };
@@ -2660,6 +2730,8 @@ async function generateBaselines(): Promise<void> {
                     fs.writeFileSync(`${fileBaselinePath}.docx`, result.value as Uint8Array);
                 } else if (destFmt === 'odt') {
                     fs.writeFileSync(`${fileBaselinePath}.odt`, result.value as Uint8Array);
+                } else if (isPackage(destFmt)) {
+                    fs.writeFileSync(`${fileBaselinePath}.${destFmt}`, result.value as Uint8Array);
                 } else if (result.value instanceof Uint8Array) {
                     fs.writeFileSync(`${fileBaselinePath}.zip`, result.value);
                 } else if (destFmt === 'chunks') {

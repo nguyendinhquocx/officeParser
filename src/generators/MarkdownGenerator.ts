@@ -870,8 +870,8 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                     }
                     let content = `${prefix}${headingText}${headingText ? id : id.trimStart()}`;
 
-                    // Alignment fallback via HTML div/p
-                    if (this.resolvedFallbackToHtml.alignment && meta?.alignment && meta.alignment !== 'left') {
+                    // Alignment fallback via HTML div/p, for a heading with something in it to align.
+                    if (this.resolvedFallbackToHtml.alignment && meta?.alignment && meta.alignment !== 'left' && headingText.trim()) {
                         // Use extra newlines to ensure Markdown inside the div is parsed
                         content = `<div style="text-align: ${sanitizeCssValue(meta.alignment)}">\n\n${content}\n\n</div>`;
                     }
@@ -1044,6 +1044,8 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                     // A rule is a block, blank lines around it: `a---b` in a paragraph was text. In a list
                     // item, cell or definition (one line of Markdown) it cannot be one, and is a line break.
                     if (meta?.breakType === 'thematic') return this.inOneLine ? `${this.deferAnchors(meta)}\n` : `${this.anchorsBefore(meta) || '\n\n'}---\n\n`;
+                    // A section starting (on the same page or a new one) is the document's structure, no text.
+                    if (meta?.breakType === 'section' || typeof meta?.section === 'number') return '';
                     return '\n';
                 }
 
@@ -1408,7 +1410,8 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
         checkAbortSignal(this.config.abortSignal);
         // Allow user to completely override rendering or skip via onNode
         const override = await this.handleOnNode(node);
-        if (override === false) {
+        // (A shape drawn on a slide, ShapeMetadata, writes nothing: its text is in the nodes after it.)
+        if (override === false || (node.type === 'drawing' && !node.children?.length && typeof override !== 'string')) {
             return '';
         }
         if (typeof override === 'string') {
@@ -1835,6 +1838,7 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                 return meta?.link ? link(meta.link, meta.linkType, meta.title, text) : text;
             }
             case 'break':
+                if ((n.metadata as BreakMetadata | undefined)?.breakType === 'section' || typeof (n.metadata as BreakMetadata | undefined)?.section === 'number') return '';
                 return (n.metadata as BreakMetadata | undefined)?.breakType === 'page' || (n.metadata as BreakMetadata | undefined)?.breakType === 'thematic' ? '<hr>' : '<br>';
             case 'code': {
                 const meta = n.metadata as CodeMetadata | undefined;

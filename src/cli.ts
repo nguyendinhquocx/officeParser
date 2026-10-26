@@ -8,7 +8,7 @@
  *   officeparser file.docx --ocr --extractAttachments
  *
  * Options (--key=value, --key value, or bare flags):
- *   --to=json|text|md|html|csv|rtf|pdf|docx|odt|tex|epub|chunks  Convert AST to specified format (default: json)
+ *   --to=json|text|md|html|csv|rtf|pdf|docx|odt|xlsx|ods|pptx|odp|tex|epub|chunks  Convert AST to specified format (default: json)
  *   --output=path             Save result to a file
  *   --fileType=docx|xlsx|...  Override file type detection
  *   --ocr                     Enable OCR for images (default: false); also requires --extractAttachments
@@ -69,14 +69,16 @@ const knownParserBooleans = new Set([
     'htmlParserConfig.preserveComments',
     'pdfParserConfig.useTags', 'pdfParserConfig.detectColumns',
     'pdfParserConfig.mergeHyphenatedWords', 'pdfParserConfig.normalizeText', 'pdfParserConfig.extractTextColor', 'pdfParserConfig.separateProcess',
+    'pdfParserConfig.keepHeadersAndFootersInPages',
     'ocrConfig.preserveLayout',
 ]);
 
 const knownGeneratorBooleans = new Set([
     'includeFormatting', 'generateIds', 'renderMetadata', 'includeImages', 'includeCharts', 'ignoreInternalLinks',
     // Dotted generator booleans, same rationale as the parser set above.
-    'pdfConfig.tagged', 'pdfConfig.outline', 'pdfConfig.subsetFonts', 'pdfConfig.landscape', 'pdfConfig.printBackground', 'pdfConfig.displayHeaderFooter',
+    'pdfConfig.tagged', 'pdfConfig.outline', 'pdfConfig.subsetFonts', 'pdfConfig.printHidden', 'pdfConfig.printSpeakerNotes', 'pdfConfig.landscape', 'pdfConfig.printBackground', 'pdfConfig.displayHeaderFooter',
     'docxConfig.landscape', 'odtConfig.landscape',
+    'xlsxConfig.sheetPerTable', 'xlsxConfig.includeText', 'odsConfig.sheetPerTable', 'odsConfig.includeText',
     'texConfig.standalone', 'texConfig.bundle', 'texConfig.embedImages', 'texConfig.numberSections', 'texConfig.landscape',
     'textConfig.preserveLayout', 'textConfig.renderNotes',
     'htmlConfig.standalone', 'htmlConfig.sourceAttributes', 'htmlConfig.gatedEmbeds',
@@ -108,7 +110,7 @@ const REMOVED_CLI_FLAGS: Record<string, string> = lookupTable({
 
 // Prefixes used to identify configurations targeted for the generator instead of the parser.
 const generatorPrefixes = [
-    'generatorConfig.', 'htmlConfig.', 'csvConfig.', 'textConfig.', 'mdConfig.', 'pdfConfig.', 'rtfConfig.', 'docxConfig.', 'odtConfig.', 'texConfig.', 'chunksConfig.'
+    'generatorConfig.', 'htmlConfig.', 'csvConfig.', 'textConfig.', 'mdConfig.', 'pdfConfig.', 'rtfConfig.', 'docxConfig.', 'odtConfig.', 'xlsxConfig.', 'odsConfig.', 'pptxConfig.', 'odpConfig.', 'texConfig.', 'chunksConfig.'
 ];
 
 // Options only a generator has (`--maxInlineImageBytes`, `--metadataOverrides.title`), read from the
@@ -271,10 +273,30 @@ function fontPathsAsBytes(pdfConfig: Record<string, any> | undefined): void {
     }
 }
 
+/**
+ * A presentation's background pictures are given as paths to picture files, a page each, in order
+ * (`--pptxConfig.backgrounds=page1.png,page2.png`; an empty entry for a page without one); the generator
+ * takes their bytes. A path that cannot be read ends the run, naming the option.
+ */
+function backgroundPathsAsBytes(container: Record<string, any> | undefined, name: string): void {
+    if (!container || typeof container.backgrounds !== 'string') return;
+    container.backgrounds = container.backgrounds.split(',').map((file: string) => file.trim()).map((file: string) => {
+        if (!file) return null;
+        try {
+            return new Uint8Array(fs.readFileSync(file));
+        } catch (e: any) {
+            console.error(`Could not read the picture given in --${name}.backgrounds: ${file} (${e?.code || e?.message})`);
+            process.exit(1);
+        }
+    });
+}
+
 if (fileArg && !showHelp) {
     numbersAsNumbers(config, DEFAULT_OFFICE_PARSER_CONFIG);
     numbersAsNumbers(generatorConfig, DEFAULT_GENERATOR_CONFIG);
     fontPathsAsBytes(generatorConfig.pdfConfig);
+    backgroundPathsAsBytes(generatorConfig.pptxConfig, 'pptxConfig');
+    backgroundPathsAsBytes(generatorConfig.odpConfig, 'odpConfig');
     // Resolve output format prioritizing: --to > --format
     let outputFormat: string | undefined;
     if (toFlagOption) {
@@ -314,7 +336,8 @@ if (fileArg && !showHelp) {
             generatorConfig.textConfig.newlineDelimiter = config.newlineDelimiter;
         }
     }
-    if (config.csvDelimiter !== undefined) {
+    // ('auto' reads the delimiter from the input; CSV output then writes the one read.)
+    if (config.csvDelimiter !== undefined && config.csvDelimiter !== 'auto') {
         if (!generatorConfig.csvConfig) generatorConfig.csvConfig = {};
         if (generatorConfig.csvConfig.columnDelimiter === undefined) {
             generatorConfig.csvConfig.columnDelimiter = config.csvDelimiter;
@@ -387,7 +410,7 @@ if (fileArg && !showHelp) {
     console.log('Usage: officeparser <file> [options]');
     console.log('');
     console.log('Options:');
-    console.log('  --to=json|text|md|html|pdf|csv|rtf|docx|odt|tex|epub|chunks  Target conversion format (default: json)');
+    console.log('  --to=json|text|md|html|pdf|csv|rtf|docx|odt|xlsx|ods|pptx|odp|tex|epub|chunks  Target conversion format (default: json)');
     console.log('  --output=file.ext                           Save output to file instead of stdout');
     console.log('  --fileType=docx|xlsx|pptx|odt|...           Explicitly override input file type detection');
     console.log('  --ocr                                       Enable OCR for images (default: false; also requires --extractAttachments)');
@@ -405,7 +428,7 @@ if (fileArg && !showHelp) {
     console.log('  --ignorePageGeometry                        Omit per-node bounding boxes and page dimensions (default: false)');
     console.log('  --verbose                                   Show full error stack traces and warning logs');
     console.log('  --newlineDelimiter=string                   Delimiter string between blocks/lines (default: \\n)');
-    console.log('  --csvDelimiter=char                         Custom CSV delimiter (default: ,)');
+    console.log('  --csvDelimiter=char                         CSV delimiter (default: auto, read from the file)');
     console.log('  --password=secret                           Password for an encrypted document (PDF, OOXML, or ODF)');
     console.log('                                              (or set OFFICEPARSER_PASSWORD to keep it out of the process list)');
     console.log('  --allowRemoteAssets=false                   Fail, not fetch, where the pdf.js worker or OCR files would come from a CDN (default: true)');
@@ -423,6 +446,7 @@ if (fileArg && !showHelp) {
     console.log('  --pdfParserConfig.mergeHyphenatedWords=false Keep words hyphenated across line breaks (default: true)');
     console.log('  --pdfParserConfig.normalizeText=false       Skip Unicode/ligature normalization of PDF text (default: true)');
     console.log('  --pdfParserConfig.extractTextColor          Record each PDF run\'s fill colour in formatting.color (default: true; set false to skip)');
+    console.log('  --pdfParserConfig.keepHeadersAndFootersInPages Keep a tagged PDF\'s running headers and footers in each page\'s content (default: false)');
     console.log('  --pdfParserConfig.maxTextItems=20000        Base of the text items a PDF may yield, plus one per byte (default: 20000)');
     console.log('  --pdfParserConfig.maxOperators=250000       Base of the drawing operators kept, plus four per byte (default: 250000)');
     console.log('  --pdfParserConfig.maxAnnotations=10000      Base of the annotations read, plus one per 32 bytes (default: 10000)');
@@ -444,8 +468,10 @@ if (fileArg && !showHelp) {
     console.log('  --pdfConfig.fonts.regular=Sans.ttf          Font file the native engine draws in; also .bold, .italic, .boldItalic, .mono');
     console.log('  --pdfConfig.fallbackFonts=a.ttf,b.otf       Font files tried, in order, for characters the fonts before them lack (native engine)');
     console.log('  --pdfConfig.subsetFonts=false               Embed whole font files, not only the glyphs used (default: true)');
+    console.log('  --pdfConfig.printHidden                     Print a spreadsheet\'s hidden sheets, rows and columns (default: false)');
+    console.log('  --pdfConfig.printSpeakerNotes               Print each slide\'s speaker notes under it (default: false)');
     console.log('  --pdfConfig.outline                         Write a bookmark outline from the headings (default: false)');
-    console.log('  --pdfConfig.format=Letter                   PDF paper format (A4 | Letter | Legal | A3 ...), both engines');
+    console.log('  --pdfConfig.format=Letter                   PDF paper format (auto: as the document sets it; A4 | Letter | Legal ...)');
     console.log('  --chunksConfig.strategy=fixed-size          Chunking strategy (fixed-size | document-structure | semantic)');
     console.log('  --mdConfig.dialect=github                   Markdown dialect (extended | github | gitlab | obsidian | pandoc | commonmark)');
     console.log('  --mdConfig.fallbackToHtml=false             Disable HTML fallback for unsupported Markdown features (default: true)');

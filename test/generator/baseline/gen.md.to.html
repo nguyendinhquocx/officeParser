@@ -13,7 +13,7 @@
     <meta name="custom:TestNumber" content="42">
     <meta name="custom:TestBool" content="true">
     
-    <style>
+    <style data-default-styles>
             :root {
                 --primary-color: #2c3e50;
                 --text-color: #333;
@@ -457,6 +457,8 @@
             
             .page-break { border: none; border-top: 2px dashed var(--border-color); margin: 40px 0; position: relative; }
             .page-break::after { content: 'PAGE BREAK'; position: absolute; top: -10px; left: 50%; transform: translateX(-50%); background: white; padding: 0 15px; font-size: 10px; color: #b2bec3; font-weight: bold; letter-spacing: 1px; }
+            .page-break.section-start { border: none; height: 0; margin: 0; }
+            .page-break.section-start::after { content: none; }
 
             /* Metadata Styles */
             .metadata-summary { 
