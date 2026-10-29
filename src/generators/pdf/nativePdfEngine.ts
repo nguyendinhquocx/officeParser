@@ -27,6 +27,7 @@ import { sanitizeOfficePackageUrl } from '../../utils/sanitize.js';
 import { cssColorHex } from '../../utils/colorUtils.js';
 import { formatListNumber } from '../../utils/listMarkers.js';
 import { drawSvg, readSvg } from './svgDrawing.js';
+import { cffOutlines, colorTables, fontkitUnbrotli, nativeUnbrotli, sfntOf, substitutes, trueTypeOutlines, Unbrotli, UnreadableFont } from './fontFiles.js';
 
 /** The largest of `values` and `floor`, without spreading them into one call (which a long list overflows). */
 function maxOf(values: readonly number[], floor: number): number {
@@ -65,6 +66,20 @@ function isInvisible(cp: number): boolean {
         || (cp >= 0xFE00 && cp <= 0xFE0F);
 }
 
+/**
+ * Characters a font draws nothing for by design: spaces, controls and format characters, those Unicode
+ * says are ignored where they are not supported (variation selectors, fillers), and U+2800 BRAILLE PATTERN
+ * BLANK, the blank cell. Any other character a font maps to a glyph that draws nothing is not the font's
+ * to draw, but for a combining mark drawn with its letter (see Face.has): a font after it that draws it
+ * does, and one no font draws is lost (see embedFonts). Such a glyph is the font's defect (U+FC39 in one
+ * of Fontsource's files of Noto Sans Arabic), or a color glyph's stand-in, drawn from color images or
+ * layers a PDF does not hold.
+ */
+const BLANK = /[\p{Z}\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/u;
+function isBlank(cp: number): boolean {
+    return isInvisible(cp) || cp === 0x2800 || BLANK.test(String.fromCodePoint(cp));
+}
+
 /** Hebrew, Arabic and the other right-to-left blocks of the Basic Multilingual Plane. */
 function isRtlChar(cp: number): boolean {
     return (cp >= 0x0590 && cp <= 0x08FF) || (cp >= 0xFB1D && cp <= 0xFDFF) || (cp >= 0xFE70 && cp <= 0xFEFF);
@@ -72,6 +87,8 @@ function isRtlChar(cp: number): boolean {
 
 const LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
 const OTHER_SPACE = /[\p{Zs}\u000B\u000C\u2028\u2029]/u;
+/** What text is cut into words at. */
+const WHITESPACE = /\s/;
 const CONTROL = /\p{Cc}/u;
 /** The most code points shaped as one string (see NativeLayout.segments). */
 const MAX_SHAPED = 256;
@@ -228,6 +245,43 @@ function glyphCoder(font: any, lib: any): (glyph: any) => number {
     return note;
 }
 
+/**
+ * Makes a font given to the engine that cannot be embedded fail the conversion, with `fail`'s error
+ * (which names the font), when the PDF is saved. First the outlines of the glyphs it is to hold are given
+ * to `check` (see TrueTypeOutlines.check): a glyph that viewers cannot draw was embedded without a word.
+ * Then fontkit writes it: pdf-lib takes a font's subset from `@pdf-lib/fontkit` 1.x as a stream that
+ * fontkit writes on a later turn of the event loop, and a glyph it could not copy threw there, where no
+ * caller could catch it, and the process ended while the conversion waited. The subset's writing is
+ * wrapped so that what it throws is kept, and the font's embedding fails with it.
+ */
+function guardEmbedding(font: any, check: (glyphs: number[]) => void, fail: (error: unknown) => Error): void {
+    const embedder = font?.embedder;
+    if (!embedder || typeof embedder.embedIntoContext !== 'function') return;
+    const subset = embedder.subset;
+    let failure: { error: unknown } | undefined;
+    if (subset && typeof subset.encode === 'function') {
+        const encode = subset.encode;
+        subset.encode = function (this: unknown, ...args: unknown[]) {
+            try { return encode.apply(this, args); } catch (error) {
+                failure ??= { error };
+                return undefined;
+            }
+        };
+    }
+    const embedInto = embedder.embedIntoContext.bind(embedder);
+    embedder.embedIntoContext = async (...args: unknown[]) => {
+        let done: unknown;
+        try {
+            // (A subset holds the glyphs it was given, a font embedded whole writes the widths of those drawn.)
+            const glyphs: unknown[] = subset ? subset.glyphs ?? [] : (embedder.glyphCache?.access?.() ?? []).map((glyph: any) => glyph?.id);
+            check(glyphs.filter((id): id is number => typeof id === 'number'));
+            done = await embedInto(...args);
+        } catch (error) { throw fail(failure ? failure.error : error); }
+        if (failure) throw fail(failure.error);
+        return done;
+    };
+}
+
 /** Thrown out of a font's state machine when it runs past its bound (see guardShaping). */
 // (No message: it never leaves guardShaping, which catches it by identity.)
 const SHAPING_RAN_AWAY = new Error();
@@ -363,7 +417,7 @@ function fontKind(family: string | undefined): 'mono' | 'serif' | 'sans' {
 }
 
 /** A single word ready to place, carrying the style/size/color it should be drawn with. */
-interface Piece { text: string; face: FaceKey; size: number; color: any; underline: boolean; link?: string; background?: string; rise?: number; note?: OfficeContentNode; picture?: { img: any; w: number; h: number }; }
+interface Piece { text: string; face: FaceKey; size: number; color: any; underline: boolean; link?: string; background?: string; rise?: number; note?: OfficeContentNode; picture?: { img: any; w: number; h: number }; /** Drawn invisibly (TextFormatting.invisible): in its place, there to select and search. */ invisible?: boolean; }
 
 /** A stretch of inline text in one formatting, and the target it links to, if any. */
 type Run = { text: string; fmt: TextFormatting; link?: string; note?: OfficeContentNode; picture?: { img: any; w: number; h: number } };
@@ -377,7 +431,15 @@ interface LineLayout { align?: TextAlignment; firstLine?: number; lineMultiple?:
 /** One embedded font and the code points it has a glyph for. */
 interface Face {
     font: any;
+    /** Whether the font draws the character: its glyph draws something, or the character is blank by design (see BLANK). */
     covers: (cp: number) => boolean;
+    /**
+     * Whether the font may draw the character: it covers it, or its glyph for it is empty in a font that
+     * substitutes glyphs as it shapes text (GSUB, morx). There a combining mark drawn with the letter
+     * before it (an invisible virama that stacks the next letter, a mark composed into its letter) may
+     * have an empty glyph of its own; a font that substitutes none draws an empty glyph as nothing.
+     */
+    has: (cp: number) => boolean;
     /** For a font given (not a Standard-14 one): the number a glyph is shown by, the glyph kept in the font (see glyphCoder). */
     code?: (glyph: any) => number;
 }
@@ -1445,25 +1507,31 @@ class NativeLayout {
     /**
      * Makes text drawable in a style before it is measured or drawn: a tab is four spaces, a line break
      * or a space the fonts lack a plain space (a drawn string cannot hold a line break), and any other
-     * character none of the style's fonts has is a `?`, counted for the one warning
-     * {@link reportLostCharacters} gives, unless `count` is false (text measured, not drawn).
+     * character none of the style's fonts draws is a `?`, counted for the one warning
+     * {@link reportLostCharacters} gives, unless `count` is false (text measured, not drawn). A combining
+     * mark the font of the character before it has stays, drawn with it (see segments).
      */
     private enc(text: string, key: FaceKey = 'regular', count = true): string {
         const chain = this.fonts[key];
         let out = '';
+        // (The font the character last written is drawn in, as segments finds it; none after a space, where
+        // text is cut into words, so a mark there is one standing alone.)
+        let previous: Face | undefined;
+        const write = (s: string) => { out += s; previous = WHITESPACE.test(s) ? undefined : chain.find(face => face.covers(s.codePointAt(0)!)); };
         for (const ch of text) {
             const cp = ch.codePointAt(0)!;
-            if (cp === 0x09) out += '    ';
-            else if (cp === 0x0A || cp === 0x0D) out += ' ';
+            if (cp === 0x09) write('    ');
+            else if (cp === 0x0A || cp === 0x0D) write(' ');
             else if (cp === 0xAD) { /* a soft hyphen shows only where a line is broken at it, and none is */ }
-            else if (chain.some(face => face.covers(cp))) out += ch;
+            else if ((isInvisible(cp) || COMBINING_MARK.test(ch)) && previous?.has(cp)) out += ch;
+            else if (chain.some(face => face.covers(cp))) write(ch);
             else if (isInvisible(cp)) { /* draws nothing: no loss */ }
             // A space of another width (an em space, a thin space, an ideographic space) or a line
             // separator the fonts lack is a space; any other control character draws nothing.
-            else if (OTHER_SPACE.test(ch)) out += ' ';
+            else if (OTHER_SPACE.test(ch)) write(' ');
             else if (CONTROL.test(ch)) { /* no glyph: no loss */ }
             else {
-                out += '?';
+                write('?');
                 if (!count) continue;
                 this.lostCharacters++;
                 if (this.lostSample.length < 8 && !this.lostSample.includes(ch)) this.lostSample.push(ch);
@@ -1475,14 +1543,15 @@ class NativeLayout {
     /** Warns, once, of the characters no font could draw: how many, and the first few distinct ones. */
     reportLostCharacters(): void {
         if (!this.lostCharacters) return;
-        const feature = this.customFonts ? 'characters none of the given fonts has (native engine)' : 'non-WinAnsi characters (native engine)';
+        const feature = this.customFonts ? 'characters none of the given fonts draws (native engine)' : 'non-WinAnsi characters (native engine)';
         this.reportWarning(OfficeWarningType.CONTENT_NOT_REPRESENTABLE, { format: 'pdf', feature, reason: 'unencodable-text', count: this.lostCharacters, sample: this.lostSample.join('') });
     }
 
     /**
      * Splits drawable text into stretches of one font each: every character goes to the first font of
-     * the style that has it. A combining mark or a joiner stays with the font of the character before
-     * it when that font has it, since a mark drawn in another font is not attached to its letter.
+     * the style that draws it. A combining mark or a joiner stays with the font of the character before
+     * it when that font has it (see Face.has), since a mark drawn in another font is not attached to its
+     * letter.
      */
     private segments(text: string, key: FaceKey): { text: string; face: Face }[] {
         const chain = this.fonts[key];
@@ -1493,10 +1562,11 @@ class NativeLayout {
             const attached = isInvisible(cp) || COMBINING_MARK.test(ch);
             let face: Face | undefined;
             if (chain.length === 1) face = chain[0];
-            else if (current && attached && current.face.covers(cp)) face = current.face;
-            else face = chain.find(f => f.covers(cp));
-            if (!face) { if (isInvisible(cp)) continue; face = chain[chain.length - 1]; }
-            const drawn = chain.length === 1 || face.covers(cp) ? ch : '?';
+            else if (current && attached && current.face.has(cp)) face = current.face;
+            // (A mark enc kept with its letter, here at the start of a stretch cut from it: in a font that has it.)
+            else face = chain.find(f => f.covers(cp)) ?? (attached ? chain.find(f => f.has(cp)) : undefined);
+            let drawn = ch;
+            if (!face) { if (isInvisible(cp)) continue; face = chain[chain.length - 1]; drawn = '?'; }
             // A stretch is shaped as one string, in time that grows with the square of its length on a run
             // of marks (fontkit), so it is cut at MAX_SHAPED code points: before a character that starts a
             // cluster, or, in a cluster longer than that (a letter under thousands of marks), anywhere.
@@ -1584,19 +1654,27 @@ class NativeLayout {
         this.page.pushOperators(...ops);
     }
 
-    /** Draws drawable text with its left edge at `x`, each stretch in its font. A right-to-left word's stretches are drawn last first. */
-    private drawText(text: string, key: FaceKey, x: number, y: number, size: number, color: any): void {
+    /**
+     * Draws drawable text with its left edge at `x`, each stretch in its font. A right-to-left word's stretches are drawn last first.
+     * Invisible text (TextFormatting.invisible) is drawn invisibly, in text rendering mode 3: where it would stand, as wide, there to
+     * select and search, as a scan's recognised words lie over its picture.
+     */
+    private drawText(text: string, key: FaceKey, x: number, y: number, size: number, color: any, invisible = false): void {
         const segs = this.segments(text, key);
         if (segs.length > 1 && directionOf(text) === 'rtl') segs.reverse();
-        for (const seg of segs) {
-            const run = this.shapedRun(seg.face, seg.text);
-            if (run) this.drawShaped(seg.face, run, seg.text, x, y, size, color);
-            else {
-                this.useFont(seg.face.font);
-                this.page.drawText(seg.text, { x, y, size, color });
+        // (The mode is the graphics state's, set around the text and its fallback drawing alike.)
+        if (invisible) this.page.pushOperators(this.lib.pushGraphicsState(), this.lib.setTextRenderingMode(this.lib.TextRenderingMode.Invisible));
+        try {
+            for (const seg of segs) {
+                const run = this.shapedRun(seg.face, seg.text);
+                if (run) this.drawShaped(seg.face, run, seg.text, x, y, size, color);
+                else {
+                    this.useFont(seg.face.font);
+                    this.page.drawText(seg.text, { x, y, size, color });
+                }
+                x += this.segmentWidth(seg, size);
             }
-            x += this.segmentWidth(seg, size);
-        }
+        } finally { if (invisible) this.page.pushOperators(this.lib.popGraphicsState()); }
     }
 
     /** Each page's resource name for each font it draws in, made once. */
@@ -1621,14 +1699,14 @@ class NativeLayout {
      * Draws one line of drawable text (a table cell's line, a line of code) inside `[x, x + width]`,
      * its words in the order they are seen: a right-to-left line starts at the right edge.
      */
-    private drawLine(text: string, key: FaceKey, x: number, y: number, size: number, color: any, width: number): void {
+    private drawLine(text: string, key: FaceKey, x: number, y: number, size: number, color: any, width: number, invisible = false): void {
         const dir = directionOf(text);
-        if (dir !== 'rtl') { this.drawText(text, key, x, y, size, color); return; }
+        if (dir !== 'rtl') { this.drawText(text, key, x, y, size, color, invisible); return; }
         const baseRtl = startsRtl(text);
         const items = text.split(/(\s+)/).filter(t => t !== '').map(t => ({ text: t, w: this.widthOf(t, key, size), dir: /^\s+$/.test(t) ? 'neutral' as const : directionOf(t) }));
         let cx = baseRtl ? x + Math.max(0, width - items.reduce((s, it) => s + it.w, 0)) : x;
         for (const it of visualOrder(items, baseRtl)) {
-            if (it.text.trim()) this.drawText(it.text, key, cx, y, size, color);
+            if (it.text.trim()) this.drawText(it.text, key, cx, y, size, color, invisible);
             cx += it.w;
         }
     }
@@ -1873,9 +1951,11 @@ class NativeLayout {
             const size = shifted ? baseSize * 0.65 : baseSize;
             const rise = run.fmt.superscript ? baseSize * 0.35 : run.fmt.subscript ? -baseSize * 0.12 : 0;
             const color = run.link ? this.lib.rgb(0.1, 0.32, 0.72) : (this.color(run.fmt.color) ?? this.lib.rgb(0.12, 0.12, 0.12));
-            const underline = !!(run.fmt.underline || run.link);
+            // (Invisible text has no line under it and no background: it is not seen.)
+            const invisible = !!run.fmt.invisible;
+            const underline = !invisible && !!(run.fmt.underline || run.link);
             // A highlight or a run's own background, drawn behind its words.
-            const background = cssColorHex(run.fmt.backgroundColor) ?? undefined;
+            const background = invisible ? undefined : cssColorHex(run.fmt.backgroundColor) ?? undefined;
             // A picture in the line: as wide and tall as it is drawn, no wider than the line, no taller
             // than most of a page.
             if (run.picture) {
@@ -1893,7 +1973,7 @@ class NativeLayout {
                     // Split a word wider than the whole line at character boundaries so it wraps instead
                     // of running off the page (a long URL, a hash, a base64 token).
                     for (const chunk of splitToWidth(w, t => this.widthOf(t, face, size), width)) {
-                        pieces.push({ p: { text: chunk, face, size, color, underline, link: run.link, background, rise, note: run.note }, space: false });
+                        pieces.push({ p: { text: chunk, face, size, color, underline, link: run.link, background, rise, note: run.note, ...(invisible ? { invisible } : {}) }, space: false });
                     }
                 }
             });
@@ -2021,7 +2101,7 @@ class NativeLayout {
                     this.drawPicture(it.p.picture.img, { x, y: baseline, width: it.p.picture.w, height: it.p.picture.h });
                     if (it.p.link) this.addLinkBox(it.p.link, x, baseline, it.p.picture.w, it.p.picture.h);
                 } else if (it.p) {
-                    this.drawText(it.p.text, it.p.face, x, baseline + (it.p.rise || 0), it.p.size, it.p.color);
+                    this.drawText(it.p.text, it.p.face, x, baseline + (it.p.rise || 0), it.p.size, it.p.color, it.p.invisible);
                     if (it.p.underline) {
                         this.page.drawLine({ start: { x, y: baseline - 1.5 }, end: { x: x + it.w, y: baseline - 1.5 }, thickness: 0.5, color: it.p.color });
                     }
@@ -2465,9 +2545,10 @@ class NativeLayout {
         // drawRuns' first line stays on this page and draws at the same baseline as the marker.
         const markerX = this.margin.left + indent - 14;
         const baseline = this.pageH - this.y - size;
-        // In its text's colour (white bullets on a dark slide were drawn dark).
+        // In its text's colour (white bullets on a dark slide were drawn dark); an invisible item's invisibly, as its text is.
         const ink = this.color(bodyRuns.find(r => r.text.trim())?.fmt.color) ?? this.lib.rgb(0.12, 0.12, 0.12);
-        if (marker && !this.drawBulletShape(marker, markerX, baseline, size, ink)) this.drawText(this.enc(marker), 'regular', markerX, baseline, size, ink);
+        const invisibleItem = bodyRuns.some(r => r.text.trim()) && bodyRuns.every(r => !r.text.trim() || r.fmt.invisible);
+        if (marker && (invisibleItem || !this.drawBulletShape(marker, markerX, baseline, size, ink))) this.drawText(this.enc(marker), 'regular', markerX, baseline, size, ink, invisibleItem);
         // The body starts past a marker wider than the usual gap (`1.1.1.`, `(iii)`), as a tab stop
         // past it would set it.
         const markerWidth = marker ? this.widthOf(this.enc(marker, 'regular', false), 'regular', size) : 0;
@@ -2794,7 +2875,7 @@ class NativeLayout {
         const border = this.lib.rgb(0.6, 0.6, 0.6);
 
         // First the cells' texts and places, then the columns' widths from them, then the rows drawn.
-        type Placed = { col: number; span: number; rowSpan: number; text: string; header: boolean; lines: string[]; fill?: string; align?: TextAlignment; ink?: string; pictures?: { img: any; w: number; h: number }[]; notes?: OfficeContentNode[] };
+        type Placed = { col: number; span: number; rowSpan: number; text: string; header: boolean; lines: string[]; fill?: string; align?: TextAlignment; ink?: string; invisible?: boolean; pictures?: { img: any; w: number; h: number }[]; notes?: OfficeContentNode[] };
         const grid: Placed[][] = [];
         const chartsAfter: OfficeContentNode[] = [];
         const picturesAfter: { img: any; w: number; h: number }[] = [];
@@ -2806,7 +2887,7 @@ class NativeLayout {
          * cell style rides on its runs). Shading was not drawn, and every cell's text sat at its left in grey
          * (white text on a dark fill was unreadable once the fill was drawn).
          */
-        const cellLook = (cell: OfficeContentNode): { fill?: string; align?: TextAlignment; ink?: string } => {
+        const cellLook = (cell: OfficeContentNode): { fill?: string; align?: TextAlignment; ink?: string; invisible?: boolean } => {
             const meta = cell.metadata as { backgroundColor?: string; align?: TextAlignment } | undefined;
             const runs: OfficeContentNode[] = [];
             const gather = (n: OfficeContentNode, depth: number) => {
@@ -2824,7 +2905,9 @@ class NativeLayout {
             const blockAlign = blocks.length && blocks.every(b => (b.metadata as any)?.alignment === (blocks[0].metadata as any)?.alignment) ? (blocks[0].metadata as any)?.alignment : undefined;
             const align = meta?.align ?? blockAlign ?? shared(n => n.formatting?.alignment);
             const ink = cssColorHex(shared(n => n.formatting?.color)) ?? undefined;
-            return { ...(fill ? { fill } : {}), ...(align === 'center' || align === 'right' ? { align } : {}), ...(ink ? { ink } : {}) };
+            // A cell whose text is all invisible (a scan's recognised table over its picture) drawn invisibly.
+            const invisible = shared(n => n.formatting?.invisible ? 'invisible' : undefined) === 'invisible';
+            return { ...(fill ? { fill } : {}), ...(align === 'center' || align === 'right' ? { align } : {}), ...(ink ? { ink } : {}), ...(invisible ? { invisible } : {}) };
         };
         for (const row of rows) {
             const rowOverride = await this.onNodeValue(row);
@@ -2918,6 +3001,9 @@ class NativeLayout {
             return wrapPlain(text, t => this.widthOf(t, face, size), Math.max(10, spanWidth(col, span) - 2 * pad), t => this.enc(t, face));
         };
 
+        // A table whose text is all invisible (a scan's recognised table) is drawn without its rules, as its text is unseen.
+        const unseen = grid.some(r => r.some(p => p.text.trim())) && grid.every(r => r.every(p => !p.text.trim() || p.invisible));
+        const ruled = unseen ? {} : { borderColor: border, borderWidth: 0.5 };
         this.y += 2;
         for (const placed of grid) {
             relayout();
@@ -2952,14 +3038,14 @@ class NativeLayout {
                 placed.forEach((p, i) => {
                     const x = xs[Math.min(p.col, cols)] + this.margin.left - tableLeft;
                     const room = spanWidth(p.col, p.span) - 2 * pad;
-                    this.page.drawRectangle({ x, y: topY - rowH, width: spanWidth(p.col, p.span), height: rowH, borderColor: border, borderWidth: 0.5, color: p.fill ? this.color(p.fill) : undefined });
+                    if (!unseen || p.fill) this.page.drawRectangle({ x, y: topY - rowH, width: spanWidth(p.col, p.span), height: rowH, ...ruled, color: p.fill ? this.color(p.fill) : undefined });
                     const face: FaceKey = p.header ? 'bold' : 'regular';
                     let ty = topY - pad - size;
                     for (const line of p.lines) {
                         const width = this.widthOf(line, face, size);
                         const free = p.align ? Math.max(0, room - width) : 0;
                         // An aligned line is placed here: drawn in its own width, a right-to-left one is not set right again.
-                        this.drawLine(line, face, x + pad + (p.align === 'center' ? free / 2 : p.align === 'right' ? free : 0), ty, size, (p.ink && this.color(p.ink)) || this.lib.rgb(0.12, 0.12, 0.12), p.align ? width : room);
+                        this.drawLine(line, face, x + pad + (p.align === 'center' ? free / 2 : p.align === 'right' ? free : 0), ty, size, (p.ink && this.color(p.ink)) || this.lib.rgb(0.12, 0.12, 0.12), p.align ? width : room, p.invisible);
                         ty -= lineH;
                     }
                     let py = topY - pad - p.lines.length * lineH;
@@ -3009,7 +3095,7 @@ class NativeLayout {
                 const topY = this.pageH - this.y;
                 for (const p of placed) {
                     const x = xs[Math.min(p.col, cols)] + this.margin.left - tableLeft;
-                    this.page.drawRectangle({ x, y: topY - bandH, width: spanWidth(p.col, p.span), height: bandH, borderColor: border, borderWidth: 0.5, color: p.fill ? this.color(p.fill) : undefined });
+                    if (!unseen || p.fill) this.page.drawRectangle({ x, y: topY - bandH, width: spanWidth(p.col, p.span), height: bandH, ...ruled, color: p.fill ? this.color(p.fill) : undefined });
                     const face: FaceKey = p.header ? 'bold' : 'regular';
                     const room = spanWidth(p.col, p.span) - 2 * pad;
                     let ty = topY - pad - size;
@@ -3017,7 +3103,7 @@ class NativeLayout {
                         const width = this.widthOf(p.lines[li], face, size);
                         const free = p.align ? Math.max(0, room - width) : 0;
                         const lx = x + pad + (p.align === 'center' ? free / 2 : p.align === 'right' ? free : 0);
-                        this.drawLine(p.lines[li], face, lx, ty, size, (p.ink && this.color(p.ink)) || this.lib.rgb(0.12, 0.12, 0.12), p.align ? width : room); ty -= lineH;
+                        this.drawLine(p.lines[li], face, lx, ty, size, (p.ink && this.color(p.ink)) || this.lib.rgb(0.12, 0.12, 0.12), p.align ? width : room, p.invisible); ty -= lineH;
                     }
                 }
                 this.y += bandH;
@@ -3206,15 +3292,16 @@ function applyMetadata(pdf: any, m: OfficeMetadata): void {
 }
 
 /**
- * A font as a caller gives it: the bytes of a TrueType or OpenType file. Anything else given (a file
- * name, an empty file) is reported and the default font used, rather than passed over without a word.
+ * A font as a caller gives it: the bytes of a TrueType, OpenType, WOFF or WOFF2 file. Anything else
+ * given (a file name, an empty file) is reported and the default font used, rather than passed over
+ * without a word.
  */
 function fontBytes(value: unknown, name: string, reportWarning: (type: OfficeWarningType, info?: any) => void): Uint8Array | null {
     if (value === undefined || value === null) return null;
     if (value instanceof Uint8Array && value.byteLength) return value;
     if (value instanceof ArrayBuffer && value.byteLength) return new Uint8Array(value);
     const shown = value instanceof Uint8Array || value instanceof ArrayBuffer ? 'an empty file' : typeof value === 'string' ? value : Object.prototype.toString.call(value);
-    reportWarning(OfficeWarningType.INVALID_CONFIG_VALUE, { option: `pdfConfig.${name}`, value: shown, expected: 'the bytes of a TrueType or OpenType font file (a Uint8Array or ArrayBuffer)', fallback: undefined });
+    reportWarning(OfficeWarningType.INVALID_CONFIG_VALUE, { option: `pdfConfig.${name}`, value: shown, expected: 'the bytes of a TrueType, OpenType, WOFF or WOFF2 font file (a Uint8Array or ArrayBuffer)', fallback: undefined });
     return null;
 }
 
@@ -3224,10 +3311,11 @@ function fontBytes(value: unknown, name: string, reportWarning: (type: OfficeWar
  * drawn in the regular one given, or in its Standard-14 font when that is not given either, the
  * fallback fonts drawing what it lacks; code keeps Courier unless a `mono` font is given. A font file that
  * cannot be read fails the conversion, naming which one: drawing in another font without a word would
- * be a different document.
+ * be a different document. So does one fontkit cannot write into the PDF, when it is saved (see
+ * guardEmbedding). A color font none of whose characters has an outline is reported, and not used.
  */
 async function embedFonts(pdf: any, lib: any, pc: FullGeneratorConfig['pdfConfig'], config: OfficeParserAST['config'], reportWarning: (type: OfficeWarningType, info?: any) => void): Promise<{ fonts: Fonts; custom: boolean }> {
-    const standard = (font: any): Face => ({ font, covers: winAnsiCovers });
+    const standard = (font: any): Face => ({ font, covers: winAnsiCovers, has: winAnsiCovers });
     const std: Record<FaceKey, Face> = {
         regular: standard(await pdf.embedFont(lib.StandardFonts.Helvetica)),
         bold: standard(await pdf.embedFont(lib.StandardFonts.HelveticaBold)),
@@ -3262,27 +3350,76 @@ async function embedFonts(pdf: any, lib: any, pc: FullGeneratorConfig['pdfConfig
     const custom = given.some(g => g.bytes) || fallbackGiven.some(g => g.bytes);
     if (!custom) return { fonts: Object.fromEntries(allKeys.map(key => [key, [std[key]]])) as Fonts, custom };
 
-    pdf.registerFontkit(await loadFontkit(config));
+    const fontkit = await loadFontkit(config);
+    pdf.registerFontkit(fontkit);
+    // (Brotli, for a WOFF2 font: Node's where it has one, else the decoder fontkit carries.)
+    let unbrotli: Unbrotli | undefined;
+    const brotli = () => unbrotli ??= nativeUnbrotli() ?? fontkitUnbrotli(fontkit);
     // The same bytes given for two styles are embedded once: the same view, or views of the same part of
     // one buffer (an ArrayBuffer given twice is viewed anew each time).
-    const embedded = new Map<ArrayBufferLike, Map<string, Face>>();
+    const embedded = new Map<ArrayBufferLike, Map<string, Face | null>>();
     const embed = async (name: string, bytes: Uint8Array | null): Promise<Face | undefined> => {
         if (!bytes) return undefined;
         const span = `${bytes.byteOffset}:${bytes.byteLength}`;
         let inBuffer = embedded.get(bytes.buffer);
         if (!inBuffer) embedded.set(bytes.buffer, inBuffer = new Map());
-        let face = inBuffer.get(span);
-        if (face) return face;
+        const known = inBuffer.get(span);
+        if (known !== undefined) return known ?? undefined;
+        let face: Face;
         try {
+            // A WOFF or WOFF2 font is embedded as the TrueType or OpenType font it holds: fontkit's subset
+            // of a WOFF2 font, and either embedded as it is, are fonts viewers do not draw.
+            const sfnt = sfntOf(bytes, brotli);
             // An OpenType font of CFF outlines (`OTTO`) is embedded whole: its subset (fontkit's) is not one
             // viewers draw (each glyph another's, or none).
-            const cff = bytes.length >= 4 && bytes[0] === 0x4F && bytes[1] === 0x54 && bytes[2] === 0x54 && bytes[3] === 0x4F;
-            const font = await pdf.embedFont(bytes, { subset: pc.subsetFonts !== false && !cff });
+            const cff = sfnt.length >= 4 && sfnt[0] === 0x4F && sfnt[1] === 0x54 && sfnt[2] === 0x54 && sfnt[3] === 0x4F;
+            const outlines = trueTypeOutlines(sfnt);
+            // (A CFF font's outlines are read from its charstrings, not as fontkit draws them: see CffOutlines.)
+            const glyphOutlines = outlines ?? cffOutlines(sfnt);
+            const color = colorTables(sfnt);
+            // How a font draws a character: `drawn` when its glyph draws something, or the character is
+            // blank by design (see BLANK); `empty` when its glyph draws nothing in a font that substitutes
+            // glyphs, which only a combining mark drawn with its letter is drawn with (see Face.has). Any
+            // other character goes to a font after it that draws it, or is lost: drawn blank, it showed
+            // nothing while it was counted as drawn. A color font's empty glyph stands in for a color one,
+            // drawn from tables a PDF does not hold, so it is not the font's at all, nor is a glyph that
+            // cannot be read, nor one of a font of neither TrueType nor CFF outlines.
+            const shapes = !color.length && substitutes(sfnt);
+            const drawing = (fontkitFont: any, cp: number): 'drawn' | 'empty' | undefined => {
+                if (isBlank(cp)) return 'drawn';
+                let glyph: any;
+                try { glyph = fontkitFont.glyphForCodePoint(cp); } catch { return undefined; }
+                if (!glyphOutlines) return undefined;
+                return glyphOutlines.draws(glyph?.id) ? 'drawn' : shapes && glyphOutlines.reads(glyph?.id) ? 'empty' : undefined;
+            };
+            // A font of color glyphs alone draws none of its characters: it is reported, and not used.
+            if (color.length) {
+                const probe = fontkit.create(sfnt);
+                if (!probe.characterSet.some((cp: number) => !isBlank(cp) && drawing(probe, cp) === 'drawn')) {
+                    reportWarning(OfficeWarningType.INVALID_CONFIG_VALUE, { option: `pdfConfig.${name}`, value: `a color font (${color.map(t => t.trim()).join(', ')})`, expected: "a font of outlines: the native engine draws a font's outlines, and this font's glyphs are color images or layers", fallback: undefined });
+                    inBuffer.set(span, null);
+                    return undefined;
+                }
+            }
+            // (fontkit subsets no font of color layers, COLR, whose glyphs it reads as layers alone.)
+            const whole = cff || color.includes('COLR');
+            const font = await pdf.embedFont(sfnt, { subset: pc.subsetFonts !== false && !whole });
+            // Every glyph is placed by its width (hmtx, read with hhea and maxp): a font fontkit cannot read
+            // them in failed halfway through the layout, naming no font.
+            if (!Number.isFinite(font.embedder?.font?.getGlyph?.(0)?.advanceWidth)) throw new UnreadableFont('its glyph widths (hmtx, hhea, maxp) cannot be read');
             const set = new Set<number>(font.getCharacterSet());
+            const drawings = new Map<number, 'drawn' | 'empty' | undefined>();
+            const drawingOf = (cp: number): 'drawn' | 'empty' | undefined => {
+                if (!set.has(cp)) return undefined;
+                if (!drawings.has(cp)) drawings.set(cp, drawing(font.embedder.font, cp));
+                return drawings.get(cp);
+            };
             guardShaping(font);
-            face = { font, covers: cp => set.has(cp), code: glyphCoder(font, lib) };
+            guardEmbedding(font, glyphs => outlines?.check(glyphs), error => (error as any)?.officeIssue ? error as Error
+                : getOfficeError(OfficeErrorType.PDF_GENERATION_FAILED, config, `pdfConfig.${name} could not be embedded (${(error as any)?.message || String(error)})`));
+            face = { font, covers: cp => drawingOf(cp) === 'drawn', has: cp => drawingOf(cp) !== undefined, code: glyphCoder(font, lib) };
         } catch (e: any) {
-            throw getOfficeError(OfficeErrorType.PDF_GENERATION_FAILED, config, `pdfConfig.${name} could not be read as a TrueType or OpenType font (${e?.message || String(e)})`);
+            throw getOfficeError(OfficeErrorType.PDF_GENERATION_FAILED, config, `pdfConfig.${name} could not be read as a TrueType, OpenType, WOFF or WOFF2 font (${e?.message || String(e)})`);
         }
         inBuffer.set(span, face);
         return face;

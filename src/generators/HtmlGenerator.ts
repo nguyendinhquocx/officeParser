@@ -224,8 +224,17 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
         return this._standaloneDoc;
     }
 
-    constructor(ast: OfficeParserAST, config?: GeneratorConfig<'html'>) {
+    /**
+     * Whether invisible text (TextFormatting.invisible) is drawn unseen, for a printout (PDF output's 'html' engine):
+     * transparent, in its place, there to select and search. HTML output itself shows it, as the content it is.
+     */
+    private readonly drawsInvisibleText: boolean;
+    /** Whether invisible text was drawn unseen, so the page needs the rule that hides it. */
+    private invisibleTextDrawn = false;
+
+    constructor(ast: OfficeParserAST, config?: GeneratorConfig<'html'>, options: { drawsInvisibleText?: boolean } = {}) {
         super('html', ast, config);
+        this.drawsInvisibleText = !!options.drawsInvisibleText;
     }
 
 
@@ -481,6 +490,10 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
         const scopeOpen = sa.styles === 'scoped' ? '<div class="op-html-scope">' : '';
         const scopeClose = sa.styles === 'scoped' ? '</div>' : '';
 
+        // The rule invisible text is drawn unseen by (see drawsInvisibleText): whatever the stylesheet, its colour,
+        // its lines' and its background's, inside a link too.
+        const invisibleRule = this.invisibleTextDrawn ? '<style>.op-invisible-text, .op-invisible-text * { color: transparent !important; text-decoration-color: transparent !important; background: transparent !important; } .op-invisible-marker::marker { color: transparent !important; } .op-invisible-block, .op-invisible-block :is(table, tr, th, td) { border-color: transparent !important; box-shadow: none !important; background-color: transparent; }</style>' : '';
+
         const inj = this.config.htmlConfig.injections;
         const headInjectionsOn = sa.document && sa.headInjections;
         // Chart.js is loaded only for a page that draws a chart: one without fetches and runs no script.
@@ -496,7 +509,7 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
     <title>${this.escape(title)}</title>
     ${metaTags}
     ${chartScriptTag}
-    ${styleBlock}
+    ${styleBlock}${invisibleRule}
     ${headInjectionsOn ? inj.headEnd : ''}
 </head>
 <body>
@@ -513,7 +526,7 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
     ${spreadsheetScriptOut}
     ${sa.bodyInjections ? inj.bodyEnd : ''}
 </body>
-</html>` : `${styleBlock}${sa.bodyInjections ? inj.bodyStart : ''}${scopeOpen}<div class="${containerClass}">${metadataBlock}${bodyContent}${spreadsheetTabs}</div>${scopeClose}${spreadsheetScriptOut}${sa.bodyInjections ? inj.bodyEnd : ''}`;
+</html>` : `${styleBlock}${invisibleRule}${sa.bodyInjections ? inj.bodyStart : ''}${scopeOpen}<div class="${containerClass}">${metadataBlock}${bodyContent}${spreadsheetTabs}</div>${scopeClose}${spreadsheetScriptOut}${sa.bodyInjections ? inj.bodyEnd : ''}`;
 
         return {
             value,
@@ -644,6 +657,8 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
         // Whether these siblings form a run of text (a paragraph's children) rather than a list of blocks.
         const runHasText = nodes.some(n => n.type === 'text');
         let html = '';
+        // The node written before this one (see afterPage).
+        let previous: OfficeContentNode | undefined;
         // Stack to track active lists. `liClose` is the currently-open item's deferred closing
         // suffix (`</li>`, or `</div></li>` for a task item): a list item is rendered WITHOUT its
         // close so a deeper list can land inside it (spec-valid `<li>a<ul>...</ul></li>` rather
@@ -699,6 +714,8 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                 continue;
             }
 
+            this.afterPage = previous?.type === 'page';
+            previous = node;
             if (node.type === 'list') {
                 const meta = node.metadata as ListMetadata;
                 const type = meta?.listType === 'ordered' ? 'ordered' : 'unordered';
@@ -739,6 +756,8 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                 // Non-list node closes all active lists
                 closeListsToLevel(-1);
                 let result = await this.processNodeRecursive(node, this.boundNodeProcessor, { value: override });
+                // (A section's start after a page writes nothing, and no gap either.)
+                if (!result && this.afterPage && node.type === 'break') continue;
 
                 // Add a blank line after BLOCK nodes for readable HTML source. Inline nodes (a
                 // paragraph's text/link runs) must concatenate with no separator: adding `\n\n`
@@ -821,6 +840,8 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
     private tableNestingLevel = 0;
     /** How many paragraphs or headings are being written: a picture in one is written inline. */
     private inlineDepth = 0;
+    /** Whether the node being written comes right after a page (a PDF's), which breaks the page after it itself. */
+    private afterPage = false;
 
     protected override async processNodeRecursive(
         node: OfficeContentNode,
@@ -1070,6 +1091,12 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                 if (!classes.includes(c)) classes.push(c);
             }
         }
+        // A list item whose text is all invisible, in a printout: its marker unseen with it.
+        // (Its marker alone: the class's rule reached its nested items, which the item's <li> holds, and hid them.)
+        if (this.drawsInvisibleText && node.type === 'list' && this.allInvisible(node)) { this.invisibleTextDrawn = true; classes.push('op-invisible-marker'); }
+        // A table or heading whose text is all invisible (a scan's recognised table or title), in a printout: the rules
+        // the page's stylesheet draws around it (a table's grid, a heading's rule) unseen with it.
+        if (this.drawsInvisibleText && (node.type === 'table' || node.type === 'heading') && this.allInvisible(node, false)) { this.invisibleTextDrawn = true; classes.push('op-invisible-block'); }
         const className = classes.length > 0 ? ` class="${this.escape(classes.join(' '))}"` : '';
 
         // Handle ID and Anchors
@@ -1310,7 +1337,9 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                 // A section starting on a new page: a page break, as the HTML reader reads it and print breaks
                 // the page, but no rule on screen (it is the document's structure, not a break the author typed).
                 // (Styled in place too: without this writer's stylesheet, in EPUB or a fragment, it was a rule.)
-                if (breakType === 'page' && typeof (node.metadata as any)?.section === 'number') return `${extraAnchors}<hr class="page-break section-start"${idAttr} style="border:none;height:0;margin:0;break-after:page">`;
+                // Right after a page (a PDF's page of another size), whose own break ends it, it breaks
+                // nothing more: a second break printed a blank page.
+                if (breakType === 'page' && typeof (node.metadata as any)?.section === 'number') return this.afterPage ? `${extraAnchors}${idAttr ? `<a${idAttr}></a>` : ''}` : `${extraAnchors}<hr class="page-break section-start"${idAttr} style="border:none;height:0;margin:0;break-after:page">`;
                 if (breakType === 'page') return `${extraAnchors}<hr class="page-break"${idAttr}>`;
                 // A thematic break is a plain rule; the parser reads a bare <hr> back as one.
                 if (breakType === 'thematic') return `${extraAnchors}<hr${idAttr}>`;
@@ -1443,7 +1472,7 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                         : ` style="${marginStyle}"`;
                 }
                 const tableHtml = `<table${idAttr}${className}${mappedAttrs}${tableDataAttrs}${tableStyleAttr}>${finalChildren}</table>`;
-                const result = this.tableNestingLevel > 1 ? tableHtml : `<div class="table-container">${tableHtml}</div>`;
+                const result = this.tableNestingLevel > 1 ? tableHtml : `<div class="table-container${classes.includes('op-invisible-block') ? ' op-invisible-block' : ''}">${tableHtml}</div>`;
                 return `${extraAnchors}${result}`;
             }
 
@@ -1905,8 +1934,27 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                 // Default emission: a <cite> carrying the bare key, matching Pandoc's [@citekey].
                 : `<cite data-citation-key="${this.escape(meta.citationKey)}">[@${this.escape(meta.citationKey)}]</cite>`;
         }
+        // Invisible text in a printout: outside its link and highlight, so neither is seen either.
+        if (this.drawsInvisibleText && f?.invisible) {
+            this.invisibleTextDrawn = true;
+            result = `<span class="op-invisible-text">${result}</span>`;
+        }
 
         return result;
+    }
+
+    /** Whether a block's own text (not its nested lists') is there and all invisible. */
+    private allInvisible(node: OfficeContentNode, ownTextOnly = true): boolean {
+        let seen = false;
+        const walk = (n: OfficeContentNode, depth: number): boolean => {
+            for (const c of n.children || []) {
+                if (ownTextOnly && c.type === 'list') continue;
+                if (c.type === 'text' && (c.text || '').trim()) { if (!c.formatting?.invisible) return false; seen = true; }
+                else if (depth < 16 && !walk(c, depth + 1)) return false;
+            }
+            return true;
+        };
+        return walk(node, 0) && seen;
     }
 
     private getInlineStyles(node: OfficeContentNode, options: { skipFontSize?: boolean, skipBackgroundColor?: boolean } = {}): string {

@@ -169,7 +169,9 @@ npx officeparser my_document --fileType=docx --to=json
 | `--ocrConfig.language` | string | `eng` | Tesseract language(s), e.g. `deu` or `eng+fra` |
 | `--ocrConfig.preserveLayout` | boolean | `true` | Keep the line layout of recognized text |
 | `--password` | string | (none) | Password for an encrypted document (PDF, OOXML, or ODF) |
-| `--allowRemoteAssets` | boolean | `true` | `false` fails with `REMOTE_ASSET_BLOCKED` where the pdf.js worker or Tesseract's files would come from the library's default CDN address |
+| `--allowRemoteAssets` | boolean | `true` | `false` fails with `REMOTE_ASSET_BLOCKED` where the pdf.js worker or Tesseract's files would come from the library's default CDN address, and fetches no pdf.js CMap or image decoder from it (`PDF_ASSET_UNAVAILABLE`) |
+| `--pdfCMapUrl` | string | pdfjs-dist's `cmaps/` | Folder of pdf.js's CMaps, for the text of fonts a PDF does not embed (CJK) |
+| `--pdfDecoderUrl` | string | pdfjs-dist's `wasm/` | Folder of pdf.js's image decoders (JBIG2, CCITT fax, JPEG 2000) |
 | `--ocrConfig.cacheMethod` | `write\|readOnly\|refresh\|none` | `write` | Where OCR keeps the language data it loads (`none` stores nothing) |
 | `--extractAttachments` | boolean | `false` | Extract images/charts as Base64 |
 | `--ignoreNotes` | boolean | `false` | Ignore footnotes/endnotes/speaker notes |
@@ -198,6 +200,7 @@ npx officeparser my_document --fileType=docx --to=json
 | `--pdfParserConfig.maxOperators` | number | `250000` | Base of the drawing operators kept from a PDF (plus four per byte of the file) |
 | `--pdfParserConfig.maxAnnotations` | number | `10000` | Base of the annotations read from a PDF (plus one per 32 bytes of the file) |
 | `--pdfParserConfig.maxTimeMs` | number | `5000` | Base of the CPU time the separate pdf.js process may spend on a PDF (plus 20 ms per KB of the file) |
+| `--pdfParserConfig.maxImagePixels` | number | `40000000` | Most pixels a PDF picture may have to be extracted |
 | `--pdfParserConfig.separateProcess` | boolean | `true` | Run pdf.js in a separate process under a memory limit (Node) |
 | `--pdfParserConfig.processMemoryMb` | number | `1024` | Heap the separate pdf.js process may use |
 | `--verbose` | boolean | `false` | Show full error stack traces and warning logs |
@@ -208,7 +211,7 @@ npx officeparser my_document --fileType=docx --to=json
 | `--htmlConfig.containerWidth` | string \| number | `auto` | HTML output container width (e.g. `900px`, `100%`) |
 | `--textConfig.pageSeparator` | string | `\n` | Separator written between pages in text output |
 | `--pdfConfig.engine` | `html\|native` | `html` | PDF engine: Puppeteer (`html`) or pdf-lib (`native`, no browser) |
-| `--pdfConfig.fonts.regular` | file path | (none) | Font file (`.ttf`/`.otf`) the native engine draws in; also `.bold`, `.italic`, `.boldItalic`, `.mono` |
+| `--pdfConfig.fonts.regular` | file path | (none) | Font file (`.ttf`/`.otf`/`.woff`/`.woff2`) the native engine draws in; also `.bold`, `.italic`, `.boldItalic`, `.mono` |
 | `--pdfConfig.fallbackFonts` | file paths, comma-separated | (none) | Font files tried in order for the characters the fonts before them lack (native engine) |
 | `--pdfConfig.subsetFonts` | boolean | `true` | `false` embeds whole font files, not only the glyphs used |
 | `--pdfConfig.outline` | boolean | `false` | Write a bookmark outline from the headings |
@@ -744,7 +747,7 @@ OfficeParserAST
 │   ├── notes: [ OfficeContentNode ]     (footnotes/endnotes/slide notes attached to this node; see below)
 │   ├── comments: [ OfficeContentNode ] (inline comments attached to this node)
 │   ├── formatting: { bold, italic, underline, color, size, font, alignment, ... }
-│   ├── bounds?: { x, y, width, height }  (place on its page or slide: PDF, PPTX, ODP)
+│   ├── bounds?: { x, y, width, height, baseline? }  (place on its page or slide: PDF, PPTX, ODP; baseline: a PDF text run's)
 │   └── metadata: { level, listId, marker, row, col, rowSpan, colSpan, backgroundColor, spacing, style, ... }
 ├── auxiliary?: OfficeAuxiliaryContent   (out-of-band layout elements)
 │   ├── headers?: OfficeContentNode[]   ('header' nodes: DOCX parts, PDF top band, ODT master pages, LaTeX fancyhdr; metadata { type, section, hidden })
@@ -776,6 +779,7 @@ interface OfficeIssue {
     message: string;
     node?: OfficeContentNode;  // the node that triggered the issue, if any
     details?: any;             // original error or extra context
+    page?: number;             // the PDF page it is on (1-based), where the reader knows it
 }
 ```
 
@@ -814,7 +818,8 @@ These never throw; they report a degraded-but-successful outcome you may branch 
 | Code | Phase | Meaning / what to do |
 |---|---|---|
 | `OCR_REQUIRES_ATTACHMENTS` | parse | `ocr: true` without `extractAttachments: true`; no OCR ran. Set both. |
-| `PDF_NO_TEXT_EXTRACTED` | parse | A PDF yielded ~no text (likely scanned). Set `ocr: true` + `extractAttachments: true`. |
+| `PDF_NO_TEXT_EXTRACTED` | parse | A PDF yielded ~no text (likely scanned). Set `ocr: true` + `extractAttachments: true`. When a CMap its fonts need could not be loaded (`PDF_ASSET_UNAVAILABLE`), the message says so instead. |
+| `PDF_ASSET_UNAVAILABLE` | parse | A file pdf.js needed could not be had: a CMap (text in the fonts using it is missing) or an image decoder (pictures needing it are not decoded). Once per file per document, with the first page that needed it (`page`); the message names the file, why (missing, failed, or blocked by `allowRemoteAssets: false`) and the option to set (`pdfCMapUrl` or `pdfDecoderUrl`). |
 | `PDF_STRUCT_TREE_UNRELIABLE` | parse | PDF tag tree absent/incomplete; structure recovered geometrically. |
 | `PDF_TEXT_ENCODING_SUSPECT` | parse | A fifth or more of a PDF's characters (of at least 50) are unmappable glyphs (broken ToUnicode); text may be garbage. Consider OCR. |
 | `PDF_OUTLINE_TRUNCATED` | parse | Bookmark outline hit the depth/size cap; `ast.auxiliary.outline` is partial. |
@@ -826,9 +831,9 @@ These never throw; they report a degraded-but-successful outcome you may branch 
 | `PDF_SEPARATE_PROCESS_UNAVAILABLE` | parse | pdf.js could not start in a separate process (Node), so it runs in the host; a hostile PDF can then exhaust its memory, and pdf.js's time is not bounded (bound it with `abortSignal`). |
 | `PDF_CONTENT_LIMIT_EXCEEDED` | parse | A PDF passed one of its content limits (plus an allowance per byte), which the message names: past `pdfParserConfig.maxTextItems` or `maxTimeMs` the rest of it was not read; past `maxOperators` its images, text colours and font styles from that page on were not (its text was). |
 | `ALT_CHUNK_NOT_READ` | parse | A DOCX alternative-format chunk (`w:altChunk`) was not read: its part is missing, is of a format other than HTML, MHT, RTF, plain text or DOCX, is a DOCX inside a DOCX chunk, or could not be read (not a ZIP, no document part, nested too deep). The rest of the document is read; a chunk past the document's limits (`maxXmlElements`, `maxUncompressedBytes`) still fails the parse. Saving the document again in Word merges chunks into it. |
-| `CONTENT_PART_NOT_READ` | parse | A part of the document was not read. A chapter an EPUB's spine lists: its file is missing from the archive (or has an extension other than `.xhtml`, `.html`, `.htm`, `.xht` or `.xml`), or it is encrypted (DRM, listed in `META-INF/encryption.xml`); a book whose chapters are all encrypted throws `DOCUMENT_DECRYPTION_FAILED` instead. In a PPTX, a part that is not XML and holds none of the slides' text: the presentation's slide list or relationships (the slides are then read in the order of their file numbers), or the relationships of a notes page or a slide master (its links and pictures are then not resolved). |
+| `CONTENT_PART_NOT_READ` | parse | A part of the document was not read. A chapter an EPUB's spine lists: its file is missing from the archive (or has an extension other than `.xhtml`, `.html`, `.htm`, `.xht` or `.xml`), or it is encrypted (DRM, listed in `META-INF/encryption.xml`); a book whose chapters are all encrypted throws `DOCUMENT_DECRYPTION_FAILED` instead. In a PPTX, a part that is not XML and holds none of the slides' text: the presentation's slide list or relationships (the slides are then read in the order of their file numbers), or the relationships of a notes page or a slide master (its links and pictures are then not resolved). In a PDF, an XObject whose text pdf.js could not read (with its `page`). |
 | `RAW_CONTENT_LIMIT_EXCEEDED` | parse | With `includeRawContent`, the document's nodes reached `decompressionLimits.maxRawContentLength` of raw content; the remaining nodes carry none. |
-| `IMAGE_EXTRACTION_FAILED` / `IMAGE_PROCESSING_FAILED` / `ATTACHMENT_EXTRACTION_FAILED` | parse | An image/attachment could not be extracted or decoded; it was skipped or degraded. |
+| `IMAGE_EXTRACTION_FAILED` / `IMAGE_PROCESSING_FAILED` / `ATTACHMENT_EXTRACTION_FAILED` | parse | An image/attachment could not be extracted or decoded; it was skipped or degraded. A PDF's has the page the picture is on (`page`), and covers the pictures pdf.js leaves out without drawing them: one larger than `pdfParserConfig.maxImagePixels` (the message names it), a small inline picture it cannot decode, one without dimensions, an XObject it cannot read. In the browser these are reported where the library can start pdf.js's worker itself (a policy forbidding `blob:` workers, or a `GlobalWorkerOptions.workerPort` you set, leaves them unreported). |
 | `ANNOTATION_EXTRACTION_FAILED` / `CHART_DATA_EXTRACTION_FAILED` | parse | A PDF annotation / a chart's data could not be read. |
 | `OCR_FAILED` | parse | OCR ran but failed for an image (see `details`). |
 | `LATEX_CONSTRUCT_NOT_INTERPRETED` | parse | The LaTeX input used commands or environments the parser does not interpret (the message names them). Text inside them was kept; drawings such as TikZ pictures were omitted. |
@@ -876,7 +881,7 @@ extracted (the matching `ignore*` flag is then a no-op).
 | ODS  | Y (cell notes) | – | – | – | Y | Y | grid |
 | ODP  | Y (page) | speaker notes | – | – (ODP masters not extracted) | Y | Y | Y |
 | ODG  | Y (page) | – | – | – | Y | – | Y |
-| PDF  | – | footnotes/endnotes (tagged) | Y (top/bottom bands) | – | Y | – | Y (spans: tagged, or drawn with ruling lines) |
+| PDF  | – | footnotes/endnotes (tagged) | Y (top/bottom bands) | – | Y | – | Y (spans: tagged, drawn with ruling lines, or a cell set between the rows it covers) |
 | RTF  | Y (annotations) | footnotes/endnotes | Y | – | Y | – | Y |
 | HTML | `<!-- -->` become `comment` nodes* (opt-in: `preserveComments`) | footnotes/endnotes | – | – | Y (`data:` only) | – | Y |
 | MD   | `<!-- -->` become `comment` nodes* | footnotes/endnotes | – | – | Y (`data:` only) | – | Y (HTML-table fallback) |
@@ -947,7 +952,7 @@ Table Node (type: 'table')
   16 per byte of the document parsed (spans count); one holding more than remain (a cell far from the rest) is laid out
   closer when written, with a `TABLE_GRID_LIMIT_EXCEEDED` warning: the rows and columns no cell starts or ends in are left
   out, and if that is not enough, each row's cells follow one another
-- `rowSpan` / `colSpan`: merged cells (DOCX, PPTX, XLSX merged ranges, ODF, HTML, Markdown HTML-tables, and PDF tables that are tagged or drawn with ruling lines)
+- `rowSpan` / `colSpan`: merged cells (DOCX, PPTX, XLSX merged ranges, ODF, HTML, Markdown HTML-tables, and PDF tables that are tagged or drawn with ruling lines, or whose merged cell is set between the rows it covers)
 - `backgroundColor`: the cell's shading, where the source sets one (a PDF table's cell takes the colour of the smallest filled rectangle under its middle, tagged or not)
 - Cells can contain nested tables
 
@@ -993,6 +998,7 @@ formatting: {
     subscript?: boolean
     superscript?: boolean
     alignment?: 'left' | 'center' | 'right' | 'justify'
+    invisible?: boolean     // drawn invisibly: a PDF's text in rendering mode 3 or 7 (a scan's recognised text)
 }
 ```
 
@@ -1019,7 +1025,8 @@ Break Node (type: 'break')
 
 > [!NOTE]
 > **Sections and columns.** A `'page'` break that starts a section (a Word section, a paragraph of an
-> ODT style naming another master page, an RTF `\sect`), and a `'section'` break, which starts a section
+> ODT style naming another master page, an RTF `\sect`, a PDF page of another size or turned, before its
+> `page` node), and a `'section'` break, which starts a section
 > on the same page (a Word continuous section, an ODF section set in columns of its own, an RTF section
 > of `\sbknone`), carry the new section's
 > `pageSetup` (under `ignorePageGeometry`, only its page numbering and first-page headers). Its `columns` are
@@ -1032,14 +1039,17 @@ Break Node (type: 'break')
 > page; DOCX output writes each section with its page, columns, header and footer, ODT a master page
 > for a section on a page of its own (with its header and footer) and a section of the columns, RTF
 > each section's page words, columns, header and footer, and LaTeX `multicols` (a long table between
-> the columns, across the page); other outputs write nothing for a `'section'` break.
+> the columns, across the page); other outputs write nothing for a `'section'` break. A PDF section's
+> `pageSetup` is its page's width and height alone, as `ast.metadata.pageSetup` is the first page's: a
+> PDF has no margins, so the writers' own are used. HTML writes no break for it (the page before ends
+> there already), and under `ignorePageGeometry` a PDF has no sections.
 
 > [!NOTE]
 > Break nodes have no `text` property, but `ast.to('text')` automatically converts them to the configured newline delimiter.
 
 > [!NOTE]
 > `includeBreakNodes` gates layout breaks in DOCX, ODF and LaTeX only (page and column breaks, otherwise invisible); a
-> section's start in a Word, RTF or ODT document is always a `break` node with `metadata.section`. A
+> section's start in a Word, RTF or ODT document, or at a PDF's page of another size, is always a `break` node with `metadata.section`. A
 > line break the author typed (DOCX `w:br`/`w:cr`, ODF `text:line-break`, LaTeX `\\`) is content, and is a `break` node whatever the flag says. **HTML and
 > Markdown always emit break nodes regardless of the flag**, because a break is explicit content there:
 > a `<br>`/hard line break becomes a `carriageReturn` break, and `<hr>`/`---` a `thematic` break (a
@@ -1464,7 +1474,7 @@ Pass as the second argument to `parseOffice(file, config)`.
 | `password` | `string` | `''` | Password for a password-protected document. Applies to every encryptable format: PDF, encrypted OOXML (`.docx`/`.xlsx`/`.pptx`, ECMA-376 agile or standard AES), and encrypted ODF (`.odt`/`.ods`/`.odp`/`.odg`, AES-CBC with PBKDF2). A missing password rejects with `PASSWORD_REQUIRED`, a wrong one with `PASSWORD_INCORRECT`. Ignored for unencrypted files. *ODF note:* LibreOffice 24.8+ defaults to AES-256-GCM with Argon2id key derivation ("wholesome encryption"), which is not supported and rejects with `DOCUMENT_DECRYPTION_FAILED`; re-save with the classic AES-CBC/PBKDF2 scheme (or an earlier LibreOffice) to parse it |
 | `onPassword` | `(reason: 'required' \| 'incorrect') => string \| undefined \| Promise<...>` | (none) | Called when an encrypted document needs a password `password` did not satisfy, so it can be supplied lazily or interactively (prompt, vault). Return a password to retry (asked at most `maxPasswordAttempts` times), or `undefined` to reject as above. Works for every encryptable format (PDF/OOXML/ODF); mirrors pdf.js's `onPassword` |
 | `maxPasswordAttempts` | `number` | `3` | How many times `onPassword` is asked for one document before the parse rejects. A whole number of 0 or more |
-| `allowRemoteAssets` | `boolean` | `true` | Whether the library may fall back to its built-in CDN addresses for the pdf.js worker (`pdfWorkerSrc`) and Tesseract's worker, core and language data (`ocrConfig.workerPath`/`corePath`/`langPath`). `false` makes a parse that would use one reject with `REMOTE_ASSET_BLOCKED`, naming the option to set, for an application that must make no request to another site. An address you pass yourself is used as given. Output written from such a parse names no chart script address unless `htmlConfig.chartJsSrc` is set |
+| `allowRemoteAssets` | `boolean` | `true` | Whether the library may fall back to its built-in CDN addresses for the pdf.js worker (`pdfWorkerSrc`), pdf.js's CMaps and image decoders (`pdfCMapUrl`, `pdfDecoderUrl`) and Tesseract's worker, core and language data (`ocrConfig.workerPath`/`corePath`/`langPath`). `false` makes a parse that would use the worker's or Tesseract's default reject with `REMOTE_ASSET_BLOCKED`, naming the option to set, for an application that must make no request to another site; a CMap or decoder a document needs is then not fetched from its default, and the parse goes on without it with `PDF_ASSET_UNAVAILABLE`. An address you pass yourself is used as given. Output written from such a parse names no chart script address unless `htmlConfig.chartJsSrc` is set |
 | `ignoreNotes` | `boolean` | `false` | Ignore footnotes/endnotes (DOCX, ODT, RTF, PDF, HTML, Markdown, EPUB, LaTeX) and speaker notes (PPTX/ODP, LaTeX `beamer` `\note`). See the [capability matrix](#per-format-capability-matrix) |
 | `ignoreComments` | `boolean` | `false` | Ignore comments/annotations, attached by default via `node.comments[]`. Applies to DOCX, XLSX, PPTX, every ODF type (ODT/ODS/ODP/ODG), RTF (`\annotation`) and LaTeX (`% Comment (Author, date): text` lines). Source-level comments (CSV `#` rows, Markdown/HTML `<!-- -->`, LaTeX `% <!-- -->` lines) are not governed by it. See the [capability matrix](#per-format-capability-matrix) |
 | `ignoreHeadersAndFooters` | `boolean` | `false` | Skip headers & footers (populated in `ast.auxiliary.headers/footers` by default). Extracted for DOCX, PDF, ODT, RTF and LaTeX (`fancyhdr`) only; a no-op for ODS/ODP/ODG, XLSX and PPTX. See the [capability matrix](#per-format-capability-matrix) |
@@ -1475,7 +1485,7 @@ Pass as the second argument to `parseOffice(file, config)`.
 | `includeRawContent` | `boolean` | `false` | Attach raw XML/RTF source to each node |
 | `serializeRawContent` | `boolean` | `true` | Re-serialize XML to clean strings (only if `includeRawContent: true`) |
 | `preserveXmlWhitespace` | `boolean` | `false` | Preserve original XML whitespace during serialization |
-| `includeBreakNodes` | `boolean` | `false` | Include layout break nodes: DOCX page, column and last-rendered-page breaks, ODF `fo:break-before`/`fo:break-after` and `text:soft-page-break`, LaTeX `\newpage`/`\clearpage`, and the breaks of an ODF section in columns of its own. The break that starts a Word, RTF or ODT section (with `metadata.section` and its `pageSetup`) is the document's structure and always a node. A line break the author typed (DOCX `w:br`/`w:cr`, ODF `text:line-break`, a LaTeX `\\` or `\newline`, HTML `<br>`) is always a `break` node inside its paragraph, and a DOCX tab is always a `\t` in the text |
+| `includeBreakNodes` | `boolean` | `false` | Include layout break nodes: DOCX page, column and last-rendered-page breaks, ODF `fo:break-before`/`fo:break-after` and `text:soft-page-break`, LaTeX `\newpage`/`\clearpage`. The break that starts a Word, RTF or ODT section, or a PDF's page of another size (with `metadata.section` and its `pageSetup`), and the `'section'` breaks around an ODF section in columns of its own, are the document's structure and always nodes. A line break the author typed (DOCX `w:br`/`w:cr`, ODF `text:line-break`, a LaTeX `\\` or `\newline`, HTML `<br>`) is always a `break` node inside its paragraph, and a DOCX tab is always a `\t` in the text |
 | `ignoreInternalLinks` | `boolean` | `false` | Strip bookmarks and internal cross-references from AST (now honored for PDF too) |
 | `ignorePageGeometry` | `boolean` | `false` | Omit the geometric layout data: per-node bounding boxes (`node.bounds`: PDF pages, PPTX and ODP slides), page dimensions and page setups (`metadata.pageSetup`, a section's or sheet's `pageSetup`; a text document's keeps how each section numbers its pages and whether its first page has a header of its own), slides' `drawing` nodes and backgrounds, and a floating frame's place (`ShapeMetadata.float`: its text is read where it stands) |
 | `fileType` | `SupportedFileType \| FileTypeAlias \| null` | `null` | **Required for text-based binary data** (`'md'`, `'html'`, `'csv'`, `'tex'`) as these lack magic bytes. Also accepts the names the matching extensions route by (`FileTypeAlias`): `'latex'`/`'ltx'` for `tex`, the ODF template names `'ott'`/`'ots'`/`'otp'`/`'otg'`, and `'zip'` (parsed as whatever the archive holds). |
@@ -1483,6 +1493,8 @@ Pass as the second argument to `parseOffice(file, config)`.
 | `decompressionLimits` | `DecompressionLimits` | `{ maxUncompressedBytes: 512MB, maxZipEntries: 10000, maxTableCells: 1000000, maxXmlElements: 2000000, maxRepeatedContent: 16777216, maxRawContentLength: 67108864 }` | Limits applied during ZIP extraction (and to the cells an ODF or XLSX document yields, the content a document repeats by reference, the `rawContent` nodes carry, and the XML elements a document's parts may hold; past `maxXmlElements` the parse rejects with `XML_ELEMENT_LIMIT_EXCEEDED`) to protect against excessive memory and resource usage. `maxTableCells` and `maxRepeatedContent` grow by one cell and 16 characters per byte of the document, so a large document is not cut short for its size while a small crafted one stays bounded |
 | `htmlParserConfig` | `HtmlParserConfig` | `{}` | HTML/XHTML/EPUB parsing options **(and Markdown input: `preserveIframes`/`embedFolkForms` govern raw `<iframe>` blocks and folk embeds in `.md` too)**. `preserveAttributes` (`boolean`, default `false`): keep generic source attributes no typed field consumed on `node.htmlAttributes`. `preserveIframes` (`boolean \| string[]`, default `false`): preserve non-YouTube `<iframe>` embeds (otherwise dropped) as `embed` nodes: `true` for any, or a hostname allowlist; the src is scheme-checked on generation. `embedFolkForms` (`boolean`, default `false`): opt in to importing ambiguous folk embed forms (Obsidian `![](youtube-url)`, thumbnail-link) as YouTube embeds. `preserveComments` (`boolean`, default `false`): keep `<!-- ... -->` comments in HTML and EPUB input as `comment` nodes (`metadata.sourceSyntax: 'html'`) instead of dropping them; conditional comments (`<!--[if …]>`) are always dropped. The `data-html-comment` shape `sourceAttributes` emits is always read. |
 | `pdfWorkerSrc` | `string` | CDN (jsDelivr) | Path/URL to `pdf.worker.min.mjs` (required in browser) |
+| `pdfCMapUrl` | `string` | pdfjs-dist's `cmaps/` in Node; CDN (jsDelivr) in the browser; `''` in the slim bundles | Folder (ending in `/`) of pdf.js's packed CMaps. pdf.js reads the text of a font a PDF does not embed through one when the font names a predefined CJK encoding (`UniJIS-UTF16-H`, `90ms-RKSJ-H`...); without it that text is lost. Only the files a document needs are read, each at most 4 MB and 15 s, and a folder that keeps a document waiting 15 s in all is asked nothing more for it. One that cannot be had raises `PDF_ASSET_UNAVAILABLE` and the rest of the document is read. In Node a path or `file:`/`http(s):` address you set replaces the installed folder |
+| `pdfDecoderUrl` | `string` | pdfjs-dist's `wasm/` in Node; CDN (jsDelivr) in the browser; `''` in the slim bundles | Folder (ending in `/`) of pdf.js's image decoders: `jbig2.wasm` (JBIG2 and CCITT fax pictures, common in scans) and `openjpeg.wasm` (JPEG 2000), with the JavaScript fallbacks beside them (`*_nowasm_fallback.js`). Without them such pictures cannot be decoded. Read as `pdfCMapUrl` is; one that cannot be had raises `PDF_ASSET_UNAVAILABLE`, and each picture then not decoded `IMAGE_EXTRACTION_FAILED` |
 | `pdfParserConfig` | `PdfParserConfig` | see below | PDF-specific options ([table below](#pdfparserconfig)) |
 | `texParserConfig` | `TexParserConfig` | `{ today: '' }` | LaTeX options. `today` (`string`): what `\today` prints. `''` (default) prints the date of the parse, as LaTeX prints the date of the compile, in the document's language ("September 25, 2026" in English); set a fixed date, so that the same file parses the same way every day, or a placeholder of your own to find and replace later |
 | `onWarning` | `(issue: OfficeIssue) => void` | (none) | Callback for non-fatal parsing issues |
@@ -1510,6 +1522,7 @@ PDF-specific options, passed as `pdfParserConfig` on the parser config.
 | `maxOperators` | `number` | `250000` | Base of the drawing operators kept from one PDF (for images, text color and font styles); the limit is this plus four per byte of the file. Paths do not count (a page keeps up to 40,000 of them apart, for bullets drawn as shapes and tables drawn with ruling lines); a shown string counts once more per 64 glyphs. Past it no more operators are read: from that page on, images, text colors and font styles are missing, and the text is still read (`PDF_CONTENT_LIMIT_EXCEEDED`). |
 | `maxAnnotations` | `number` | `10000` | Base of the annotations (links, highlights) one PDF may have read; the limit is this plus one per 32 bytes of the file. Past it the rest of the document's links and highlights are not read (`ANNOTATION_EXTRACTION_FAILED`). |
 | `maxTimeMs` | `number` | `5000` | Base of the CPU time the separate pdf.js process may spend reading one PDF; the limit is this plus 20 ms per KB of the file. CPU time, not time passed, so a busy host, many parses at once or a loaded machine never cut a document short. Past it the process is ended and the rest of the document is not read (`PDF_CONTENT_LIMIT_EXCEEDED`). pdf.js in the host (`separateProcess: false`, or the fallback) has no time limit, since no measure of time there is the document's own; bound it with `abortSignal`. |
+| `maxImagePixels` | `number` | `40000000` | The most pixels (width times height) a picture may have to be extracted with `extractAttachments`. A few bytes of a compressed picture can declare dimensions that decode to gigabytes, so pdf.js leaves out a larger one without decoding it, reported with `IMAGE_EXTRACTION_FAILED` (with its page) naming this option. Raise it for high-resolution scans (an A3 page at 600 dpi is about 42 million pixels); `Infinity` is no limit. |
 | `separateProcess` | `boolean` | `true` | Run pdf.js in a separate process (Node) under `processMemoryMb`, so a PDF that inflates into gigabytes inside pdf.js fails with `PDF_PROCESS_FAILED` instead of ending the host; `abortSignal` and `maxTimeMs` stop it mid-request. Processes are pooled, at most one per CPU, each reading one document at a time (further parses wait), and end with the host. Falls back to the host with `PDF_SEPARATE_PROCESS_UNAVAILABLE`. |
 | `processMemoryMb` | `number` | `1024` | Heap, in MB, of the separate pdf.js process (64 or more). |
 
@@ -1693,7 +1706,9 @@ const { value: pdf } = await ast.to('pdf', {
 });
 ```
 
-Each character is drawn in the first font that has it, so one document can mix scripts. Words are shaped by the font (ligatures, Arabic joining, Indic conjuncts), and a right-to-left line starts at the right edge with its words in visual order; text of the Indic and Southeast Asian scripts, and letters with combining marks, is drawn with each glyph where the font places it (through its positioning table, `GPOS`) and marked with what it says (`/ActualText`), so it copies in the order it is written. Fonts are subset to the glyphs used, but for OpenType fonts of CFF outlines, which are embedded whole.
+Each font is the bytes of a TrueType, OpenType, WOFF or WOFF2 file (a web font, such as Fontsource's, is embedded as the TrueType or OpenType font it holds). Each character is drawn in the first font that has it, so one document can mix scripts. Words are shaped by the font (ligatures, Arabic joining, Indic conjuncts), and a right-to-left line starts at the right edge with its words in visual order; text of the Indic and Southeast Asian scripts, and letters with combining marks, is drawn with each glyph where the font places it (through its positioning table, `GPOS`) and marked with what it says (`/ActualText`), so it copies in the order it is written. Fonts are subset to the glyphs used, but for OpenType fonts of CFF outlines, and fonts with color layers (`COLR`), which are embedded whole. A font that cannot be read (a damaged one, a collection such as a `.ttc`), or whose glyphs to be drawn cannot be read or written into the PDF, fails the conversion (`PDF_GENERATION_FAILED`) and names the option it was given in.
+
+**Which font draws what.** A character is drawn by the first font whose glyph for it draws something. A font whose glyph for it is empty is passed over, and a character no font draws is drawn as `?` and reported with the characters no font has: an empty glyph is a font's defect, or, in a color font, the stand-in for a color glyph. A character blank by design (a space, a control or format character, the Braille blank cell U+2800) is drawn by the first font that has it, and so is a combining mark that a font substituting glyphs as it shapes (`GSUB`, `morx`) has with the letter before it (an invisible virama that stacks the next letter). The Standard-14 fonts have no rupee sign `₹` (U+20B9), ruble sign `₽` (U+20BD) or emoji, and fonts differ: of Fontsource's files, Noto Sans has `₹` and `₽` in its `latin-ext` file and neither in its `latin` one, Noto Sans Devanagari has `₹` but not `₽`, and Liberation Sans has neither. Emoji are drawn by a monochrome font of outlines such as Noto Emoji. A color emoji font (Noto Color Emoji, Apple Color Emoji) draws its emoji from color images or layers that the native engine does not draw: they are counted with the characters no font has, and a color font none of whose characters has an outline is reported (`INVALID_CONFIG_VALUE`) and not used.
 
 **The maintained pdf-lib fork.** `@cantoo/pdf-lib` 2.x (the same API, with encryption) is supported in place of `pdf-lib`, installed under its name, with the fork's own fontkit under `@pdf-lib/fontkit` when fonts are used (each pdf-lib subsets fonts only with its own fontkit):
 
@@ -1707,9 +1722,9 @@ Each character is drawn in the first font that has it, so one document can mix s
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `engine` | `'html' \| 'native'` | `'html'` | `'html'`: render through a headless browser (Puppeteer in Node; native print in the browser) for maximum fidelity. `'native'`: lay the AST out directly with `pdf-lib` - no browser, runs in Node and the browser (real PDF bytes client-side), much lighter, but draws in the fonts it is given (the Standard-14 fonts when given none) and reflows rather than pixel-matching |
-| `fonts` | `{ regular?, bold?, italic?, boldItalic?, mono? }` of `Uint8Array \| ArrayBuffer` | none | Native engine: the font file (`.ttf`/`.otf` bytes) each style is drawn in. A style given none is drawn in `regular`; code stays in Courier unless `mono` is given. Needs `@pdf-lib/fontkit`. Bytes that are not a font fail the conversion (`PDF_GENERATION_FAILED`) |
-| `fallbackFonts` | `(Uint8Array \| ArrayBuffer)[]` | `[]` | Native engine: more font files, tried in order for each character the fonts before them lack. Given without `fonts`, text stays in the Standard-14 fonts and these draw only what those lack |
-| `subsetFonts` | `boolean` | `true` | Native engine: embed only the glyphs used of each font given. `false` embeds the whole files. An OpenType font of CFF outlines is embedded whole either way |
+| `fonts` | `{ regular?, bold?, italic?, boldItalic?, mono? }` of `Uint8Array \| ArrayBuffer` | none | Native engine: the font file (`.ttf`, `.otf`, `.woff` or `.woff2` bytes) each style is drawn in. A style given none is drawn in `regular`; code stays in Courier unless `mono` is given. Needs `@pdf-lib/fontkit`. Bytes that are not a font fail the conversion (`PDF_GENERATION_FAILED`) |
+| `fallbackFonts` | `(Uint8Array \| ArrayBuffer)[]` | `[]` | Native engine: more font files (TrueType, OpenType, WOFF, WOFF2), tried in order for each character the fonts before them lack. Given without `fonts`, text stays in the Standard-14 fonts and these draw only what those lack. A color font none of whose characters has an outline is reported (`INVALID_CONFIG_VALUE`) and not used |
+| `subsetFonts` | `boolean` | `true` | Native engine: embed only the glyphs used of each font given. `false` embeds whole fonts (a WOFF or WOFF2 file as the font it holds). An OpenType font of CFF outlines, or a font with color layers (`COLR`), is embedded whole either way |
 | `tagged` | `boolean` | `true` | Emit a tagged, PDF/UA-accessible PDF (structure tree). HTML engine only; the native engine ignores it |
 | `outline` | `boolean` | `false` | Emit a bookmark outline from the document's headings, nested by heading level. Both engines |
 | `format` | `string` | `'auto'` | Paper format (`'A4'`, `'Letter'`, `'Legal'`, etc.). `'auto'`: the document's own pages (`metadata.pageSetup`; the native engine gives each section and sheet its own and takes unset margins from the document), else A4 |
@@ -1820,14 +1835,14 @@ writeFileSync('data.ods', value); // value is a Uint8Array
 Pass as `pptxConfig` inside `GeneratorConfig`. The PPTX generator writes a PowerPoint presentation (`.pptx`) with zero extra dependencies, so it runs identically in Node and the browser and returns a `Uint8Array`. What the slides hold depends on the source:
 
 - **A presentation** (PPTX, ODP) is written slide for slide at its slide size: each text box, shape (its outline, fill, line, turn and mirroring, with the text in it), picture and table in its place (`bounds`), the slide's background colour, and its speaker notes on the slide's notes page. A chart is a table of its data in the chart's place.
-- **A PDF** becomes a slide for each page, at the pages' most common size (a page of another size is scaled into it, centred). Each paragraph is a text box where the page set it, its lines broken and spaced as on the page, in its runs' fonts, sizes and colours; a paragraph set beside a floating table or picture is a box for each group of its lines. Tables keep their measured row heights and their cells' shading, pictures their places, and footnotes and a page's notes are at the foot of their page.
+- **A PDF** becomes a slide for each page, at the pages' most common size (a page of another size is scaled into it, centred). Each paragraph is a text box where the page set it, its lines broken and spaced as on the page (each line on the baseline the page drew it on, where the runs' `bounds.baseline` give it), in its runs' fonts, sizes and colours; a paragraph set beside a floating table or picture is a box for each group of its lines. Tables keep their measured row heights and their cells' shading, pictures their places, and footnotes and a page's notes are at the foot of their page. A page's invisible text (a scan's recognised words laid over its picture, `TextFormatting.invisible`) is written fully transparent: not seen, still there to select and search. A table whose text is all invisible is drawn without rules (its cells' text in their places where the page gave them).
 - **Any other document** flows onto 16:9 slides: a slide for each heading of the first two levels, titled by it, with the text under it as bullets (lower headings bold), carried on to more slides of the same title where it does not fit. Text before the first heading is under the document's title, from its metadata. Each table is on slides of its own, ten rows a slide with its header rows repeated, and each sheet of a workbook is a table under the sheet's name. Pictures (those in a table's cells too) are on slides of their own, charts are tables of their data, a presentation's speaker notes go with the slides its content made, and footnotes and endnotes, numbered where they are cited, are listed on slides at the end.
 
 A numbered list item carries its own number as the document shows it (`2.`, `1.1.`, `iv.`), and a picture its alternative text. A code block is set in a monospaced font, line for line; an embedded video or page is its link; a picture known only by its address is its alternative text, and reported; comments go into the speaker notes of the slide they are on. A PDF page shown turned (`/Rotate`) has its text and pictures turned with it. A presentation or PDF parsed with `ignorePageGeometry` has no places on its pages, so it flows as any other document. Pictures and charts need `extractAttachments: true` on the parse (`OfficeConverter.convert` sets it); PNG, JPEG, GIF and BMP pictures are written, and others are reported with `IMAGE_PROCESSING_FAILED`. Links to web, mail and phone addresses stay clickable. What a slide cannot hold (a chart without its data, a picture without a place on a page) is reported with `CONTENT_NOT_REPRESENTABLE`.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `backgrounds` | `(Uint8Array \| null \| undefined)[]` | `[]` | A picture (PNG or JPEG bytes) for each page of a PDF or slide of a presentation, in order, drawn as its slide's background under its text; `null` or `undefined` for one without. Give a PDF's pages drawn without their text, and the slides look as the pages did (shapes, gradients and charts included) with the text over them to edit; a page's tables are then their cells' text in place over the picture, which holds their rules. A flowing document's slides take them in order |
+| `backgrounds` | `(Uint8Array \| null \| undefined)[]` | `[]` | A picture (PNG or JPEG bytes) for each page of a PDF or slide of a presentation, in order, drawn as its slide's background under its text; `null` or `undefined` for one without. Give a PDF's pages drawn without their text, and the slides look as the pages did (shapes, gradients and charts included) with the text over them to edit; a page's tables are then their cells' text in place over the picture, which holds their rules. The page's pictures are placed over the background as objects of their own too, so a picture the background also holds is there twice and moving one uncovers its copy beneath. A flowing document's slides take them in order |
 
 ```typescript
 import { OfficeConverter } from 'officeparser';
@@ -1847,7 +1862,7 @@ Pass as `odpConfig` inside `GeneratorConfig`. The ODP generator writes an OpenDo
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `backgrounds` | `(Uint8Array \| null \| undefined)[]` | `[]` | A picture (PNG or JPEG bytes) for each page of a PDF or slide of a presentation (a flowing document's slides, in order), under its slide's text; `null` or `undefined` for one without |
+| `backgrounds` | `(Uint8Array \| null \| undefined)[]` | `[]` | A picture (PNG or JPEG bytes) for each page of a PDF or slide of a presentation (a flowing document's slides, in order), under its slide's text; `null` or `undefined` for one without. As PPTX's: the page's pictures are placed over it as objects of their own too |
 
 ```typescript
 import { OfficeConverter } from 'officeparser';
@@ -2094,6 +2109,18 @@ For strict browser environments like **Chrome/Edge Manifest V3 extensions**, rem
 ### Content Security Policy
 Every browser bundle loads under a policy with no `'unsafe-eval'` (`script-src 'self'`): none evaluates code from a string as it loads. What a policy still has to allow is what you choose to load: the pdf.js worker for PDF input (`pdfWorkerSrc`, a CDN by default, so host it yourself under `'self'`), and for OCR, Tesseract's worker and WebAssembly.
 
+For PDF input, pdf.js also loads files when a document needs them: its CMaps (`pdfCMapUrl`) for text in fonts the PDF does not embed, chiefly Chinese, Japanese and Korean, and its image decoders (`pdfDecoderUrl`) for JBIG2, CCITT fax and JPEG 2000 pictures. To host them yourself, or to work offline, copy the `cmaps/` and `wasm/` folders of `node_modules/pdfjs-dist` (the version the library uses, `6.2.108`) beside your copy of the worker and point both options at them:
+
+```js
+const ast = await officeParser.parseOffice(pdfBytes, {
+    pdfWorkerSrc: '/pdfjs/pdf.worker.min.mjs',
+    pdfCMapUrl: '/pdfjs/cmaps/',
+    pdfDecoderUrl: '/pdfjs/wasm/',
+});
+```
+
+The library reads them with `fetch()`, so a policy allows their address in `connect-src`. The decoders are WebAssembly, which needs `'wasm-unsafe-eval'` in `script-src`; without it pdf.js's worker imports the slower JavaScript decoder beside each (`wasm/*_nowasm_fallback.js`), which `script-src` (or `worker-src`) must then allow. The library starts pdf.js's worker itself, from a small `blob:` module that passes pdf.js's warnings back (about pictures pdf.js leaves out) and then imports `pdfWorkerSrc`, so a policy allows `blob:` in `worker-src`, as pdf.js itself needs for a worker on another origin; where it cannot (or a `GlobalWorkerOptions.workerPort` is set), pdf.js starts its own worker as before and those pictures go unreported.
+
 ### ESM (Vite / Webpack / Next.js)
 
 ```js
@@ -2150,6 +2177,7 @@ const ast = await officeParser.parseOffice(pdfArrayBuffer, {
 |---------|-----|
 | Node.js process stays alive after finishing | Call `await officeParser.terminateOcr()` at end of script when OCR was used |
 | `"Worker not found"` in browser for PDF | Verify `pdfWorkerSrc` points to `pdf.worker.min.mjs` matching `pdfjs-dist@6.2.108` |
+| Japanese, Chinese or Korean PDF text missing (`PDF_ASSET_UNAVAILABLE` for a CMap) | Set `pdfCMapUrl` to a copy of `pdfjs-dist/cmaps/` you host (or leave `allowRemoteAssets` on) |
 | Low OCR accuracy | Verify `ocrConfig.language` matches the document language; quality depends on image resolution |
 | Out of memory on large Excel files | Call `await ast.to('text')` early and discard the AST object to allow garbage collection |
 | `md`/`html`/`csv`/`tex` buffer not detected | Add `fileType: 'md'` (or `'html'`, `'csv'`, `'tex'`) to config (these formats have no magic bytes) |

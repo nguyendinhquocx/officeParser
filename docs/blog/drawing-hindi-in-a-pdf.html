@@ -23,6 +23,7 @@
     <meta property="og:url" content="https://officeparser.harshankur.com/blog/drawing-hindi-in-a-pdf.html">
     <meta property="og:site_name" content="officeParser">
     <meta property="article:published_time" content="2026-10-26">
+    <meta property="article:modified_time" content="2026-10-28">
 
     <!-- Fonts: the site's own copies (docs/fonts), shared with the home page. -->
     <link rel="stylesheet" href="../fonts/fonts.css">
@@ -47,20 +48,27 @@
     <header class="blog-header">
         <div class="header-container">
             <div class="logo-group">
-                <a href="../" class="brand-logo">
-                    <span>officeParser</span>
-                    <span class="brand-badge">Blog</span>
-                </a>
+                <a href="../" class="brand-logo">officeParser</a>
+                <a href="./" class="brand-badge" aria-label="Blog: all articles">Blog</a>
             </div>
             <nav class="nav-actions" aria-label="Site">
                 <a href="./" class="nav-link"><span class="nav-long">All Articles</span><span
                         class="nav-short">Articles</span></a>
                 <a href="../" class="nav-link"><span class="nav-long">Visualizer &amp; Docs</span><span
                         class="nav-short">Docs</span></a>
-                <a href="https://github.com/harshankur/officeParser" class="nav-link nav-secondary" target="_blank"
-                    rel="noopener">GitHub</a>
-                <button class="theme-toggle-btn" id="theme-toggle" type="button" aria-label="Toggle theme">
-                    <span id="theme-icon" aria-hidden="true">🌙</span>
+                <a href="https://github.com/harshankur/officeParser" class="header-btn" target="_blank" rel="noopener"
+                    aria-label="GitHub">
+                    <svg class="header-btn-icon" viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="header-btn-label">GitHub</span>
+                </a>
+                <button class="header-btn revision-toggle" id="revision-toggle" type="button" aria-pressed="true"
+                    aria-label="Hide changes" title="Hide changes" hidden>
+                    <svg class="header-btn-icon" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor"
+                        stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M8 2.5v6M5 5.5h6M5 12.5h6"/></svg><span
+                        class="header-btn-label" id="revision-label">Hide changes</span>
+                </button>
+                <button class="header-btn" id="theme-toggle" type="button" aria-label="Dark mode">
+                    <span class="header-btn-icon" id="theme-icon" aria-hidden="true">🌙</span><span class="header-btn-label"
+                        id="theme-label">Dark mode</span>
                 </button>
             </nav>
         </div>
@@ -78,7 +86,7 @@
                     <div>
                         <a href="https://harshankur.com" target="_blank" rel="noopener" class="author-name">Harsh
                             Ankur</a>
-                        <div>Published <time datetime="2026-10-26">26 October 2026</time> · 8 min read</div>
+                        <div>Published <time datetime="2026-10-26">26 October 2026</time>, updated <time datetime="2026-10-28">28 October 2026</time> · <a href="#revisions" class="byline-changes">5 changes</a> · 8 min read</div>
                     </div>
                 </div>
             </div>
@@ -147,7 +155,7 @@
     it is written into the page now:
 </p>
 <pre><code>/Span &lt;&lt; /ActualText &lt;FEFF0939093F090209260940&gt; &gt;&gt; BDC
-1 0 0 1 48 765.89 Tm
+1 0 0 1 48 <del datetime="2026-10-28">765.89</del><ins datetime="2026-10-28">782.89</ins><button type="button" class="revision-mark" id="change-tm-value" popovertarget="change-tm-value-note">Corrected</button><span class="revision-note" id="change-tm-value-note" popover><strong>Corrected 28 Oct 2026.</strong> The sample said 765.89 when the post went out. The engine draws this line at 782.89. <a href="#revisions">All revisions</a><button type="button" class="revision-note-hide" hidden>Hide all changes</button></span> Tm
 [ &lt;0001&gt; &lt;0002&gt; &lt;0003&gt; &lt;0004&gt; &lt;0005&gt; ] TJ
 EMC</code></pre>
 <p>
@@ -237,6 +245,18 @@ EMC</code></pre>
     space before the word. The reader also composes an ActualText's marks with their letters when
     <code>pdfParserConfig.normalizeText</code> is on, as pdf.js does for the glyphs' text.
 </p>
+<p>
+    <ins datetime="2026-10-28" cite="../#doc/changelog/840---2026-10-28">That was not the whole of it. pdf.js tells such a glyph by a regular expression,
+    <code>/^(\s)|(\p{Mn})|(\p{Cf})$/u</code>, whose middle part has no anchors, so any glyph whose text
+    holds a mark counts: a conjunct, and a syllable like <code>ते</code> too. It gives that glyph no
+    advance and does not move past it, so the gap it measures to the next glyph starts from the wrong
+    place. In a PDF that places each cluster on its own, as LibreOffice's do, that gap looked like a
+    space, and words read back split: <code>हिं दी</code> for <code>हिंदी</code>. Since 8.4.0 the reader
+    walks the page's drawing operators glyph by glyph, puts each piece of text where its glyphs are
+    really drawn, and keeps a space only where the page draws one or leaves a gap. Words now read whole
+    from LibreOffice's PDFs in the Indian languages and Thai I tested, and the space after a conjunct is
+    kept.</ins><button type="button" class="revision-mark" id="change-whole-words" popovertarget="change-whole-words-note">Updated</button><span class="revision-note" id="change-whole-words-note" popover><strong>Updated 28 Oct 2026 for <a href="../#doc/changelog/840---2026-10-28">8.4.0</a>.</strong> The reader now reads words whole from PDFs that place each letter cluster apart, as LibreOffice&#39;s do. <a href="#revisions">All revisions</a><button type="button" class="revision-note-hide" hidden>Hide all changes</button></span>
+</p>
 
 <h2>Using It</h2>
 <pre><code>import { readFileSync, writeFileSync } from 'node:fs';
@@ -251,18 +271,19 @@ const pdf = await ast.to('pdf', {
 });
 writeFileSync('report.pdf', pdf.value);</code></pre>
 <p>
-    Each character is drawn in the first font that has it, so one Latin font in
+    Each character is drawn in the first font <del datetime="2026-10-28" cite="../#doc/changelog/840---2026-10-28">that has it</del><ins datetime="2026-10-28" cite="../#doc/changelog/840---2026-10-28">whose glyph for it draws something</ins><button type="button" class="revision-mark" id="change-first-font-that-draws" popovertarget="change-first-font-that-draws-note">Updated</button><span class="revision-note" id="change-first-font-that-draws-note" popover><strong>Updated 28 Oct 2026 for <a href="../#doc/changelog/840---2026-10-28">8.4.0</a>.</strong> A font whose glyph for a character draws nothing is now passed over for the next font. <a href="#revisions">All revisions</a><button type="button" class="revision-note-hide" hidden>Hide all changes</button></span>, so one Latin font in
     <code>pdfConfig.fonts</code> and a font for each other script in <code>fallbackFonts</code> covers a document
-    that mixes them. The fonts need the optional peer dependency <code>@pdf-lib/fontkit</code>.
+    that mixes them. <ins datetime="2026-10-28" cite="../#doc/changelog/840---2026-10-28">A font may be a TrueType or OpenType file, and since 8.4.0 a WOFF or WOFF2 file too.</ins><button type="button" class="revision-mark" id="change-web-fonts" popovertarget="change-web-fonts-note">Updated</button><span class="revision-note" id="change-web-fonts-note" popover><strong>Updated 28 Oct 2026 for <a href="../#doc/changelog/840---2026-10-28">8.4.0</a>.</strong> The native engine now takes WOFF and WOFF2 fonts. <a href="#revisions">All revisions</a><button type="button" class="revision-note-hide" hidden>Hide all changes</button></span>
+    The fonts need the optional peer dependency <code>@pdf-lib/fontkit</code>.
 </p>
 
 <h2>What is Still Not Right</h2>
 <ul>
     <li>Viewers built on pdf.js build their text from the glyphs, not from <code>/ActualText</code>, so
         copying there can still put ि before its letter.</li>
-    <li>officeParser's own reader can still lose the space <em>after</em> a conjunct when a Latin word
+    <li class="revision-removed"><del datetime="2026-10-28" cite="../#doc/changelog/840---2026-10-28">officeParser's own reader can still lose the space <em>after</em> a conjunct when a Latin word
         follows it: <code>क्ष end</code> reads back as <code>क्षend</code>. pdf.js gives the conjunct no
-        width, so there is no gap left to find.</li>
+        width, so there is no gap left to find.</del><button type="button" class="revision-mark" id="change-space-after-conjunct" popovertarget="change-space-after-conjunct-note">Updated</button><span class="revision-note" id="change-space-after-conjunct-note" popover><strong>Updated 28 Oct 2026 for <a href="../#doc/changelog/840---2026-10-28">8.4.0</a>.</strong> The reader now keeps the space after a conjunct, so this is no longer a problem. <a href="#revisions">All revisions</a><button type="button" class="revision-note-hide" hidden>Hide all changes</button></span></li>
     <li>Arabic and Hebrew marks are drawn where pdf-lib draws them: right for the fonts I tested, but not
         placed by the font's positioning table.</li>
 </ul>
@@ -271,6 +292,17 @@ writeFileSync('report.pdf', pdf.value);</code></pre>
     places where text stops being text: when it becomes glyphs, when a viewer turns glyphs back into
     text, and when a font file is cut down to fit.
 </p>
+
+                <section class="article-revisions" id="revisions" aria-labelledby="revisions-title">
+                    <h2 id="revisions-title">Revisions</h2>
+                    <ol>
+                        <li><strong>Corrected</strong> <time datetime="2026-10-28">28 October 2026</time>: The sample said 765.89 when the post went out. The engine draws this line at 782.89. <a href="#change-tm-value">See the change</a></li>
+                        <li><strong>Updated</strong> <time datetime="2026-10-28">28 October 2026</time> for <a href="../#doc/changelog/840---2026-10-28">8.4.0</a>: The reader now reads words whole from PDFs that place each letter cluster apart, as LibreOffice&#39;s do. <a href="#change-whole-words">See the change</a></li>
+                        <li><strong>Updated</strong> <time datetime="2026-10-28">28 October 2026</time> for <a href="../#doc/changelog/840---2026-10-28">8.4.0</a>: A font whose glyph for a character draws nothing is now passed over for the next font. <a href="#change-first-font-that-draws">See the change</a></li>
+                        <li><strong>Updated</strong> <time datetime="2026-10-28">28 October 2026</time> for <a href="../#doc/changelog/840---2026-10-28">8.4.0</a>: The native engine now takes WOFF and WOFF2 fonts. <a href="#change-web-fonts">See the change</a></li>
+                        <li><strong>Updated</strong> <time datetime="2026-10-28">28 October 2026</time> for <a href="../#doc/changelog/840---2026-10-28">8.4.0</a>: The reader now keeps the space after a conjunct, so this is no longer a problem. <a href="#change-space-after-conjunct">See the change</a></li>
+                    </ol>
+                </section>
 
                 <div class="article-nav-footer">
                     <a href="./reading-the-spreadsheet-you-see.html" class="back-to-blog">&larr; Previous: The Spreadsheet You See</a>

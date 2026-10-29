@@ -5,7 +5,7 @@ import { checkAbortSignal } from '../utils/errorUtils.js';
 import { PRESET_TO_ODF } from '../utils/shapeNames.js';
 import { decodeBase64, encUrl, hexColor, odfUserDefinedXml, resolveZipInstant, sniffImageSize, toW3CDTF } from '../utils/officeGenUtils.js';
 import { BaseGenerator } from './BaseGenerator.js';
-import { buildDeck, bulletMargin, Box, DeckItem, DeckParagraph, DeckRun, DeckSlide } from './slides/deck.js';
+import { buildDeck, bulletMargin, Box, DeckItem, DeckParagraph, DeckRun, DeckSlide, unseenTable } from './slides/deck.js';
 
 
 /** The pictures ODP output holds, by their types' names (EMF, WMF, TIFF and SVG too, as LibreOffice shows them), and each kind's type. */
@@ -26,7 +26,7 @@ const ODF_NS = 'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" 
     + 'xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" '
     + 'xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" '
     + 'xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" '
-    + 'xmlns:dc="http://purl.org/dc/elements/1.1/"';
+    + 'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0"';
 
 /** DrawingML's preset outlines ODF draws as its own shapes. */
 
@@ -163,14 +163,18 @@ export class OdpGenerator extends BaseGenerator<'odp'> {
         return ` svg:width="${pt(Math.max(1, box.w))}" svg:height="${pt(Math.max(1, box.h))}" draw:transform="rotate (${Math.round(r * 1e6) / 1e6}) translate (${pt(ox)} ${pt(oy)})"`;
     }
 
-    /** A shape's or frame's graphic style: its fill, outline, text anchor and insets. */
-    private graphicStyle(fill?: string, line?: { color?: string; width?: number }, anchor?: string, insets?: { top: number; right: number; bottom: number; left: number }, autoGrow = false, unwrapped = false): string {
+    /**
+     * A shape's or frame's graphic style: its fill, outline, text anchor and insets. A page's paragraph placed on its
+     * baselines (`onBaselines`) has its lines spaced independently of its font's metrics, as LibreOffice reads PPTX,
+     * so they stand on the baselines the deck placed them on (see baselineSet) whatever font a reader has for it.
+     */
+    private graphicStyle(fill?: string, line?: { color?: string; width?: number }, anchor?: string, insets?: { top: number; right: number; bottom: number; left: number }, autoGrow = false, unwrapped = false, onBaselines = false): string {
         const f = fill && hexColor(fill) ? ` draw:fill="solid" draw:fill-color="#${hexColor(fill)}"` : ' draw:fill="none"';
         const l = line && (line.color || line.width) ? ` draw:stroke="solid" svg:stroke-color="#${hexColor(line.color ?? '#000000') ?? '000000'}" svg:stroke-width="${pt(line.width ?? 0.75)}"` : ' draw:stroke="none"';
         const a = ` draw:textarea-vertical-align="${anchor === 'middle' ? 'middle' : anchor === 'bottom' ? 'bottom' : 'top'}"`;
         const i = insets ? ` fo:padding-top="${pt(insets.top)}" fo:padding-right="${pt(insets.right)}" fo:padding-bottom="${pt(insets.bottom)}" fo:padding-left="${pt(insets.left)}"` : '';
-        const key = `gr|${f}|${l}|${a}|${i}|${autoGrow}|${unwrapped}`;
-        return this.styleNamed(key, 'gr', name => `<style:style style:name="${name}" style:family="graphic" style:parent-style-name="standard"><style:graphic-properties${f}${l}${a}${i} draw:auto-grow-height="${autoGrow}" draw:auto-grow-width="${unwrapped}"${unwrapped ? ' fo:wrap-option="no-wrap" draw:textarea-horizontal-align="left"' : ''}/></style:style>`);
+        const key = `gr|${f}|${l}|${a}|${i}|${autoGrow}|${unwrapped}|${onBaselines}`;
+        return this.styleNamed(key, 'gr', name => `<style:style style:name="${name}" style:family="graphic" style:parent-style-name="standard"><style:graphic-properties${f}${l}${a}${i} draw:auto-grow-height="${autoGrow}" draw:auto-grow-width="${unwrapped}"${unwrapped ? ' fo:wrap-option="no-wrap" draw:textarea-horizontal-align="left"' : ''}/>${onBaselines ? '<style:paragraph-properties style:font-independent-line-spacing="true"/>' : ''}</style:style>`);
     }
 
     /** A shape's ODF name: its preset's own, else a rectangle, reported once a name. */
@@ -217,7 +221,7 @@ export class OdpGenerator extends BaseGenerator<'odp'> {
             const kind = this.odfShape(s.geometry);
             return `<draw:custom-shape draw:style-name="${this.graphicStyle(s.fill, s.line, item.anchor, insets)}"${this.frameAttrs(item.box, item.rotation ?? s.rotation)}>${paragraphs}<draw:enhanced-geometry svg:viewBox="0 0 21600 21600" draw:type="${kind}"/></draw:custom-shape>`;
         }
-        return `<draw:frame draw:style-name="${this.graphicStyle(undefined, undefined, item.anchor, insets, !item.exact, item.exact)}"${this.frameAttrs(item.box, item.rotation)}><draw:text-box>${paragraphs}</draw:text-box></draw:frame>`;
+        return `<draw:frame draw:style-name="${this.graphicStyle(undefined, undefined, item.anchor, insets, !item.exact, item.exact, !!item.exact && item.paragraphs.some(p => p.baselineBox))}"${this.frameAttrs(item.box, item.rotation)}><draw:text-box>${paragraphs}</draw:text-box></draw:frame>`;
     }
 
     /** A table in a frame: its columns' widths, its cells (merges covering others), thin rules. */
@@ -226,9 +230,11 @@ export class OdpGenerator extends BaseGenerator<'odp'> {
         const total = item.widths.reduce((a, b) => a + b, 0) || cols;
         // A measured table's cells keep its text close to their rules, as its source set them; a shaded cell its colour.
         const pad = item.heights ? ` fo:padding-top="0pt" fo:padding-bottom="0pt" fo:padding-left="${pt(3)}" fo:padding-right="${pt(3)}"` : '';
+        // (No rules for a table whose text is all invisible: a scan's recognised table, its rules in the scan.)
+        const border = unseenTable(item) ? 'none' : '0.5pt solid #BFBFBF';
         const cellStyleOf = (fill?: string) => {
             const hex = fill && hexColor(fill);
-            return this.styleNamed(`cell|rule|${hex ?? ''}|${pad}`, 'ce', name => `<style:style style:name="${name}" style:family="table-cell"><style:graphic-properties ${hex ? `draw:fill="solid" draw:fill-color="#${hex}"` : 'draw:fill="none"'}${pad}/><style:paragraph-properties fo:border="0.5pt solid #BFBFBF"/></style:style>`);
+            return this.styleNamed(`cell|${border}|${hex ?? ''}|${pad}`, 'ce', name => `<style:style style:name="${name}" style:family="table-cell"><style:graphic-properties ${hex ? `draw:fill="solid" draw:fill-color="#${hex}"` : 'draw:fill="none"'}${pad}/><style:paragraph-properties fo:border="${border}"/></style:style>`);
         };
         const cellStyle = cellStyleOf();
         const hTotal = item.heights?.reduce((a, b) => a + b, 0);
@@ -274,8 +280,14 @@ export class OdpGenerator extends BaseGenerator<'odp'> {
         const spacing = p.lineSpacing && p.lineSpacing > 0 ? Math.min(1584, p.lineSpacing) : 0;
         const pStyle = align || p.bullet || first || spacing ? this.styleNamed(`p|${align}|${p.bullet?.level ?? ''}|${first.toFixed(2)}|${spacing.toFixed(2)}`, 'P', name => `<style:style style:name="${name}" style:family="paragraph"><style:paragraph-properties${align ? ` fo:text-align="${align}"` : ''}${spacing ? ` fo:line-height="${pt(spacing)}"` : ''}${p.bullet ? ` fo:margin-left="${pt(bulletMargin(p.bullet.level))}" fo:text-indent="${pt(-14)}"` : first ? ` fo:margin-left="${pt(Math.max(0, -first))}" fo:text-indent="${pt(first)}"` : ''}/></style:style>`) : undefined;
         const spans = p.runs.map(r => this.spanXml(r, defaultSize, p.mono)).join('');
-        // A number is written as the item shows it, as a bullet's character is.
-        const marker = p.bullet ? (p.bullet.numbered ? (p.bullet.text ? `${xmlText(p.bullet.text)}<text:tab/>` : '') : `${xmlText(p.bullet.char ?? '')}<text:tab/>`) : '';
+        // A number is written as the item shows it, as a bullet's character is (an invisible item's invisible with it).
+        const shown = p.bullet ? (p.bullet.numbered ? p.bullet.text ?? '' : p.bullet.char ?? '') : '';
+        const lead = p.runs.find(r => r.text && !r.lineBreak);
+        // (An item is invisible where all its text is: one of shown text after an invisible word keeps its marker.)
+        const unseen = p.runs.some(r => r.text.trim()) && p.runs.every(r => !r.text.trim() || r.invisible);
+        const marker = !p.bullet || (p.bullet.numbered && !p.bullet.text) ? ''
+            : unseen ? this.spanXml({ text: `${shown}\t`, invisible: true, ...(lead?.color ? { color: lead.color } : {}) }, defaultSize)
+                : `${xmlText(shown)}<text:tab/>`;
         return `<text:p${pStyle ? ` text:style-name="${pStyle}"` : ''}>${marker}${spans}</text:p>`;
     }
 
@@ -290,7 +302,9 @@ export class OdpGenerator extends BaseGenerator<'odp'> {
         const props = (size ? all('font-size', pt(size)) : '') + (r.bold ? all('font-weight', 'bold') : '') + (r.italic ? all('font-style', 'italic') : '')
             + (r.underline ? ' style:text-underline-style="solid" style:text-underline-width="auto" style:text-underline-color="font-color"' : '')
             + (r.strike ? ' style:text-line-through-style="solid"' : '') + (r.superscript ? ' style:text-position="33% 58%"' : r.subscript ? ' style:text-position="-33% 58%"' : '')
-            + (r.color && hexColor(r.color) ? ` fo:color="#${hexColor(r.color)}"` : '') + (r.font || mono ? face(r.font || 'Courier New') : '');
+            // Invisible text in its colour made fully transparent (LibreOffice's opacity, which it reads with a colour
+            // of the text's own): not seen, still there to select and search.
+            + (r.invisible ? ` fo:color="#${(r.color && hexColor(r.color)) || '000000'}" loext:opacity="0%"` : r.color && hexColor(r.color) ? ` fo:color="#${hexColor(r.color)}"` : '') + (r.font || mono ? face(r.font || 'Courier New') : '');
         const text = xmlText(r.text).replace(/ {2,}/g, m => ` <text:s text:c="${m.length - 1}"/>`).replace(/\t/g, '<text:tab/>');
         const span = props ? `<text:span text:style-name="${this.styleNamed(`t|${props}`, 'T', name => `<style:style style:name="${name}" style:family="text"><style:text-properties${props}/></style:style>`)}">${text}</text:span>` : text;
         return r.link ? `<text:a xlink:type="simple" xlink:href="${xmlText(encUrl(r.link))}">${span}</text:a>` : span;

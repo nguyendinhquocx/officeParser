@@ -5,7 +5,7 @@ import { checkAbortSignal } from '../utils/errorUtils.js';
 import { DRAWINGML_PRESETS } from '../utils/shapeNames.js';
 import { decodeBase64, encUrl, hexColor, ooxmlCustomPropertiesXml, resolveZipInstant, sniffImageSize, toW3CDTF } from '../utils/officeGenUtils.js';
 import { BaseGenerator } from './BaseGenerator.js';
-import { buildDeck, bulletMargin, Box, DeckItem, DeckParagraph, DeckRun, DeckSlide } from './slides/deck.js';
+import { buildDeck, bulletMargin, Box, DeckItem, DeckParagraph, DeckRun, DeckSlide, unseenTable } from './slides/deck.js';
 
 /** Escapes text content for an XML part after stripping XML-illegal characters. */
 /** A size in points as a text size PowerPoint takes (hundredths of a point, 1 to 4,000 points). */
@@ -292,7 +292,8 @@ export class PptxGenerator extends BaseGenerator<'pptx'> {
                 col += span;
             }
         });
-        const rule = '<a:solidFill><a:srgbClr val="BFBFBF"/></a:solidFill>';
+        // (None for a table whose text is all invisible: a scan's recognised table, its rules in the scan.)
+        const rule = unseenTable(item) ? '<a:noFill/>' : '<a:solidFill><a:srgbClr val="BFBFBF"/></a:solidFill>';
         const edges = ['lnL', 'lnR', 'lnT', 'lnB'].map(e => `<a:${e} w="9525">${rule}</a:${e}>`).join('');
         const empty = (attrs: string) => `<a:tc${attrs}><a:txBody><a:bodyPr/><a:lstStyle/><a:p/></a:txBody><a:tcPr${margins}>${edges}</a:tcPr></a:tc>`;
         const rowsXml = grid.map((row, r) => `<a:tr h="${rowH(r)}">${row.map(at => {
@@ -319,12 +320,15 @@ export class PptxGenerator extends BaseGenerator<'pptx'> {
         // A number is written as the item shows it (each item a paragraph or a box of its own, an automatic
         // number restarted at 1 in each).
         // (A marker of more than one character, `.1` as a right-to-left list sets it, is text too: a bullet is one
-        // character, and the rest was lost.)
-        const long = !!b && !b.numbered && !!b.char && [...b.char].length > 1;
-        const bullet = !b || b.numbered || long ? '<a:buNone/>' : b.char ? `<a:buFont typeface="Arial"/><a:buChar char="${xmlText(b.char)}"/>` : '<a:buNone/>';
+        // character, and the rest was lost. So is an invisible item's, invisible with it: LibreOffice draws a bullet
+        // without its colour's transparency.)
         const lead = p.runs.find(r => r.text && !r.lineBreak);
+        // (An item is invisible where all its text is: one of shown text after an invisible word keeps its marker.)
+        const unseen = p.runs.some(r => r.text.trim()) && p.runs.every(r => !r.text.trim() || r.invisible);
+        const long = !!b && !b.numbered && !!b.char && ([...b.char].length > 1 || unseen);
+        const bullet = !b || b.numbered || long ? '<a:buNone/>' : b.char ? `<a:buFont typeface="Arial"/><a:buChar char="${xmlText(b.char)}"/>` : '<a:buNone/>';
         const shown = b?.numbered ? b.text : long ? b!.char : undefined;
-        const number: DeckRun[] = shown ? [{ text: `${shown}\t`, ...(lead?.size ? { size: lead.size } : {}), ...(lead?.font ? { font: lead.font } : {}), ...(lead?.color ? { color: lead.color } : {}) }] : [];
+        const number: DeckRun[] = shown ? [{ text: `${shown}\t`, ...(lead?.size ? { size: lead.size } : {}), ...(lead?.font ? { font: lead.font } : {}), ...(lead?.color ? { color: lead.color } : {}), ...(unseen ? { invisible: true } : {}) }] : [];
         const runs = [...number, ...p.runs].map(r => this.runXml(r, rel, defaultSize, p.mono)).join('');
         const size = p.runs.find(r => r.size)?.size ?? defaultSize;
         // Lines as far apart as the source set them (spcPts holds at most 1,584 points).
@@ -337,9 +341,12 @@ export class PptxGenerator extends BaseGenerator<'pptx'> {
         if (!r.text) return '';
         const size = r.size ?? defaultSize;
         const attrs = `lang="en-US"${size ? ` sz="${pptSize(size)}"` : ''}${r.bold ? ' b="1"' : ''}${r.italic ? ' i="1"' : ''}${r.underline ? ' u="sng"' : ''}${r.strike ? ' strike="sngStrike"' : ''}${r.superscript ? ' baseline="30000"' : r.subscript ? ' baseline="-25000"' : ''} dirty="0"`;
-        const color = r.color && hexColor(r.color) ? `<a:solidFill><a:srgbClr val="${hexColor(r.color)}"/></a:solidFill>` : '';
+        // Invisible text in its colour made fully transparent: not seen, still there to select and search.
+        const color = r.invisible ? `<a:solidFill><a:srgbClr val="${(r.color && hexColor(r.color)) || '000000'}"><a:alpha val="0"/></a:srgbClr></a:solidFill>`
+            : r.color && hexColor(r.color) ? `<a:solidFill><a:srgbClr val="${hexColor(r.color)}"/></a:solidFill>` : '';
         const font = r.font || mono ? `<a:latin typeface="${xmlText(r.font || 'Courier New')}"/>` : '';
-        const link = r.link ? `<a:hlinkClick r:id="${rel('hyperlink', encUrl(r.link), true)}"/>` : '';
+        // (An invisible link in its own colour, the transparent one: PowerPoint draws a link in the theme's.)
+        const link = r.link ? `<a:hlinkClick r:id="${rel('hyperlink', encUrl(r.link), true)}"${r.invisible ? '><a:extLst><a:ext uri="{A12FA001-AC4F-418D-AE19-62706E023703}"><ahyp:hlinkClr xmlns:ahyp="http://schemas.microsoft.com/office/drawing/2018/hyperlinkcolor" val="tx"/></a:ext></a:extLst></a:hlinkClick>' : '/>'}` : '';
         return `<a:r><a:rPr ${attrs}>${color}${font}${link}</a:rPr><a:t>${xmlText(r.text)}</a:t></a:r>`;
     }
 

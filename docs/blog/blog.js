@@ -1,6 +1,7 @@
 /**
  * What the blog's pages do once they are loaded: keep the reader's theme, filter the list by topic
- * and by the words searched for, and bring a post's interactive figures to life. The pages themselves are built (scripts/build-blog.js) and
+ * and by the words searched for, bring a post's interactive figures to life, place a revision's
+ * note by its button, and show or put away a revised post's changes. The pages themselves are built (scripts/build-blog.js) and
  * are complete without this script: every post is in its page, and the list shows every post.
  * Views are counted by the viewcounter, whose consent prompt the layout loads.
  */
@@ -14,11 +15,24 @@
     const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
     root.setAttribute('data-theme', saved === 'auto' ? (prefersDark ? 'dark' : 'light') : saved);
 
+    // ── A revised post's changes: shown unless the reader has put them away, which is kept for every post ──
+    const CHANGES_KEY = 'blog-changes';
+    const changesStored = () => { try { return localStorage.getItem(CHANGES_KEY); } catch { return null; } };
+    root.classList.toggle('changes-hidden', changesStored() === 'hidden');
+
     const wireThemeToggle = () => {
+        const button = document.getElementById('theme-toggle');
         const icon = document.getElementById('theme-icon');
-        const paint = () => { icon.textContent = root.getAttribute('data-theme') === 'dark' ? '☀️' : '🌙'; };
+        const label = document.getElementById('theme-label');
+        // The button says what it does: the mode it turns on.
+        const paint = () => {
+            const dark = root.getAttribute('data-theme') === 'dark';
+            icon.textContent = dark ? '☀️' : '🌙';
+            label.textContent = dark ? 'Light mode' : 'Dark mode';
+            button.setAttribute('aria-label', label.textContent);
+        };
         paint();
-        document.getElementById('theme-toggle').addEventListener('click', () => {
+        button.addEventListener('click', () => {
             const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
             root.setAttribute('data-theme', next);
             try { localStorage.setItem('theme', next); } catch { /* the choice lasts for this page */ }
@@ -453,10 +467,93 @@
         }
     };
 
+    /**
+     * A revision's note, by its button: opened by a click (the page's own popover, which works without
+     * this script) or by resting the pointer on the button, and placed beside the button where the page
+     * alone would centre it. A note opened by the pointer closes when the pointer leaves the button and
+     * the note, and a click keeps it open.
+     */
+    const wireRevisionNotes = () => {
+        const GUTTER = 16;
+        for (const button of document.querySelectorAll('.revision-mark[popovertarget]')) {
+            const note = document.getElementById(button.getAttribute('popovertarget'));
+            if (!note || typeof note.showPopover !== 'function') continue;
+            let byPointer = false;
+            let closing = 0;
+            const place = () => {
+                const at = button.getBoundingClientRect();
+                const width = note.offsetWidth;
+                const height = note.offsetHeight;
+                const left = Math.min(Math.max(GUTTER, at.left + at.width / 2 - width / 2), window.innerWidth - GUTTER - width);
+                const below = at.bottom + 8;
+                const top = below + height <= window.innerHeight - GUTTER || at.top - 8 - height < GUTTER ? below : at.top - 8 - height;
+                Object.assign(note.style, { position: 'fixed', inset: 'auto', margin: '0', left: `${Math.max(GUTTER, left)}px`, top: `${top}px` });
+            };
+            note.addEventListener('toggle', event => {
+                if (event.newState === 'open') place();
+                else byPointer = false;
+            });
+            const stay = () => clearTimeout(closing);
+            const leave = () => {
+                if (!byPointer) return;
+                closing = setTimeout(() => { if (byPointer && note.matches(':popover-open')) note.hidePopover(); }, 200);
+            };
+            button.addEventListener('pointerenter', event => {
+                if (event.pointerType !== 'mouse') return;
+                stay();
+                if (!note.matches(':popover-open')) { byPointer = true; note.showPopover(); }
+            });
+            button.addEventListener('click', event => {
+                // A note the pointer opened is kept open by a click, not closed by it.
+                if (byPointer && note.matches(':popover-open')) { event.preventDefault(); byPointer = false; }
+            });
+            for (const part of [button, note]) {
+                part.addEventListener('pointerleave', leave);
+                part.addEventListener('pointerenter', stay);
+            }
+            window.addEventListener('scroll', () => { if (note.matches(':popover-open')) place(); }, { passive: true });
+            window.addEventListener('resize', () => { if (note.matches(':popover-open')) place(); });
+        }
+    };
+
+    /**
+     * The button in a revised post's header, beside the theme's, which stays in reach wherever the
+     * reader is: pressed, the changes are shown; not, the post reads as it is now. Each change's note
+     * offers to put them away too, where a reader puzzled by struck text looks. The choice is kept for
+     * every post. A link to a change in the list of revisions shows the changes on this page first
+     * (without changing the choice), so it never lands where nothing is to be seen.
+     */
+    const wireRevisionToggle = () => {
+        const toggle = document.getElementById('revision-toggle');
+        if (!toggle) return;
+        const show = (shown, keep) => {
+            root.classList.toggle('changes-hidden', !shown);
+            const label = shown ? 'Hide changes' : 'Show changes';
+            toggle.setAttribute('aria-pressed', String(shown));
+            toggle.setAttribute('aria-label', label);
+            toggle.title = label;
+            document.getElementById('revision-label').textContent = label;
+            if (!shown) for (const open of document.querySelectorAll('.revision-note:popover-open')) open.hidePopover();
+            if (keep) { try { localStorage.setItem(CHANGES_KEY, shown ? 'shown' : 'hidden'); } catch { /* the choice lasts for this page */ } }
+        };
+        show(!root.classList.contains('changes-hidden'), false);
+        toggle.hidden = false;
+        toggle.addEventListener('click', () => show(toggle.getAttribute('aria-pressed') !== 'true', true));
+        for (const hide of document.querySelectorAll('.revision-note-hide')) {
+            hide.hidden = false;
+            hide.addEventListener('click', () => show(false, true));
+        }
+        for (const link of document.querySelectorAll('.article-revisions a[href^="#change-"]')) {
+            link.addEventListener('click', () => { if (root.classList.contains('changes-hidden')) show(true, false); });
+        }
+    };
+
     const start = () => {
         wireThemeToggle();
+        wireRevisionToggle();
         wireListFilter();
         wireDemos();
+        wireRevisionNotes();
     };
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);

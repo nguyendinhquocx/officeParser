@@ -483,25 +483,36 @@ await ast.to('md', {
                 <td><code>fonts</code></td>
                 <td><code>{ regular?, bold?, italic?, boldItalic?, mono? }</code> of <code>Uint8Array | ArrayBuffer</code></td>
                 <td><code>(none)</code></td>
-                <td>Native engine: the font file (<code>.ttf</code>/<code>.otf</code> bytes) each style is drawn in. A style given
-                    none is drawn in <code>regular</code>; code stays in Courier unless <code>mono</code> is given. Words are shaped
-                    by the font (ligatures, Arabic joining, Indic conjuncts), and a right-to-left line starts at the right edge.
+                <td>Native engine: the font file (<code>.ttf</code>, <code>.otf</code>, <code>.woff</code> or <code>.woff2</code>
+                    bytes) each style is drawn in; a WOFF or WOFF2 file is embedded as the TrueType or OpenType font it holds. A
+                    style given none is drawn in <code>regular</code>; code stays in Courier unless <code>mono</code> is given. Words
+                    are shaped by the font (ligatures, Arabic joining, Indic conjuncts), and a right-to-left line starts at the right
+                    edge. A font that cannot be read (a damaged one, a collection such as a <code>.ttc</code>), or whose glyphs to
+                    be drawn cannot be read or written into the PDF, fails the conversion (<code>PDF_GENERATION_FAILED</code>).
                     Needs the optional peer dependency <code>@pdf-lib/fontkit</code>.</td>
             </tr>
             <tr>
                 <td><code>fallbackFonts</code></td>
                 <td><code>(Uint8Array | ArrayBuffer)[]</code></td>
                 <td><code>[]</code></td>
-                <td>Native engine: more font files, tried in order for each character the fonts before them lack, so one
-                    document can mix scripts. Given without <code>fonts</code>, text stays in the Standard-14 fonts and these
-                    draw only what those lack.</td>
+                <td>Native engine: more font files (TrueType, OpenType, WOFF, WOFF2), tried in order for each character the
+                    fonts before them lack, so one document can mix scripts. Given without <code>fonts</code>, text stays in the
+                    Standard-14 fonts and these draw only what those lack. A character is drawn by a font that has a glyph of
+                    outlines for it: the Standard-14 fonts have no <code>₹</code> (U+20B9), <code>₽</code> (U+20BD) or emoji; of
+                    Fontsource's files, Noto Sans has both signs in its <code>latin-ext</code> file and neither in its
+                    <code>latin</code> one, and Noto Sans Devanagari has <code>₹</code> but not <code>₽</code>. Emoji are drawn by a
+                    monochrome font of outlines such as Noto Emoji; a color emoji font (Noto Color Emoji, Apple Color Emoji) is drawn
+                    from color images or layers the engine does not draw, so its emoji are counted with the characters no font has,
+                    and a color font none of whose characters has an outline is reported (<code>INVALID_CONFIG_VALUE</code>) and
+                    not used.</td>
             </tr>
             <tr>
                 <td><code>subsetFonts</code></td>
                 <td><code>boolean</code></td>
                 <td><code>true</code></td>
-                <td>Native engine: embed only the glyphs used of each font given; <code>false</code> embeds the whole files. An
-                    OpenType font of CFF outlines is embedded whole either way.</td>
+                <td>Native engine: embed only the glyphs used of each font given; <code>false</code> embeds whole fonts (a WOFF
+                    or WOFF2 file as the font it holds). An OpenType font of CFF outlines, or a font with color layers
+                    (<code>COLR</code>), is embedded whole either way.</td>
             </tr>
             <tr>
                 <td><code>tagged</code></td>
@@ -776,10 +787,13 @@ await ast.to('md', {
             (<code>bounds</code>), the slide's background colour, and its speaker notes on the slide's notes page. A chart
             is a table of its data in the chart's place.</li>
         <li><strong>A PDF</strong> becomes a slide for each page, at the pages' most common size (a page of another size is
-            scaled into it, centred). Each paragraph is a text box where the page set it, its lines broken and spaced as on the page,
+            scaled into it, centred). Each paragraph is a text box where the page set it, its lines broken and spaced as on the page
+            (each line on the baseline the page drew it on, where the runs' <code>bounds.baseline</code> give it),
             in its runs' fonts, sizes and colours; a paragraph set beside a floating table or picture is a box for each
             group of its lines. Tables keep their measured row heights and their cells' shading, pictures their places,
-            and footnotes and a page's notes are at the foot of their page.</li>
+            and footnotes and a page's notes are at the foot of their page. A page's invisible text (a scan's recognised
+            words laid over its picture, <code>TextFormatting.invisible</code>) is written fully transparent: not seen,
+            still there to select and search. A table whose text is all invisible is drawn without rules (its cells' text in their places where the page gave them).</li>
         <li><strong>Any other document</strong> flows onto 16:9 slides: a slide for each heading of the first two levels,
             titled by it, with the text under it as bullets (lower headings bold), carried on to more slides of the same
             title where it does not fit. Text before the first heading is under the document's title, from its metadata.
@@ -816,7 +830,9 @@ await ast.to('md', {
                     slide's background under its text; <code>null</code> or <code>undefined</code> for one without. Give a
                     PDF's pages drawn without their text, and the slides look as the pages did (shapes, gradients and
                     charts included) with the text over them to edit; a page's tables are then their cells' text in place over
-                    the picture, which holds their rules. A flowing document's slides take them in order. The CLI takes
+                    the picture, which holds their rules. The page's pictures are placed over the background as objects of
+                    their own too, so a picture the background also holds is there twice and moving one uncovers its copy
+                    beneath. A flowing document's slides take them in order. The CLI takes
                     picture files: <code>--pptxConfig.backgrounds=a.png,b.png</code>.</td>
             </tr>
         </tbody>
@@ -846,7 +862,9 @@ await ast.to('md', {
                     slide's background under its text; <code>null</code> or <code>undefined</code> for one without. Give a
                     PDF's pages drawn without their text, and the slides look as the pages did (shapes, gradients and
                     charts included) with the text over them to edit; a page's tables are then their cells' text in place over
-                    the picture, which holds their rules. A flowing document's slides take them in order. The CLI takes
+                    the picture, which holds their rules. The page's pictures are placed over the background as objects of
+                    their own too, so a picture the background also holds is there twice and moving one uncovers its copy
+                    beneath. A flowing document's slides take them in order. The CLI takes
                     picture files: <code>--odpConfig.backgrounds=a.png,b.png</code>.</td>
             </tr>
         </tbody>

@@ -126,7 +126,7 @@ export enum OfficeWarningType {
     REPEATED_CONTENT_LIMIT_EXCEEDED = 'REPEATED_CONTENT_LIMIT_EXCEEDED',
     /** A DOCX alternative-format chunk (`w:altChunk`) could not be read (its part is missing, of a format not read, a DOCX inside a DOCX chunk, or unreadable: not a ZIP, no document part, nested too deep); its content is not in the AST, and the rest of the document is */
     ALT_CHUNK_NOT_READ = 'ALT_CHUNK_NOT_READ',
-    /** A part of the document was not read, and what it holds is not in the AST: an EPUB chapter its package lists that is missing from the archive or encrypted; or, in a PPTX, the presentation's slide list or relationships, or the relationships of a notes page or a slide master, that are not XML */
+    /** A part of the document was not read, and what it holds is not in the AST: an EPUB chapter its package lists that is missing from the archive or encrypted; in a PPTX, the presentation's slide list or relationships, or the relationships of a notes page or a slide master, that are not XML; or, in a PDF, an XObject whose text pdf.js could not read (with its page) */
     CONTENT_PART_NOT_READ = 'CONTENT_PART_NOT_READ',
     /** A metadata override could not be represented in the destination format's vocabulary */
     METADATA_NOT_REPRESENTABLE = 'METADATA_NOT_REPRESENTABLE',
@@ -150,7 +150,7 @@ export enum OfficeWarningType {
     PDF_STRUCT_TREE_UNRELIABLE = 'PDF_STRUCT_TREE_UNRELIABLE',
     /** A fifth or more of a PDF's characters (of at least 50) are unmappable glyphs (broken/missing ToUnicode); extracted text is likely garbage */
     PDF_TEXT_ENCODING_SUSPECT = 'PDF_TEXT_ENCODING_SUSPECT',
-    /** A PDF yielded essentially no text; it is very likely a scanned/image-only document needing OCR */
+    /** A PDF yielded essentially no text: it is very likely a scanned/image-only document needing OCR, or, when a CMap its fonts need could not be had (see `PDF_ASSET_UNAVAILABLE`), its text is in those fonts */
     PDF_NO_TEXT_EXTRACTED = 'PDF_NO_TEXT_EXTRACTED',
     /** A PDF's bookmark outline was cut short by the depth/size cap or could not be read; `ast.auxiliary.outline` holds only what was recovered */
     PDF_OUTLINE_TRUNCATED = 'PDF_OUTLINE_TRUNCATED',
@@ -158,6 +158,14 @@ export enum OfficeWarningType {
     PDF_CONTENT_LIMIT_EXCEEDED = 'PDF_CONTENT_LIMIT_EXCEEDED',
     /** pdf.js could not start in a separate process (see `pdfParserConfig.separateProcess`), so it runs in this one */
     PDF_SEPARATE_PROCESS_UNAVAILABLE = 'PDF_SEPARATE_PROCESS_UNAVAILABLE',
+    /**
+     * A file pdf.js needed for a PDF could not be had: a CMap (the text of the fonts using it is
+     * missing) or an image decoder (pictures needing it are not decoded). Raised once per file per
+     * document, with the first page that needed it; the message names the file, why (it is missing,
+     * reading it failed, or `allowRemoteAssets` is false and it would have come from the built-in CDN
+     * address) and the option to set (`pdfCMapUrl` or `pdfDecoderUrl`). The rest of the document is read.
+     */
+    PDF_ASSET_UNAVAILABLE = 'PDF_ASSET_UNAVAILABLE',
     /** `ocr: true` was set without `extractAttachments: true`; OCR runs over extracted images (in every format), so no OCR was performed */
     OCR_REQUIRES_ATTACHMENTS = 'OCR_REQUIRES_ATTACHMENTS',
     /** A config option was passed that this version does not recognize (e.g. a key renamed in a major release); it had no effect */
@@ -377,15 +385,18 @@ export interface CommonOfficeParserConfig {
     maxPasswordAttempts?: number;
     /**
      * Whether the library may fall back to the addresses it has built in for files it loads at run
-     * time: the pdf.js worker (`pdfWorkerSrc`, in the browser, and in Node when the installed worker
-     * cannot be found) and Tesseract's worker, core and language data (`ocrConfig.workerPath`,
-     * `corePath`, `langPath`), all on a public CDN.
+     * time: the pdf.js worker (`pdfWorkerSrc`), pdf.js's CMaps (`pdfCMapUrl`) and image decoders
+     * (`pdfDecoderUrl`), in the browser and in Node when the installed pdfjs-dist cannot be found, and
+     * Tesseract's worker, core and language data (`ocrConfig.workerPath`, `corePath`, `langPath`), all
+     * on a public CDN.
      *
      * Set false for an application that must make no request to another site: a parse that would use
-     * one of those defaults rejects with `REMOTE_ASSET_BLOCKED`, naming the option to set, in place of
-     * fetching it. An address you pass yourself is used as given, wherever it points. HTML and PDF
-     * written from an AST parsed with false also name no chart script address unless
-     * `htmlConfig.chartJsSrc` is set.
+     * the worker's or Tesseract's default rejects with `REMOTE_ASSET_BLOCKED`, naming the option to set,
+     * in place of fetching it. A CMap or decoder is fetched only when a document needs one, so a parse
+     * that would fetch one from its default fetches nothing and goes on without it, with a
+     * `PDF_ASSET_UNAVAILABLE` warning naming the option. An address you pass yourself is used as given,
+     * wherever it points. HTML and PDF written from an AST parsed with false also name no chart script
+     * address unless `htmlConfig.chartJsSrc` is set.
      *
      * Default is true.
      */
@@ -492,6 +503,44 @@ export interface CommonOfficeParserConfig {
      */
     pdfWorkerSrc?: string;
     /**
+     * The folder (ending in '/'; one is added if missing) holding pdf.js's packed CMaps, the
+     * `cmaps/` folder of `pdfjs-dist` at the version the library uses. pdf.js reads the text of a
+     * font a PDF does not embed through one of these when the font names a predefined CJK encoding
+     * (UniJIS-UTF16-H, 90ms-RKSJ-H...); without it every character in such a font is lost. Only the
+     * CMaps a document needs are read, each once, at most 4 MB and 15 seconds each, and a folder that
+     * keeps a document waiting 15 seconds in all is asked nothing more for it. One that cannot
+     * be had raises `PDF_ASSET_UNAVAILABLE` (once per document, with the first page that needed it),
+     * and the rest of the document is read.
+     *
+     * In Node the installed package's own folder is used, unless this is set to another address (a
+     * path, or a `file:` or `http(s):` address). In the browser it defaults to
+     * `https://cdn.jsdelivr.net/npm/pdfjs-dist@6.2.108/cmaps/`; a page with a Content Security Policy,
+     * or one that must work offline, sets it to a copy of that folder it hosts (and allows the address
+     * in `connect-src`). The slim browser bundle has no default: there, set it to read such text.
+     * Not fetched from its default when `allowRemoteAssets` is false.
+     */
+    pdfCMapUrl?: string;
+    /**
+     * The folder (ending in '/'; one is added if missing) holding pdf.js's image decoders, the `wasm/`
+     * folder of `pdfjs-dist` at the version the library uses: `jbig2.wasm` (JBIG2 and CCITT fax
+     * pictures, common in scanned documents) and `openjpeg.wasm` (JPEG 2000), each with a JavaScript
+     * fallback beside it (`*_nowasm_fallback.js`) that pdf.js's worker loads itself where WebAssembly
+     * cannot run (a Content Security Policy without `'wasm-unsafe-eval'`). Without them such
+     * pictures cannot be decoded. Only the decoders a document needs are read, each once, at most 4 MB
+     * and 15 seconds each, and a folder that keeps a document waiting 15 seconds in all is asked
+     * nothing more for it. One that cannot be had raises `PDF_ASSET_UNAVAILABLE` (once per document,
+     * with the first page that needed it), and each picture that then could not be decoded an
+     * `IMAGE_EXTRACTION_FAILED`.
+     *
+     * In Node the installed package's own folder is used, unless this is set to another address (a
+     * path, or a `file:` or `http(s):` address). In the browser it defaults to
+     * `https://cdn.jsdelivr.net/npm/pdfjs-dist@6.2.108/wasm/`; a page with a Content Security Policy,
+     * or one that must work offline, sets it to a copy of that folder it hosts (and allows the address
+     * in `connect-src`). The slim browser bundle has no default: there, set it to decode such pictures.
+     * Not fetched from its default when `allowRemoteAssets` is false.
+     */
+    pdfDecoderUrl?: string;
+    /**
      * Flag to include break nodes for layout breaks in the AST. Default is false.
      * Applies to Word page, column and last-rendered-page breaks (`w:br w:type`, `w:lastRenderedPageBreak`),
      * ODF (`fo:break-before`/`fo:break-after`, `text:soft-page-break`) and LaTeX (`\newpage`, `\clearpage`),
@@ -499,8 +548,10 @@ export interface CommonOfficeParserConfig {
      * node: Word's `w:br` (text wrapping) and `w:cr`, ODF's `text:line-break`, HTML's `<br>`, a Markdown hard break; so are HTML and
      * Markdown's `<hr>`/`---` (a `thematic`/`page` break). This flag does not gate those. Nor does it gate
      * a section's start (a break with BreakMetadata.section: a Word, RTF or ODF text document's next
-     * section): that is the document's structure, and always a node (none where nothing comes after it).
-     * Text and Markdown output show a section's start as nothing, HTML as a new page in print.
+     * section, a PDF's page of another size) or the `'section'` breaks around an ODF section set in columns
+     * of its own: that is the document's structure, and always a node (none where nothing comes after it).
+     * Text and Markdown output show a section's start as nothing, HTML as a new page in print (nothing
+     * for a `'section'` break).
      */
     includeBreakNodes?: boolean;
     /**
@@ -750,6 +801,17 @@ export interface PdfParserConfig {
      */
     maxTimeMs?: number;
     /**
+     * The most pixels (width times height) a picture in a PDF may have to be extracted, when
+     * `extractAttachments` is on. A few bytes of a compressed picture can declare dimensions that
+     * decode to gigabytes, so pdf.js leaves out a larger picture without decoding it; each is reported
+     * with `IMAGE_EXTRACTION_FAILED` (with its page), naming this option. Raise it for scans at high
+     * resolution (an A3 page at 600 dpi is about 42 million pixels). `Infinity` is no limit; a negative
+     * or non-numeric value is reported (`INVALID_CONFIG_VALUE`) and the default used.
+     *
+     * Default is 40000000.
+     */
+    maxImagePixels?: number;
+    /**
      * Run pdf.js in a separate process (Node only). pdf.js reads a PDF's content streams itself, and a
      * 100 KB file can hold a stream that inflates to a string pdf.js turns into gigabytes before any of
      * it reaches the parser: in this process that ends the host with a fatal out-of-memory error no
@@ -985,6 +1047,12 @@ export interface OfficeIssue {
     code: OfficeWarningType | OfficeErrorType;
     /** Optional additional context or original error object. */
     details?: any;
+    /**
+     * The page of the PDF being read that the issue is on (1-based), where the reader knows it: a
+     * picture that could not be extracted or decoded, a page or its links that could not be read, an
+     * object a page waited for, and the page a content budget ran out on. The message names it too.
+     */
+    page?: number;
 }
 
 /**
@@ -1625,8 +1693,9 @@ export interface PdfGeneratorConfig {
      */
     engine?: 'html' | 'native';
     /**
-     * Fonts the `'native'` engine draws in, each the bytes of a TrueType or OpenType file (`.ttf`,
-     * `.otf`), one per style. Without them the engine draws in the Standard-14 Helvetica and Courier
+     * Fonts the `'native'` engine draws in, each the bytes of a TrueType, OpenType, WOFF or WOFF2 file
+     * (`.ttf`, `.otf`, `.woff`, `.woff2`; a web font is embedded as the TrueType or OpenType font it
+     * holds), one per style. Without them the engine draws in the Standard-14 Helvetica and Courier
      * fonts, which have Western European characters only: every other character is drawn as `?` and
      * reported in one `CONTENT_NOT_REPRESENTABLE` warning. A style given no font is drawn in `regular`
      * when that is given (so bold text is not bold unless `bold` is given too); code stays in Courier
@@ -1634,10 +1703,13 @@ export interface PdfGeneratorConfig {
      * `fallbackFonts`, then in the Standard-14 font of the style.
      *
      * Embedding a font needs the optional peer dependency `@pdf-lib/fontkit`. A file that cannot be
-     * read as a font fails the conversion with `PDF_GENERATION_FAILED`; a value that is not a file's
-     * bytes (a file name, an empty file), or `fonts` given as anything but an object of styles, is
-     * reported (`INVALID_CONFIG_VALUE`) and the style drawn as if none were given, and a style name not
-     * listed here is reported as `UNRECOGNIZED_CONFIG_OPTION`. Ignored by the `'html'` engine.
+     * read as a font (a damaged one, a collection of fonts such as a `.ttc`), or one whose glyphs to be
+     * drawn cannot be read or written into the PDF, fails the conversion with `PDF_GENERATION_FAILED`,
+     * naming it. A value that is not a file's bytes (a file name, an empty file), `fonts` given as
+     * anything but an object of styles, or a color font none of whose characters has an outline (see
+     * `fallbackFonts`), is reported (`INVALID_CONFIG_VALUE`) and the style drawn as if none were given,
+     * and a style name not listed here is reported as `UNRECOGNIZED_CONFIG_OPTION`. Ignored by the
+     * `'html'` engine.
      *
      * Defaults to no fonts.
      */
@@ -1651,9 +1723,25 @@ export interface PdfGeneratorConfig {
     /**
      * More fonts for the `'native'` engine, tried in order for each character the style's own font and
      * `fonts.regular` lack, so one document can mix scripts (Latin, Devanagari, Chinese) by listing a
-     * font for each. Each is the bytes of a TrueType or OpenType file. Given with no `fonts`, text
-     * stays in the Standard-14 fonts (bold and italic included) and these draw only the characters
-     * those lack.
+     * font for each. Each is the bytes of a TrueType, OpenType, WOFF or WOFF2 file. Given with no
+     * `fonts`, text stays in the Standard-14 fonts (bold and italic included) and these draw only the
+     * characters those lack.
+     *
+     * A character is drawn by the first font whose glyph for it draws something. A font whose glyph
+     * for it is empty is passed over, and a character no font draws is drawn as `?` and reported with
+     * the characters no font has: an empty glyph is a font's defect, or, in a color font, the stand-in
+     * for a color glyph. A character blank by design (a space, a control or format character, the
+     * Braille blank cell U+2800) is drawn by the first font that has it, and so is a combining mark
+     * that a font substituting glyphs as it shapes (`GSUB`, `morx`) has with the letter before it (an
+     * invisible virama that stacks the next letter). The Standard-14 fonts have neither the rupee
+     * sign `₹` (U+20B9) nor the ruble sign `₽` (U+20BD), nor any emoji; a font must be given for
+     * them, and which characters a font has is that font's (of Fontsource's files, Noto
+     * Sans has both signs in its `latin-ext` file and neither in its `latin` one, and Noto Sans
+     * Devanagari has `₹` but not `₽`). Emoji are drawn by a monochrome font of outlines such as Noto
+     * Emoji. A color emoji font (Noto Color Emoji, Apple Color Emoji) draws them from color images or
+     * layers that the engine does not draw: its emoji are counted with the characters no font has, and
+     * a color font none of whose characters has an outline is reported (`INVALID_CONFIG_VALUE`) and
+     * not used.
      *
      * Words are shaped by the font (ligatures, Arabic joining, Indic conjuncts) and a right-to-left
      * line is laid out from the right edge, its words in visual order. Text of the Indic and Southeast
@@ -1667,9 +1755,11 @@ export interface PdfGeneratorConfig {
     fallbackFonts?: (Uint8Array | ArrayBuffer)[];
     /**
      * Embed only the glyphs the document uses of each font given in `fonts` and `fallbackFonts`
-     * (`'native'` engine). Set false to embed whole font files, for a font whose subset a viewer does
-     * not draw. An OpenType font of CFF outlines (`.otf` starting `OTTO`) is embedded whole either way:
-     * its subset is not one viewers draw. Defaults to true.
+     * (`'native'` engine). Set false to embed whole fonts, for a font whose subset a viewer does not
+     * draw; a WOFF or WOFF2 file is embedded as the TrueType or OpenType font it holds either way. An
+     * OpenType font of CFF outlines (`.otf` starting `OTTO`) is embedded whole either way: its subset
+     * is not one viewers draw. So is a font with color layers (`COLR`), which fontkit does not subset.
+     * Defaults to true.
      */
     subsetFonts?: boolean;
     /**
@@ -1868,14 +1958,21 @@ export interface PptxGeneratorConfig {
     /**
      * A picture for each page (PNG or JPEG bytes, in page order; null or undefined for a page without
      * one), drawn as its slide's background under its text: a PDF's page drawn without its text, so its
-     * shapes, backgrounds, charts and gradients look as they did, with its text over it to edit.
+     * shapes, backgrounds, charts and gradients look as they did, with its text over it to edit. The
+     * page's pictures are placed over it as objects of their own too, so a picture the background also
+     * holds is there twice, and moving one uncovers its copy beneath. A page's invisible text (a scan's
+     * recognised words, TextFormatting.invisible) is written fully transparent, so it is not seen twice.
      */
     backgrounds?: (Uint8Array | null | undefined)[];
 }
 
 /** Configuration options for ODP (OpenDocument presentation) generation, as {@link PptxGeneratorConfig}'s. */
 export interface OdpGeneratorConfig {
-    /** A picture for each page (PNG or JPEG bytes, in page order), under its slide's text. */
+    /**
+     * A picture for each page (PNG or JPEG bytes, in page order), under its slide's text, as
+     * {@link PptxGeneratorConfig.backgrounds}: the page's pictures are placed over it as objects of their own
+     * too, and its invisible text is written fully transparent.
+     */
     backgrounds?: (Uint8Array | null | undefined)[];
 }
 
@@ -2840,6 +2937,16 @@ export interface TextFormatting {
      * @example "center", "right"
      */
     alignment?: TextAlignment;
+
+    /**
+     * The text is drawn invisibly, to be found and copied but not seen: a PDF's text in rendering mode
+     * 3 or 7, as a scan's recognised text is laid over its picture. Slide output (PPTX, ODP) writes it
+     * fully transparent and both PDF engines draw it unseen (the native engine in rendering mode 3, the
+     * 'html' engine transparent), a table of it without its rules, so a scan's page still looks like
+     * the scan with its words there to find; other outputs write it as text. (Text an author hid is
+     * another thing, and is not marked so.)
+     */
+    invisible?: boolean;
 }
 
 /**
@@ -3465,8 +3572,9 @@ export interface BreakMetadata {
 
     /**
      * On a page break that starts a section of the document (a Word or RTF section, an ODF page of another
-     * style): its number (1 for the second section) and its pages' setup (size and margins where they are
-     * set, its columns, how it numbers its pages). Always a node, whatever `includeBreakNodes` says, but
+     * style, a PDF page of another size or turned, before its `page` node, its setup its size alone): its
+     * number (1 for the second section) and its pages' setup (size and margins where they are set, its
+     * columns, how it numbers its pages). Always a node, whatever `includeBreakNodes` says, but
      * for a section with nothing in it after the document's last text, which is none. (A break with a
      * section number starts a section; an author's page break has none.)
      */
@@ -3603,6 +3711,16 @@ export interface NodeBounds {
     width: number;
     /** Box height. */
     height: number;
+    /**
+     * Distance from the page's top edge to the text's baseline, on a run of level text (PDF), from the
+     * text matrix it is drawn with; a run set a little askew (within 15 degrees, as a scan's text layer)
+     * has the baseline at its start. The box runs from the font's ascent above the baseline to its
+     * descent below it (the font's own metrics, or 0.8 and 0.2 of its size where it has none), so they
+     * are `baseline - y` and `y + height - baseline`. Absent on text that is turned on the page as it is
+     * seen (a rotated run, or any run of a page with a `/Rotate`), on container nodes, and with
+     * `ignorePageGeometry`.
+     */
+    baseline?: number;
 }
 
 /**
@@ -3881,7 +3999,8 @@ export interface OfficeMetadata {
     /**
      * The size and margins of the document's pages (its first section's, where sections differ: each
      * later one's is on the page break that starts it, BreakMetadata.pageSetup): a Word document's
-     * section, an ODF document's page style, a presentation's slide size, a sheet's print setup.
+     * section, an ODF document's page style, a presentation's slide size, a sheet's print setup, a PDF's
+     * first page (its size alone: a PDF has no margins, so a writer's own are used).
      */
     pageSetup?: PageSetup;
     /** Document-wide default formatting settings (font, size, color). */

@@ -30,6 +30,9 @@ import { OfficeErrorType } from '../../src/types';
 import { buildTaggedNodes } from '../../src/parsers/pdf/structTree';
 import { computeDocContext } from '../../src/parsers/pdf/textLayout';
 import { MarkedContent } from '../../src/parsers/pdf/actualText';
+import { CffOutlines, nativeUnbrotli, sfntOf, TrueTypeOutlines } from '../../src/generators/pdf/fontFiles';
+import { cffTable, charString, EMPTY } from '../helpers/cffFontWriter';
+import * as zlib from 'zlib';
 
 let passed = 0;
 let failed = 0;
@@ -3422,6 +3425,7 @@ async function parserHardeningTests() {
     const outlined = outlinedRun.result;
     check('pdf: bookmarks naming pages deep in a long page tree are resolved within maxTimeMs', !outlined.error && outlinedRun.within && outlined.codes.includes('PDF_CONTENT_LIMIT_EXCEEDED'), `${outlinedRun.ms}ms ${deepOutline.length} bytes ${outlined.codes} ${outlined.error}`);
     await pdfProcessTests({ pdfFrom, flate, pdfForms, drawnOften, parseQuiet, files });
+    await pdfAssetTests();
 
     // Tables write within bounds however ragged or spanned: rows padded to the widest (a 4 KB DOCX,
     // 100 million positions), a staircase of rows each spanning a thousand below (a 1.5 KB EPUB, 500 MB
@@ -4189,6 +4193,23 @@ async function pdfProcessTests(h: {
     let cut = { error: '', text: '' } as { error: string; text: string };
     await linear('pdf: a ruled table of rows drawn as one string across 56 rules is read', async () => { cut = await read(cutPage(n(76))); });
     check('pdf: a table of rows drawn across its rules keeps its text', !cut.error && cut.text.includes('Cut page') && cut.text.includes('w55'), cut.error || cut.text.slice(0, 80));
+    // A page of thousands of small tables between lines of prose: the row just above each (its header's first
+    // line) is found by halving the page's baselines, not by reading every line of the page for each table.
+    const tablesPage = (count: number) => {
+        const pitch = 1.6, height = Math.ceil(count * 4 * pitch) + 20;
+        let y = height - 10, body = 'BT /F1 1 Tf\n';
+        for (let t = 0; t < count; t++) {
+            for (let r = 0; r < 3; r++, y -= pitch) for (let c = 0; c < 8; c++) body += `1 0 0 1 ${10 + c * 20} ${y.toFixed(2)} Tm (c${c}) Tj\n`;
+            body += `1 0 0 1 10 ${y.toFixed(2)} Tm (This is a long line of prose that separates the tables) Tj\n`;
+            y -= pitch;
+        }
+        body += 'ET\n';
+        return pdfFrom(['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [5 0 R] /Count 1 >>', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>', flate(Buffer.from(body)),
+            `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 220 ${height}] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>`]);
+    };
+    let tabled = { error: '', text: '' } as { error: string; text: string };
+    await linear('pdf: a page of 2,000 small tables between lines of prose is read', async () => { tabled = await read(tablesPage(n(2000))); });
+    check('pdf: a page of small tables keeps its text', !tabled.error && tabled.text.includes('c7') && tabled.text.includes('prose'), tabled.error || tabled.text.slice(0, 80));
     // A page's marked content is read for its ActualText (see actualText): in time in proportion to its
     // operators, and within its bound on what it inflates (a stream of zeros inflating far past it).
     const markedPage = (body: Buffer) => pdfFrom(['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [5 0 R] /Count 1 >>', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>', flate(body),
@@ -4379,11 +4400,221 @@ async function pdfProcessTests(h: {
 }
 
 /**
+ * The files pdf.js loads for a PDF (its CMaps and image decoders) are read only as asked for by name,
+ * from inside their folder, bounded in size and time, never from the built-in CDN address under
+ * `allowRemoteAssets: false`; and nothing waiting on one outlives its bound or the parse's abortSignal.
+ */
+async function pdfAssetTests() {
+    console.log('\n=== PDF assets: CMaps and image decoders ===');
+    const { PdfAssetSession, MAX_ASSET_BYTES } = await import('../../src/parsers/pdf/pdfAssets');
+    const { DEFAULT_OFFICE_PARSER_CONFIG, DEFAULT_PDF_CMAP_URL, DEFAULT_PDF_DECODER_URL } = await import('../../src/defaults');
+    const { pathToFileURL } = await import('url');
+    const http = await import('http');
+    const fixture = path.join(__dirname, '..', 'files', 'pdf', 'cjk_ccitt_jpx.pdf');
+    const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'officeparser-assets-'));
+    const cmaps = path.join(folder, 'cmaps');
+    fs.mkdirSync(cmaps);
+    fs.writeFileSync(path.join(folder, 'Outside.bcmap'), 'outside');
+    fs.writeFileSync(path.join(cmaps, 'Small-H.bcmap'), 'small');
+    fs.writeFileSync(path.join(cmaps, 'Huge-H.bcmap'), Buffer.alloc(MAX_ASSET_BYTES + 1));
+    const session = (urls: { cMapUrl: string; wasmUrl: string }, blocked = false) => {
+        const warnings: any[] = [];
+        const config = { ...DEFAULT_OFFICE_PARSER_CONFIG, onWarning: (issue: any) => warnings.push(issue) } as any;
+        const assets = new PdfAssetSession({
+            cMapUrl: { url: urls.cMapUrl, option: 'pdfCMapUrl', blocked },
+            wasmUrl: { url: urls.wasmUrl, option: 'pdfDecoderUrl', blocked },
+        }, config, 40_000_000);
+        return { assets, warnings };
+    };
+    const outcome = async (run: () => Promise<Uint8Array>): Promise<string> => { try { return `read ${(await run()).length}`; } catch (e: any) { return String(e?.message); } };
+    try {
+        const local = session({ cMapUrl: `${pathToFileURL(cmaps).href}/`, wasmUrl: `${pathToFileURL(folder).href}/` });
+        check('pdf assets: a CMap in its folder is read', (await outcome(() => local.assets.fetchAsset({ kind: 'cMapUrl', filename: 'Small-H.bcmap' }))) === 'read 5');
+        const escaped = await outcome(() => local.assets.fetchAsset({ kind: 'cMapUrl', filename: '../Outside.bcmap' }));
+        check('pdf assets: a name leading out of the folder is refused', !escaped.startsWith('read'), escaped);
+        const kind = await outcome(() => local.assets.fetchAsset({ kind: 'standardFontDataUrl', filename: 'FoxitSans.pfb' }));
+        check('pdf assets: a kind of file not loaded is refused', !kind.startsWith('read'), kind);
+        const named = await Promise.all(['qcms_bg.wasm', 'jbig2_nowasm_fallback.js', '/etc/passwd'].map(filename => outcome(() => local.assets.fetchAsset({ kind: 'wasmUrl', filename }))));
+        check('pdf assets: a file that is not one of the decoders is refused', named.every(o => !o.startsWith('read')), named.join(' | '));
+        const huge = await outcome(() => local.assets.fetchAsset({ kind: 'cMapUrl', filename: 'Huge-H.bcmap' }));
+        check('pdf assets: a file past the size limit is refused and reported', !huge.startsWith('read') && local.warnings.some(w => w.code === 'PDF_ASSET_UNAVAILABLE' && w.details?.reason === 'failed' && w.details?.asset === 'Huge-H.bcmap'), `${huge} ${JSON.stringify(local.warnings.map(w => w.details))}`);
+        check('pdf assets: refused names and kinds are not reported as missing files', local.warnings.length === 1, local.warnings.map(w => w.details?.asset).join());
+
+        // Under allowRemoteAssets: false the built-in CDN address is never asked; a document needing a file says so.
+        const originalFetch = globalThis.fetch;
+        let fetches = 0;
+        globalThis.fetch = (async () => { fetches++; throw new Error('no fetch'); }) as any;
+        try {
+            const blocked = session({ cMapUrl: DEFAULT_PDF_CMAP_URL, wasmUrl: DEFAULT_PDF_DECODER_URL }, true);
+            const refused = await Promise.all([
+                outcome(() => blocked.assets.fetchAsset({ kind: 'cMapUrl', filename: 'UniJIS-UTF16-H.bcmap' })),
+                outcome(() => blocked.assets.fetchAsset({ kind: 'wasmUrl', filename: 'jbig2.wasm' })),
+            ]);
+            const reasons = blocked.warnings.filter(w => w.code === 'PDF_ASSET_UNAVAILABLE').map(w => `${w.details.asset} ${w.details.reason}`);
+            check('pdf assets: under allowRemoteAssets false the CDN is not asked, and each file needed is reported', fetches === 0 && refused.every(o => !o.startsWith('read')) && reasons.join() === 'UniJIS-UTF16-H.bcmap blocked,jbig2.wasm blocked' && blocked.warnings.every(w => /allowRemoteAssets/.test(w.message)), `${fetches} fetches, ${reasons}`);
+            check('pdf assets: under allowRemoteAssets false pdf.js is given no decoder address to import a fallback from', blocked.assets.documentOptions().wasmUrl === undefined);
+            // The address a caller gives is used as given, through fetch().
+            const given = session({ cMapUrl: 'https://cmaps.example/', wasmUrl: '' });
+            await outcome(() => given.assets.fetchAsset({ kind: 'cMapUrl', filename: 'UniJIS-UTF16-H.bcmap' }));
+            check('pdf assets: an address the caller gives is fetched', fetches === 1, `${fetches} fetches`);
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+
+        // A server that never answers: an abort ends the parse at once, and without one the file's own time bound does.
+        const hanging = http.createServer(() => { /* never answers */ });
+        await new Promise<void>(resolve => hanging.listen(0, '127.0.0.1', () => resolve()));
+        const address = `http://127.0.0.1:${(hanging.address() as any).port}/`;
+        try {
+            for (const separateProcess of [true, false]) {
+                const abortedRun = await withinTime(5000, async () => {
+                    try { await OfficeParser.parseOffice(fixture, { extractAttachments: true, onWarning: () => { }, abortSignal: AbortSignal.timeout(500), pdfCMapUrl: address, pdfDecoderUrl: address, pdfParserConfig: { separateProcess } } as any); return 'parsed'; } catch (e: any) { return String(e?.name); }
+                });
+                check(`pdf assets: an abort ends a parse waiting on a file that never comes (separateProcess ${separateProcess})`, abortedRun.within && abortedRun.result === 'AbortError', `${abortedRun.ms}ms ${abortedRun.result}`);
+            }
+            // A server trickling a byte a second, alongside: a file that timed out is not asked for again,
+            // one asked for twice while it is read is read once, and once the folder has kept the document
+            // waiting its 15 s, the other files are not asked of it (each font naming a CMap it could not
+            // have asked anew, 15 s a font).
+            const asked: string[] = [];
+            const trickling = http.createServer((request, response) => {
+                asked.push(String(request.url));
+                response.writeHead(200, { 'content-type': 'application/octet-stream' });
+                const beat = setInterval(() => { response.write(Buffer.from([0])); }, 1000);
+                request.on('close', () => clearInterval(beat));
+            });
+            await new Promise<void>(resolve => trickling.listen(0, '127.0.0.1', () => resolve()));
+            const slowRun = (async () => {
+                const slow = session({ cMapUrl: `http://127.0.0.1:${(trickling.address() as any).port}/cmaps/`, wasmUrl: '' });
+                const first = await Promise.all([1, 2].map(() => outcome(() => slow.assets.fetchAsset({ kind: 'cMapUrl', filename: 'UniJIS-UTF16-H.bcmap' }))));
+                const started = performance.now();
+                const after = await Promise.all(['UniJIS-UTF16-H.bcmap', 'UniJIS-UTF16-V.bcmap', '90ms-RKSJ-H.bcmap'].map(filename => outcome(() => slow.assets.fetchAsset({ kind: 'cMapUrl', filename }))));
+                return { first, after, afterMs: Math.round(performance.now() - started), warnings: slow.warnings };
+            })();
+            const warnings: any[] = [];
+            const timedRun = await withinTime(25_000, async () => {
+                warnings.length = 0;
+                const ast = await OfficeParser.parseOffice(fixture, { extractAttachments: true, onWarning: (issue: any) => warnings.push(issue), pdfCMapUrl: address } as any) as OfficeParserAST;
+                return ast.attachments.length;
+            });
+            const timedOut = warnings.find(w => w.code === 'PDF_ASSET_UNAVAILABLE');
+            check('pdf assets: a file that never comes is given up after its time bound, and the rest of the document is read', timedRun.within && timedRun.result === 2 && timedOut?.details?.reason === 'failed' && timedOut?.page === 1 && /longer than/.test(timedOut.message),
+                `${timedRun.ms}ms, ${timedRun.result} pictures, ${timedOut?.message}`);
+            const notText = warnings.find(w => w.code === 'PDF_NO_TEXT_EXTRACTED');
+            check('pdf assets: a document whose CMap could not be had is not called scanned', !!notText && /UniJIS-UTF16-H/.test(notText.message) && !/scanned/.test(notText.message), notText?.message);
+            try {
+                const slow = await slowRun;
+                const reported = slow.warnings.filter(w => w.code === 'PDF_ASSET_UNAVAILABLE').map(w => w.details?.asset);
+                check('pdf assets: a file asked for twice while it is read is read once', asked.length === 1 && slow.first.every(o => /longer than 15 s/.test(o) || /could not load/.test(o)), `${asked.join()} ${slow.first.join(' | ')}`);
+                check('pdf assets: after a folder kept a document waiting its time, no file is asked of it again, and each is refused at once', asked.length === 1 && slow.afterMs < 1000 && slow.after.every(o => !o.startsWith('read')),
+                    `${asked.length} asked, ${slow.afterMs}ms, ${slow.after.join(' | ')}`);
+                check('pdf assets: each file a slow folder could not give is reported once', reported.join() === 'UniJIS-UTF16-H.bcmap,UniJIS-UTF16-V.bcmap,90ms-RKSJ-H.bcmap' && /in all/.test(slow.warnings[1]?.message), `${reported.join()} ${slow.warnings[1]?.message}`);
+            } finally {
+                trickling.closeAllConnections?.();
+                trickling.close();
+            }
+        } finally {
+            hanging.closeAllConnections?.();
+            hanging.close();
+        }
+    } finally {
+        fs.rmSync(folder, { recursive: true, force: true });
+    }
+}
+
+/**
  * The HTML reader's tree building (implied ends, formatting carried across paragraphs, foster
  * parenting, declarations) and the EPUB writer's paragraph pairing, on hostile shapes: each in time
  * linear in the input, checked by timing two sizes four times apart (linear work takes about four
  * times as long, quadratic sixteen).
  */
+/**
+ * Fonts given to the native PDF engine are unpacked (WOFF, WOFF2) and their outlines checked in time
+ * linear in the file: fonts may come from untrusted hands.
+ */
+async function fontFileTests() {
+    console.log('\n=== Font files: unpacking and outlines in linear time ===');
+    const refused = (run: () => unknown): string => { try { run(); return 'accepted'; } catch (e: any) { return String(e?.message); } };
+    // A WOFF of many tables, each reading one zlib stream of 4 MB and declaring one byte more than its
+    // compressed length: each was inflated whole (gigabytes from kilobytes), cut short and accepted.
+    let woffOutcome = '';
+    await linear('font: a WOFF of many tables sharing one inflating stream is refused', () => {
+        const stored = zlibSync(new Uint8Array(4 << 20));
+        const count = n(1600), dataAt = 44 + count * 20;
+        const view = new DataView(new ArrayBuffer(dataAt + stored.length));
+        view.setUint32(0, 0x774F4646); view.setUint32(4, 0x00010000); view.setUint32(8, dataAt + stored.length); view.setUint16(12, count);
+        for (let i = 0; i < count; i++) {
+            const at = 44 + i * 20;
+            view.setUint32(at, 0x41000000 + i); view.setUint32(at + 4, dataAt); view.setUint32(at + 8, stored.length); view.setUint32(at + 12, stored.length + 1);
+        }
+        const bytes = new Uint8Array(view.buffer);
+        bytes.set(stored, dataAt);
+        woffOutcome = refused(() => sfntOf(bytes, () => { throw new Error('no Brotli for a WOFF'); }));
+    });
+    check('font: a WOFF table inflating past its declared length is refused', woffOutcome.includes('inflates to more than'), woffOutcome);
+    // A WOFF2 of many tables of their own tags: each tag was looked for among all the tables before it.
+    const unbrotli = nativeUnbrotli();
+    if (unbrotli) {
+        let woff2Outcome = '';
+        await linear('font: a WOFF2 of many tables is unpacked', () => {
+            const count = n(64000), entries: number[] = [];
+            for (let i = 0; i < count; i++) entries.push(0x3F, 0x41, (i >> 16) & 0xFF, (i >> 8) & 0xFF, i & 0xFF, 4);
+            const data = zlib.brotliCompressSync(new Uint8Array(count * 4));
+            const view = new DataView(new ArrayBuffer(48 + entries.length + data.length));
+            view.setUint32(0, 0x774F4632); view.setUint32(4, 0x00010000); view.setUint32(8, view.byteLength); view.setUint16(12, count);
+            view.setUint32(16, 12 + 16 * count + 4 * count); view.setUint32(20, data.length);
+            const bytes = new Uint8Array(view.buffer);
+            bytes.set(entries, 48); bytes.set(data, 48 + entries.length);
+            woff2Outcome = refused(() => sfntOf(bytes, () => unbrotli));
+        });
+        check('font: a WOFF2 of many tables unpacks', woff2Outcome === 'accepted', woff2Outcome);
+    }
+    // One glyph made of many components, that many glyphs are made of: it was read again for each.
+    await linear('font: glyphs made of one glyph of many components are checked', () => {
+        const components = n(30000), users = n(6000);
+        const glyphs: number[][] = [[]];
+        const composite = (parts: number[]) => {
+            const out = [0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0];
+            parts.forEach((id, i) => out.push(0, i < parts.length - 1 ? 0x20 : 0, id >> 8, id & 0xFF, 0, 0));
+            return out;
+        };
+        glyphs.push(composite(new Array(components).fill(0)));
+        for (let i = 0; i < users; i++) glyphs.push(composite([1]));
+        const glyf = new Uint8Array(glyphs.reduce((sum, g) => sum + g.length, 0));
+        const loca = new DataView(new ArrayBuffer(4 * (glyphs.length + 1)));
+        let at = 0;
+        glyphs.forEach((g, i) => { loca.setUint32(4 * i, at); glyf.set(g, at); at += g.length; });
+        loca.setUint32(4 * glyphs.length, at);
+        const outlines = new TrueTypeOutlines(glyf, new Uint8Array(loca.buffer), true, undefined);
+        for (let id = 2; id < glyphs.length; id++) if (!outlines.reads(id)) throw new Error(`glyph ${id} could not be read`);
+    });
+    // CFF glyphs, read from their charstrings without running them: many of stem hints, a hint mask and
+    // arithmetic that draw nothing, one long one of the same, and one calling subroutines nested 26 deep,
+    // each calling the next twice (fontkit, running them, took time doubling with each level).
+    let cffOutcome = '';
+    await linear('font: CFF charstrings are read', () => {
+        const stems = (op: string) => charString(...Array.from({ length: 48 }, (_, i) => i % 2 ? 10 : 20 * i), op);
+        const busy = [...stems('hstemhm'), ...stems('vstemhm'), ...charString('hintmask', [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], 1, 2, 'add', 'dup', 'exch', 'drop', 'drop', 10, 20, 'rmoveto', 'endchar')];
+        const long = stems('hstemhm');
+        const unit = charString('hintmask', [0xFF, 0x05, 0x08], 1, 2, 'add', 'drop', 5, 'hmoveto');
+        for (let i = 0; i < n(40000); i++) for (const byte of unit) long.push(byte);
+        long.push(...charString('endchar'));
+        const subrs = Array.from({ length: 26 }, (_, level) => level < 25 ? charString(level + 1 - 107, 'callsubr', level + 1 - 107, 'callsubr', 'return') : charString(0, 0, 'rmoveto', 10, 10, 'rlineto', 'return'));
+        const charStrings = [EMPTY, long, charString(-107, 'callsubr', 'endchar'), ...Array.from({ length: n(20000) }, () => busy)];
+        const outlines = new CffOutlines(cffTable({ charStrings, subrs }));
+        const wrong = charStrings.findIndex((_, id) => !outlines.reads(id) || outlines.draws(id) !== (id === 2));
+        cffOutcome = wrong < 0 ? 'each read' : `glyph ${wrong}: ${outlines.reads(wrong) ? 'read' : 'unread'}, ${outlines.draws(wrong) ? 'drawn' : 'empty'}`;
+    });
+    check('font: CFF glyphs of hints alone are empty, and the one calling subroutines drawn', cffOutcome === 'each read', cffOutcome);
+    // A stack as deep as FreeType and HarfBuzz hold (513 operands) is read, whatever the specification's
+    // limit: fontTools writes CFF2 glyphs that deep with no maxstack, and such a glyph was judged
+    // unreadable and drawn in another font. One deeper is not read.
+    const lineOf = (operands: number) => charString(10, 10, 'rmoveto', ...Array.from({ length: operands }, (_, i) => (i % 2 ? 5 : -5)), 'rlineto', 'endchar');
+    const deep = new CffOutlines(cffTable({ charStrings: [EMPTY, lineOf(298), lineOf(512), lineOf(514)] }));
+    check('font: a CFF glyph of up to 513 operands is read and drawn, and one of more is not read',
+        deep.reads(1) && deep.draws(1) && deep.reads(2) && deep.draws(2) && !deep.reads(3), [1, 2, 3].map(id => `${deep.reads(id)}/${deep.draws(id)}`).join(' '));
+}
+
 async function htmlReadingTests() {
     console.log('- HTML reading and EPUB writing (linear time)...');
     // (Each size's faster of two runs, so a pause in a busy machine is not read as the work growing.)
@@ -4479,6 +4710,7 @@ async function main() {
     await errorRoutingTests();
     await parserHardeningTests();
     await htmlReadingTests();
+    await fontFileTests();
 
     console.log(`\n${failed === 0 ? '✓' : '✗'} Sanitization tests: ${passed} passed, ${failed} failed`);
     if (failed > 0) process.exit(1);

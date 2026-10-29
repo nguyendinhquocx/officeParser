@@ -5995,6 +5995,27 @@ async function testSectionRoundTrips(): Promise<void> {
         '<text:p>Before.</text:p><text:section text:name="S" text:style-name="Sect1"><text:p>In.</text:p><text:p text:style-name="P2">Turned.</text:p></text:section><text:p>After.</text:p>',
         layouts, '<style:master-page style:name="Standard" style:page-layout-name="pm1"/><style:master-page style:name="Other" style:page-layout-name="nope"/>'), { fileType: 'odt', includeBreakNodes: true } as any) as OfficeParserAST;
     assert.deepStrictEqual(noLayout.content.map(n => n.type === 'break' ? `B:${(n.metadata as any).breakType}` : n.text), ['Before.', 'B:section', 'In.', 'B:page', 'Turned.', 'B:section', 'After.'], 'ODT: a section turning to a page style of no layout is read');
+    // A section in columns of its own is the document's structure, as a Word continuous section is: its breaks
+    // are nodes whatever includeBreakNodes says. Its columns are geometry: none under ignorePageGeometry.
+    const columnsShape = (a: OfficeParserAST) => a.content.map(n => n.type === 'break' ? `B:${(n.metadata as any).breakType}:${(n.metadata as any).pageSetup?.columns?.count ?? 1}` : n.text);
+    const columnsOdt = odtOf('<style:style style:name="Sect1" style:family="section"><style:section-properties><style:columns fo:column-count="2" fo:column-gap="0.2in"/></style:section-properties></style:style>',
+        '<text:p>Before.</text:p><text:section text:name="S" text:style-name="Sect1"><text:p>In.</text:p></text:section><text:p>After.</text:p>',
+        layouts, '<style:master-page style:name="Standard" style:page-layout-name="pm1"/>');
+    const columnsRead = await OfficeParser.parseOffice(columnsOdt, { fileType: 'odt' } as any) as OfficeParserAST;
+    assert.deepStrictEqual(columnsShape(columnsRead), ['Before.', 'B:section:2', 'In.', 'B:section:1', 'After.'], 'ODT: a section in columns of its own is read without includeBreakNodes');
+    const columnsFlat = await OfficeParser.parseOffice(columnsOdt, { fileType: 'odt', ignorePageGeometry: true } as any) as OfficeParserAST;
+    assert.deepStrictEqual(columnsShape(columnsFlat), ['Before.', 'In.', 'After.'], 'ODT: no column section breaks under ignorePageGeometry');
+    // Its columns reach every writer that sets columns, and the flowing outputs show nothing for them.
+    const columnsDocx = strFromU8(unzipSync(new Uint8Array((await OfficeGenerator.generate(columnsRead, 'docx')).value as any))['word/document.xml']);
+    assert.ok(/<w:cols w:num="2"/.test(columnsDocx) && (columnsDocx.match(/<w:type w:val="continuous"\/>/g) || []).length === 2, 'DOCX: an ODT section in columns is a continuous section of its columns');
+    const columnsOdtOut = strFromU8(unzipSync(new Uint8Array((await OfficeGenerator.generate(columnsRead, 'odt')).value as any))['content.xml']);
+    assert.ok(/fo:column-count="2"/.test(columnsOdtOut) && /<text:section [^>]*>[^]*In\.[^]*<\/text:section>/.test(columnsOdtOut), 'ODT: an ODT section in columns is written as a section of its columns');
+    assert.ok(/\\cols2/.test(String((await OfficeGenerator.generate(columnsRead, 'rtf')).value)), 'RTF: an ODT section in columns is written in its columns');
+    assert.ok(/\\begin\{multicols\}\{2\}[^]*In\.[^]*\\end\{multicols\}/.test(String((await OfficeGenerator.generate(columnsRead, 'tex')).value)), 'LaTeX: an ODT section in columns is in multicols');
+    assert.strictEqual(String((await OfficeGenerator.generate(columnsRead, 'text')).value).trim(), 'Before.\nIn.\nAfter.', 'text: an ODT section in columns shows nothing');
+    assert.strictEqual(String((await OfficeGenerator.generate(columnsRead, 'md')).value).trim(), 'Before.\n\nIn.\n\nAfter.', 'Markdown: an ODT section in columns shows nothing');
+    const columnsHtml = String((await OfficeGenerator.generate(columnsRead, 'html', { htmlConfig: { standalone: false } } as any)).value);
+    assert.ok(!/<hr/.test(columnsHtml) && columnsHtml.includes('In.'), 'HTML: an ODT section in columns shows nothing');
 
     // A section that sets no page is on the document's: Letter in every writer, landscape closed in LaTeX.
     const sizeless = { type: 'docx', metadata: { pageSetup: page }, attachments: [], content: [para('Portrait.'), { type: 'break', metadata: { breakType: 'page', section: 1, pageSetup: { width: 792, height: 612 } } }, para('Landscape.'),
@@ -7148,6 +7169,146 @@ async function testSpreadsheetWriters(): Promise<void> {
 }
 
 /**
+ * A PDF's invisible text (TextFormatting.invisible: a scan's recognised words over its picture): fully
+ * transparent in PPTX and ODP, drawn in text rendering mode 3 by the native PDF engine and transparent by the
+ * 'html' one, and plain text everywhere else; in each, still there to read back.
+ */
+async function testInvisibleTextWriters(): Promise<void> {
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const run = (text: string, x: number, baseline: number, invisible: boolean, more: object = {}) => ({ type: 'text', text, formatting: { size: '12pt', ...(invisible ? { invisible: true } : {}) }, bounds: { x, y: baseline - 9.6, width: text.length * 6, height: 12, baseline }, ...more });
+    const cell = (text: string, x: number) => ({ type: 'cell', text, children: [run(text, x, 330, true)], bounds: { x, y: 318, width: 80, height: 16 } });
+    const scan = { type: 'pdf', metadata: {}, attachments: [{ type: 'image', name: 'scan.png', mimeType: 'image/png', extension: 'png', data: png }], content: [{ type: 'page', metadata: { pageWidth: 612, pageHeight: 792 }, children: [
+        { type: 'image', bounds: { x: 0, y: 0, width: 612, height: 792 }, metadata: { attachmentName: 'scan.png' } },
+        { type: 'paragraph', text: 'Invisibleword alpha', bounds: { x: 72, y: 90.4, width: 120, height: 12 }, children: [run('Invisibleword alpha', 72, 100, true)] },
+        { type: 'paragraph', text: 'Shownword Invisiblegamma', bounds: { x: 72, y: 150.4, width: 150, height: 12 }, children: [run('Shownword', 72, 160, false), run(' Invisiblegamma', 126, 160, true)] },
+        { type: 'list', text: 'Invisibleitem', bounds: { x: 90, y: 200.4, width: 90, height: 12 }, metadata: { listType: 'unordered', indentation: 0 }, children: [run('Invisibleitem', 90, 210, true)] },
+        { type: 'paragraph', text: 'Invisiblelink', bounds: { x: 72, y: 250.4, width: 80, height: 12 }, children: [run('Invisiblelink', 72, 260, true, { metadata: { link: 'https://example.com/' } })] },
+        { type: 'table', bounds: { x: 72, y: 318, width: 160, height: 16 }, children: [{ type: 'row', children: [cell('Invisiblecell', 72), cell('Invisibleother', 152)] }] },
+    ] }] } as any;
+    const words = ['Invisibleword', 'Invisiblegamma', 'Invisibleitem', 'Invisiblelink', 'Invisiblecell', 'Shownword'];
+    const parts = (bytes: Uint8Array) => Object.entries(unzipSync(bytes)).filter(([k]) => /\.(xml|x?html|rels)$/.test(k)).map(([, v]) => strFromU8(v)).join('\n');
+    const readBack = async (bytes: Uint8Array, fileType: string) => JSON.stringify(await OfficeParser.parseOffice(Buffer.from(bytes), { fileType, ocr: false, pdfParserConfig: { separateProcess: false } } as any));
+
+    // PPTX: each invisible run (and an invisible item's bullet, written as text) transparent; the shown one not.
+    const pptx = unzipSync(new Uint8Array((await OfficeGenerator.generate(scan, 'pptx')).value as Uint8Array));
+    const slide = strFromU8(pptx['ppt/slides/slide1.xml']);
+    const runOf = (xml: string, text: string) => [...xml.matchAll(/<a:r>([\s\S]*?)<\/a:r>/g)].map(m => m[1]).find(r => r.includes(`<a:t>${text}`)) ?? '';
+    for (const text of ['Invisibleword alpha', ' Invisiblegamma', 'Invisibleitem', 'Invisiblelink', 'Invisiblecell', '•\t']) assert.ok(/<a:solidFill><a:srgbClr val="000000"><a:alpha val="0"\/><\/a:srgbClr><\/a:solidFill>/.test(runOf(slide, text)), `PPTX: "${text}" is fully transparent; got ${runOf(slide, text)}`);
+    assert.ok(!/alpha/.test(runOf(slide, 'Shownword')), 'PPTX: shown text keeps its colour');
+    assert.ok(!/<a:buChar/.test(slide) && /hlinkClr[^>]*val="tx"/.test(runOf(slide, 'Invisiblelink')), 'PPTX: an invisible item has no bullet a reader draws in its own colour; an invisible link keeps its transparent colour');
+    // A scan's table, all of it invisible, is its cells' text in their places: no table, so no rules over the scan.
+    assert.ok(!/<a:tbl>/.test(slide), 'PPTX: a table of invisible text over a scan is no table of rules');
+    const pptxBack = await readBack((await OfficeGenerator.generate(scan, 'pptx')).value as Uint8Array, 'pptx');
+    assert.ok(words.every(w => pptxBack.includes(w)), 'PPTX: the invisible text reads back');
+    // ODP: a transparent span, in the namespace LibreOffice reads it in.
+    const odp = strFromU8(unzipSync(new Uint8Array((await OfficeGenerator.generate(scan, 'odp')).value as Uint8Array))['content.xml']);
+    const styleOf = (text: string) => { const name = new RegExp(`<text:span text:style-name="([^"]+)">${text}`).exec(odp)?.[1]; return new RegExp(`<style:style style:name="${name}"[^>]*><style:text-properties([^>]*)/>`).exec(odp)?.[1] ?? ''; };
+    for (const text of ['Invisibleword alpha', ' Invisiblegamma', 'Invisibleitem', 'Invisiblecell', '•<text:tab/>']) assert.ok(/fo:color="#000000" loext:opacity="0%"/.test(styleOf(text)), `ODP: "${text}" is fully transparent; got ${styleOf(text)}`);
+    assert.ok(!/opacity/.test(styleOf('Shownword')) && /xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0"/.test(odp), 'ODP: shown text is not transparent; the opacity\'s namespace is declared');
+    assert.ok(words.every(w => odp.includes(w)), 'ODP: the invisible text is written');
+    // Native PDF: drawn in rendering mode 3, still read back; the shown word not.
+    const native = (await OfficeGenerator.generate(scan, 'pdf', { pdfConfig: { engine: 'native' } } as any)).value as Uint8Array;
+    const loaded = await PDFDocument.load(native);
+    let ops = '';
+    for (const [, obj] of loaded.context.enumerateIndirectObjects()) if (obj instanceof PDFRawStream) { try { ops += strFromU8(unzlibSync(obj.contents)); } catch { /* not Flate */ } }
+    assert.strictEqual((ops.match(/\b3 Tr\b/g) ?? []).length >= 6, true, `native PDF: each invisible run, the invisible item's marker and cells drawn in mode 3; got ${(ops.match(/\b3 Tr\b/g) ?? []).length}`);
+    const nativeBack = await readBack(native, 'pdf');
+    assert.ok(words.every(w => nativeBack.includes(w)), 'native PDF: the invisible text reads back');
+    // The 'html' engine's page: invisible text (and an invisible item's marker) transparent; HTML output shows it.
+    const { HtmlGenerator } = await import('../src/generators/HtmlGenerator');
+    const printed = (await new HtmlGenerator(scan, { htmlConfig: { standalone: true } } as any, { drawsInvisibleText: true }).generate()).value as string;
+    assert.ok(/<span class="op-invisible-text">(?:<span[^>]*>)?Invisibleword alpha</.test(printed) && /<li[^>]*class="op-invisible-marker"/.test(printed) && /\.op-invisible-marker::marker \{ color: transparent !important/.test(printed) && !/op-invisible-text">Shownword/.test(printed),
+        `html engine: invisible text and an invisible item's marker are drawn transparent; got ${printed.match(/<style>\.op[^<]*<\/style>|<li[^>]*>.{0,80}|<p[^>]*>.{0,80}/g)}`);
+    // An invisible item's marker alone is unseen: its nested items, which its <li> holds, stay seen.
+    const item = (text: string, invisible: boolean, indentation: number, listType = 'unordered') => ({ type: 'list', text, metadata: { listType, indentation }, children: [{ type: 'text', text, formatting: invisible ? { invisible: true } : {} }] });
+    const nested = { type: 'pdf', metadata: {}, attachments: [], content: [item('Hiddenparent', true, 0), item('Seenchild', false, 1), item('Hiddennumber', true, 0, 'ordered'), item('Seennumbered', false, 1, 'ordered')] } as any;
+    const nestedPrinted = (await new HtmlGenerator(nested, { htmlConfig: { standalone: true } } as any, { drawsInvisibleText: true }).generate()).value as string;
+    const carriers = [...nestedPrinted.matchAll(/<(\w+)[^>]*class="[^"]*\bop-invisible-text\b/g)].map(m => m[1]);
+    assert.ok(carriers.length > 0 && carriers.every(t => t === 'span') && /<li>Seenchild/.test(nestedPrinted) && /<li>Seennumbered/.test(nestedPrinted) && !/op-invisible-text::marker/.test(nestedPrinted),
+        `html engine: an invisible item hides its own text and marker, not its nested items; got ${carriers} ${nestedPrinted.match(/<li[^>]*>[^<]*/g)}`);
+    // PPTX: an item of some invisible text and some shown keeps its bullet, whichever comes first.
+    for (const runs of [[['Hiddenlead', true], [' Shown rest', false]], [['Shownlead', false], [' hidden rest', true]]] as [string, boolean][][]) {
+        const mixed = { type: 'docx', metadata: {}, attachments: [], content: [{ type: 'list', metadata: { listType: 'unordered', indentation: 0 }, children: runs.map(([text, invisible]) => ({ type: 'text', text, formatting: invisible ? { invisible: true } : {} })) }] } as any;
+        const deck = parts((await OfficeGenerator.generate(mixed, 'pptx')).value as Uint8Array);
+        assert.ok(/<a:buChar/.test(deck), `PPTX: an item of shown and invisible text keeps its bullet (${runs[0][0]} first)`);
+    }
+    // A table whose text is all invisible draws no rules in any writer that draws them; one shown cell keeps them.
+    const tableOf = (shown: boolean) => ({ type: 'docx', metadata: {}, attachments: [], content: [
+        { type: 'heading', metadata: { level: 1 }, children: [{ type: 'text', text: 'Invisibletitle', formatting: { invisible: true } }] },
+        { type: 'table', children: [{ type: 'row', children: ['Cellone', 'Celltwo'].map((text, i) => ({ type: 'cell', children: [{ type: 'paragraph', children: [{ type: 'text', text, formatting: shown && i === 0 ? {} : { invisible: true } }] }] })) }] },
+    ] }) as any;
+    for (const shown of [false, true]) {
+        const pptxTable = parts((await OfficeGenerator.generate(tableOf(shown), 'pptx')).value as Uint8Array);
+        const odpTable = parts((await OfficeGenerator.generate(tableOf(shown), 'odp')).value as Uint8Array);
+        assert.strictEqual(/BFBFBF/.test(pptxTable), shown, `PPTX: a table's rules ${shown ? 'kept for a shown cell' : 'left out where all its text is invisible'}`);
+        if (!shown) assert.ok(/<a:lnL w="9525"><a:noFill\/>/.test(pptxTable) && /fo:border="none"/.test(odpTable) && !/BFBFBF/.test(odpTable), 'PPTX and ODP: an invisible table\'s rules are none');
+        else assert.ok(/BFBFBF/.test(odpTable), 'ODP: a table with a shown cell keeps its rules');
+        const nativeTable = await PDFDocument.load((await OfficeGenerator.generate(tableOf(shown), 'pdf', { pdfConfig: { engine: 'native' } } as any)).value as Uint8Array);
+        let tableOps = '';
+        for (const [, obj] of nativeTable.context.enumerateIndirectObjects()) if (obj instanceof PDFRawStream) { try { tableOps += strFromU8(unzlibSync(obj.contents)); } catch { /* not Flate */ } }
+        assert.strictEqual(/ RG\b/.test(tableOps), shown, `native PDF: a table's rules ${shown ? 'drawn for a shown cell' : 'left out where all its text is invisible'}`);
+        const htmlTable = (await new HtmlGenerator(tableOf(shown), { htmlConfig: { standalone: true } } as any, { drawsInvisibleText: true }).generate()).value as string;
+        assert.strictEqual(/class="table-container op-invisible-block"/.test(htmlTable), !shown, `html engine: a table's rules ${shown ? 'kept' : 'unseen'}`);
+        if (!shown) assert.ok(/<h1[^>]*class="[^"]*op-invisible-block/.test(htmlTable), "html engine: an invisible heading's rule is unseen");
+    }
+    // Every other writer: the invisible text is its content, written as text.
+    for (const format of ['html', 'md', 'text', 'rtf', 'csv', 'chunks', 'epub', 'docx', 'odt', 'tex', 'xlsx', 'ods'] as const) {
+        const value = (await OfficeGenerator.generate(scan, format)).value as unknown;
+        const out = value instanceof Uint8Array ? parts(value) : typeof value === 'string' ? value : JSON.stringify(value);
+        const expected = format === 'csv' ? ['Invisiblecell'] : words;
+        assert.ok(expected.every(w => out.includes(w)) && !/op-invisible-text|transparent|w:vanish|text:display="none"/.test(out.replace(/background(-color)?: ?transparent/g, '')), `${format}: invisible text is written as text; missing ${expected.filter(w => !out.includes(w))}`);
+    }
+}
+
+/**
+ * A PDF page's paragraph on slides, where its runs have their baselines (NodeBounds.baseline): its lines spaced
+ * from baseline to baseline, its box's top the spacing above its first baseline less a fifth of its size (where
+ * LibreOffice's font-independent spacing then sets that baseline), and an ODP frame asking for that spacing.
+ * Without baselines a paragraph's box is where its bounds put it, as before.
+ */
+async function testSlideBaselines(): Promise<void> {
+    const line = (text: string, baseline: number, size: number) => ({ type: 'text', text, formatting: { size: `${size}pt` }, bounds: { x: 72, y: baseline - 0.72 * size, width: text.length * size / 2, height: 0.93 * size, baseline } });
+    const page = (withBaselines: boolean) => ({ type: 'pdf', metadata: {}, attachments: [], content: [{ type: 'page', metadata: { pageWidth: 612, pageHeight: 792 }, children: [
+        { type: 'paragraph', bounds: { x: 72, y: 91.36, width: 300, height: 40 }, children: [line('First line of three', 100, 12), line(' second line', 114.4, 12), line(' third line', 128.8, 12)] },
+        { type: 'paragraph', bounds: { x: 72, y: 282.72, width: 300, height: 22.32 }, children: [line('A single line', 300, 24)] },
+    ].map(p => withBaselines ? p : { ...p, children: p.children.map(r => ({ ...r, bounds: { ...r.bounds, baseline: undefined } })) }) }] }) as any;
+    const pptx = strFromU8(unzipSync(new Uint8Array((await OfficeGenerator.generate(page(true), 'pptx')).value as Uint8Array))['ppt/slides/slide1.xml']);
+    const boxes = pptx.split('<p:sp>').slice(1).map(sp => [Number(/<a:off x="\d+" y="(\d+)"\/>/.exec(sp)?.[1]) / 12700, Number(/<a:spcPts val="(\d+)"\/>/.exec(sp)?.[1]) / 100]);
+    // Three lines 14.4 apart: the top 14.4 above the first baseline, less 2.4; one line of 24pt at 1.2 times its size.
+    assert.deepStrictEqual(boxes.map(([y, s]) => [Math.round(y * 100) / 100, s]), [[100 - 14.4 + 2.4, 14.4], [300 - 28.8 + 4.8, 28.8]], `PPTX: a paragraph is placed on its baselines; got ${JSON.stringify(boxes)}`);
+    const odp = strFromU8(unzipSync(new Uint8Array((await OfficeGenerator.generate(page(true), 'odp')).value as Uint8Array))['content.xml']);
+    const frames = [...odp.matchAll(/<draw:frame draw:style-name="(gr\d+)" svg:x="[^"]+" svg:y="([\d.]+)pt"[^>]*><draw:text-box><text:p text:style-name="(P\d+)"/g)];
+    assert.deepStrictEqual(frames.map(f => Number(f[2])), [88, 276], `ODP: a paragraph is placed on its baselines; got ${frames.map(f => f[2])}`);
+    for (const [, graphic, , paragraph] of frames) {
+        assert.ok(new RegExp(`<style:style style:name="${graphic}"[^>]*><style:graphic-properties[^>]*/><style:paragraph-properties style:font-independent-line-spacing="true"/>`).test(odp), 'ODP: its frame spaces its lines independently of the font\'s metrics');
+        assert.ok(new RegExp(`<style:style style:name="${paragraph}"[^>]*><style:paragraph-properties fo:line-height="(14.4|28.8)pt"`).test(odp), 'ODP: its lines are as far apart as the page set them');
+    }
+    // Without baselines: placed from its bounds, spaced as its lines' boxes are, its frame spaced by its font.
+    const before = strFromU8(unzipSync(new Uint8Array((await OfficeGenerator.generate(page(false), 'pptx')).value as Uint8Array))['ppt/slides/slide1.xml']);
+    assert.deepStrictEqual([...before.matchAll(/<a:off x="\d+" y="(\d+)"\/>/g)].slice(1).map(m => Math.round(Number(m[1]) / 127) / 100), [91.36, 282.72], 'PPTX: without baselines a paragraph is placed by its bounds');
+    const odpBefore = strFromU8(unzipSync(new Uint8Array((await OfficeGenerator.generate(page(false), 'odp')).value as Uint8Array))['content.xml']);
+    assert.ok(!odpBefore.includes('font-independent-line-spacing') && /svg:y="91.36pt"/.test(odpBefore), 'ODP: without baselines a paragraph is placed by its bounds, its lines by its font');
+    // A line stands on its body's baseline, not a superscript's whose box is taller (another font's).
+    const body = (text: string, x: number) => ({ type: 'text', text, formatting: { size: '14pt' }, bounds: { x, y: 180.39, width: 60, height: 17.16, baseline: 192.91 } });
+    const raised = { type: 'text', text: '2 ', formatting: { size: '11.5pt', superscript: true }, bounds: { x: 140, y: 177.06, width: 9.63, height: 20.48, baseline: 187.5 } };
+    const supLine = { type: 'pdf', metadata: {}, attachments: [], content: [{ type: 'page', metadata: { pageWidth: 612, pageHeight: 792 }, children: [{ type: 'paragraph', bounds: { x: 72, y: 177.06, width: 140, height: 20.48 }, children: [body('Hello world', 72), raised, body('here', 150)] }] }] } as any;
+    for (const includeFormatting of [true, false]) {
+        const supPptx = strFromU8(unzipSync(new Uint8Array((await OfficeGenerator.generate(supLine, 'pptx', { includeFormatting } as any)).value as Uint8Array))['ppt/slides/slide1.xml']);
+        const supOdp = strFromU8(unzipSync(new Uint8Array((await OfficeGenerator.generate(supLine, 'odp', { includeFormatting } as any)).value as Uint8Array))['content.xml']);
+        const top = Math.round(Number(/<p:sp>[\s\S]*?<a:off x="\d+" y="(\d+)"/.exec(supPptx)?.[1]) / 127) / 100;
+        assert.ok(top === 178.91 && /draw:frame[^>]*svg:y="178.91pt"/.test(supOdp), `PPTX and ODP: a line with a superscript stands on its body's baseline (includeFormatting ${includeFormatting}); got ${top}, ${/draw:frame[^>]*svg:y="([^"]+)"/.exec(supOdp)?.[1]}`);
+    }
+    // A baseline outside its run's box, or a box that is no numbers, places the paragraph by its bounds.
+    const odd = (run: object) => ({ type: 'pdf', metadata: {}, attachments: [], content: [{ type: 'page', metadata: { pageWidth: 612, pageHeight: 792 }, children: [{ type: 'paragraph', bounds: { x: 72, y: 90, width: 300, height: 30 }, children: [{ type: 'text', text: 'Line one', ...run }] }] }] }) as any;
+    for (const [what, run] of [['a baseline far outside its box', { formatting: { size: '12pt' }, bounds: { x: 72, y: 90, width: 60, height: 12, baseline: 1e12 } }], ['a height that is text', { formatting: {}, bounds: { x: 72, y: 90, width: 60, height: '12', baseline: 99 } }]] as [string, object][]) {
+        const oddPptx = strFromU8(unzipSync(new Uint8Array((await OfficeGenerator.generate(odd(run), 'pptx')).value as Uint8Array))['ppt/slides/slide1.xml']);
+        const oddOdp = strFromU8(unzipSync(new Uint8Array((await OfficeGenerator.generate(odd(run), 'odp')).value as Uint8Array))['content.xml']);
+        const [, y, h] = /<p:sp>[\s\S]*?<a:off x="\d+" y="(\d+)"\/><a:ext cx="\d+" cy="(\d+)"/.exec(oddPptx) ?? [];
+        assert.ok(Number(y) / 12700 === 90 && Number(h) / 12700 === 30 && /svg:y="90pt" svg:width="[^"]+" svg:height="30pt"/.test(oddOdp), `PPTX and ODP: ${what} is placed by its paragraph's bounds; got ${Number(y) / 12700}, ${Number(h) / 12700}, ${/svg:y="[^"]+" svg:width="[^"]+" svg:height="[^"]+"/.exec(oddOdp)?.[0]}`);
+    }
+}
+
+/**
  * PPTX and ODP output: a deck written as a deck (its slides, notes and charts, as tables of their data),
  * a PDF's pages as slides with their text where the page set it (lines kept, a paragraph beside a floating
  * table in two boxes, a shaded header cell's colour), a document flowed onto slides (a slide a section,
@@ -7699,6 +7860,289 @@ async function testPdfIdeographLookalikes(): Promise<void> {
     const ast = await OfficeParser.parseOffice(Buffer.from(pdf, 'latin1'), { fileType: 'pdf', ocr: false, pdfParserConfig: { separateProcess: false }, onWarning: () => { } } as any) as OfficeParserAST;
     const text = String((await ast.to('text')).value).trim();
     assert.strictEqual(text, '\u65E5\u672C\u8A9E\u8C48', `look-alike ideographs read as the unified ones; got ${JSON.stringify(text)}`);
+}
+
+/**
+ * A PDF warning about a page says which (`OfficeIssue.page`), so a caller acts on it without reading the
+ * message: a picture pdf.js could not decode (which was dropped with no warning at all), a page that
+ * could not be loaded, links past the annotation budget and a page past the operator budget. A warning
+ * about the whole document has no page.
+ */
+async function testPdfWarningPages(): Promise<void> {
+    const { deflateSync } = await import('zlib');
+    const pdfFrom = (objects: (string | Buffer)[]): Buffer => {
+        const parts: Buffer[] = [Buffer.from('%PDF-1.7\n')];
+        const offsets: number[] = [];
+        let at = parts[0].length;
+        objects.forEach((o, i) => { const b = Buffer.concat([Buffer.from(`${i + 1} 0 obj\n`), typeof o === 'string' ? Buffer.from(o, 'latin1') : o, Buffer.from('\nendobj\n')]); offsets.push(at); at += b.length; parts.push(b); });
+        parts.push(Buffer.from(`xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.map(o => `${String(o).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${at}\n%%EOF\n`));
+        return Buffer.concat(parts);
+    };
+    const stream = (content: Buffer, dict = '') => Buffer.concat([Buffer.from(`<< /Length ${content.length} ${dict} >>\nstream\n`), content, Buffer.from('\nendstream')]);
+    const flate = (content: Buffer, dict = '') => stream(deflateSync(content), `/Filter /FlateDecode ${dict}`);
+    const issues = async (pdf: Buffer, config: object = {}) => {
+        const found: any[] = [];
+        const ast = await OfficeParser.parseOffice(pdf, { fileType: 'pdf', onWarning: (issue: any) => found.push(issue), ...config } as any) as OfficeParserAST;
+        return { ast, found };
+    };
+    const blank = '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>';
+
+    // A JPEG pdf.js cannot decode, drawn twice on page 2 beside one it can: reported once, with its page.
+    const pictures = pdfFrom([
+        '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>', blank,
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Bad 6 0 R /Good 7 0 R >> >> /Contents 5 0 R >>',
+        stream(Buffer.from('q 50 0 0 50 0 0 cm /Bad Do Q q 50 0 0 50 50 0 cm /Bad Do Q q 50 0 0 50 0 50 cm /Good Do Q')),
+        stream(Buffer.from('not a JPEG'), '/Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode'),
+        stream(Buffer.alloc(48, 0x80), '/Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceRGB /BitsPerComponent 8'),
+    ]);
+    const read = await issues(pictures, { extractAttachments: true });
+    const lost = read.found.filter(issue => issue.code === 'IMAGE_EXTRACTION_FAILED');
+    assert.strictEqual(lost.length, 1, `an undecodable picture is reported once; got ${JSON.stringify(read.found.map(i => i.code))}`);
+    assert.strictEqual(lost[0].page, 2, `an undecodable picture's warning names its page; got ${lost[0].page}`);
+    assert.ok(/page 2/.test(lost[0].message) && /could not decode/.test(String(lost[0].details)), `the warning says where and why; got ${lost[0].message} ${lost[0].details}`);
+    assert.strictEqual(read.ast.attachments.length, 1, 'the picture pdf.js decodes is still extracted');
+    const whole = read.found.find(issue => issue.code === 'PDF_NO_TEXT_EXTRACTED');
+    assert.ok(whole && !('page' in whole), 'a warning about the whole document has no page');
+    const withoutPictures = await issues(pictures);
+    assert.ok(!withoutPictures.found.some(issue => issue.code === 'IMAGE_EXTRACTION_FAILED'), 'pictures not asked for are not reported');
+
+    // Page 2 is not in the file.
+    const missing = await issues(pdfFrom([
+        '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R 9 0 R] /Count 2 >>', blank,
+    ]));
+    const notLoaded = missing.found.find(issue => issue.code === 'PAGE_LOAD_FAILED');
+    assert.strictEqual(notLoaded?.page, 2, `a page that cannot be loaded is named; got ${JSON.stringify(missing.found.map(i => [i.code, i.page]))}`);
+
+    // Ten pages sharing a hundred links, past a budget of 50 (plus one per 32 bytes of the file).
+    const links = await issues(pdfFrom([
+        '<< /Type /Catalog /Pages 2 0 R >>', `<< /Type /Pages /Kids [${Array.from({ length: 10 }, (_, i) => `${5 + i} 0 R`).join(' ')}] /Count 10 >>`,
+        '<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /URI /URI (https://example.com/) >> >>', `[${'3 0 R '.repeat(100)}]`,
+        ...Array.from({ length: 10 }, () => '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots 4 0 R >>'),
+    ]), { pdfParserConfig: { maxAnnotations: 50 } });
+    const capped = links.found.find(issue => issue.code === 'ANNOTATION_EXTRACTION_FAILED');
+    assert.ok(capped && Number.isInteger(capped.page) && capped.page > 1 && capped.message.includes(`page ${capped.page}`), `the page the link budget ran out on is named; got ${JSON.stringify(capped)}`);
+
+    // Page 2 sets its text colour far more often than the operator budget allows.
+    const colours = await issues(pdfFrom([
+        '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>', blank,
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 5 0 R >>',
+        flate(Buffer.from('0 0 0 rg 1 0 0 rg '.repeat(20_000))),
+    ]), { pdfParserConfig: { maxOperators: 0 } });
+    const budget = colours.found.find(issue => issue.code === 'PDF_CONTENT_LIMIT_EXCEEDED');
+    assert.strictEqual(budget?.page, 2, `the page the operator budget ran out on is named; got ${JSON.stringify(colours.found.map(i => [i.code, i.page]))}`);
+    // Page 2 draws a 1 MB string through a form two hundred times, past a 100 ms time budget.
+    const long = Buffer.concat([Buffer.from('BT /F1 10 Tf 0 50 Td ('), Buffer.alloc(1_000_000, 'a'), Buffer.from(') Tj ET')]);
+    const slow = await issues(pdfFrom([
+        '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>', blank,
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 6 0 R >> /XObject << /X 7 0 R >> >> /Contents 5 0 R >>',
+        flate(Buffer.from('q /X Do Q\n'.repeat(200))), '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+        flate(long, '/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /Font << /F1 6 0 R >> >>'),
+    ]), { pdfParserConfig: { maxTimeMs: 100, separateProcess: true } });
+    const timed = slow.found.find(issue => issue.code === 'PDF_CONTENT_LIMIT_EXCEEDED');
+    assert.strictEqual(timed?.page, 2, `the page the time budget ran out on is named; got ${JSON.stringify(slow.found.map(i => [i.code, i.page]))}`);
+    console.log('  PDF warning pages: All assertions passed ✓');
+}
+
+/**
+ * The pictures pdf.js leaves out without drawing them are reported, with their page: one larger than
+ * `pdfParserConfig.maxImagePixels` (named, and extracted when the option is raised) and a small inline
+ * picture pdf.js cannot decode, in a separate process and in this one. pdf.js says so only in its
+ * worker's warnings, whose wording a test checks is still in the installed worker. Two PDFs read at once
+ * in this process keep their pictures (pdf.js's decoders followed the document opened last, so one
+ * closing left the other's waiting on it), checked in a fresh process, where no decoder is loaded yet.
+ */
+async function testPdfPicturesLeftOut(): Promise<void> {
+    const { deflateSync } = await import('zlib');
+    const pdfFrom = (objects: (string | Buffer)[]): Buffer => {
+        const parts: Buffer[] = [Buffer.from('%PDF-1.7\n')];
+        const offsets: number[] = [];
+        let at = parts[0].length;
+        objects.forEach((o, i) => { const b = Buffer.concat([Buffer.from(`${i + 1} 0 obj\n`), typeof o === 'string' ? Buffer.from(o, 'latin1') : o, Buffer.from('\nendobj\n')]); offsets.push(at); at += b.length; parts.push(b); });
+        parts.push(Buffer.from(`xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.map(o => `${String(o).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${at}\n%%EOF\n`));
+        return Buffer.concat(parts);
+    };
+    const stream = (content: Buffer, dict = '') => Buffer.concat([Buffer.from(`<< /Length ${content.length} ${dict} >>\nstream\n`), content, Buffer.from('\nendstream')]);
+    // An A3 page scanned at 600 dpi, one bit a pixel (69.6 million pixels), and an inline JPEG that is not one.
+    const [width, height] = [7016, 9921];
+    const scan = pdfFrom([
+        '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Im1 5 0 R >> /Font << /F1 6 0 R >> >> /Contents 4 0 R >>',
+        stream(Buffer.from('q 400 0 0 560 100 100 cm /Im1 Do Q\nq 20 0 0 20 50 50 cm BI /W 10 /H 10 /BPC 8 /CS /RGB /F /DCT ID \xff\xd8\xff\xe0garbagegarbage\xff\xd9 EI Q\nBT /F1 12 Tf 72 40 Td (A scanned page.) Tj ET', 'latin1')),
+        stream(deflateSync(Buffer.alloc(Math.ceil(width / 8) * height, 0xff), { level: 9 }), `/Type /XObject /Subtype /Image /Width ${width} /Height ${height} /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /FlateDecode`),
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    ]);
+    const read = async (config: object) => {
+        const found: any[] = [];
+        const ast = await OfficeParser.parseOffice(scan, { fileType: 'pdf', extractAttachments: true, onWarning: (issue: any) => found.push(issue), ...config } as any) as OfficeParserAST;
+        return { ast, lost: found.filter(issue => issue.code === 'IMAGE_EXTRACTION_FAILED') };
+    };
+    for (const separateProcess of [true, false]) {
+        const { ast, lost } = await read({ pdfParserConfig: { separateProcess } });
+        const where = separateProcess ? 'in a separate process' : 'in this process';
+        assert.strictEqual(ast.attachments.length, 0, `${where}: neither picture is extracted`);
+        assert.ok(lost.length === 2 && lost.every(issue => issue.page === 1), `${where}: both pictures are reported, with their page; got ${JSON.stringify(lost.map(i => [i.page, String(i.details)]))}`);
+        assert.ok(lost.some(issue => /pdfParserConfig\.maxImagePixels \(40000000 pixels\)/.test(String(issue.details))), `${where}: the large picture's warning names the option`);
+        assert.ok(lost.some(issue => /inline picture/.test(String(issue.details))), `${where}: the inline picture's warning says what it was`);
+    }
+    const raised = await read({ pdfParserConfig: { maxImagePixels: 80e6 } });
+    assert.strictEqual(raised.ast.attachments.length, 1, 'with maxImagePixels raised, the large picture is extracted');
+    assert.ok(raised.lost.length === 1 && !/maxImagePixels/.test(String(raised.lost[0].details)), `and only the inline picture is reported; got ${JSON.stringify(raised.lost.map(i => String(i.details)))}`);
+    const untold = await OfficeParser.parseOffice(scan, { fileType: 'pdf', onWarning: (issue: any) => assert.notStrictEqual(issue.code, 'IMAGE_EXTRACTION_FAILED', 'pictures not asked for are not reported') } as any) as OfficeParserAST;
+    assert.strictEqual(untold.attachments.length, 0);
+    const invalid: any[] = [];
+    await OfficeParser.parseOffice(scan, { fileType: 'pdf', onWarning: (issue: any) => invalid.push(issue), pdfParserConfig: { maxImagePixels: -1 } } as any);
+    assert.ok(invalid.some(issue => issue.code === 'INVALID_CONFIG_VALUE' && /maxImagePixels/.test(issue.message)), 'a negative maxImagePixels is reported');
+
+    // pdf.js's own words for what it leaves out, in each worker the library runs.
+    const { PDFJS_WARNINGS } = await import('../src/parsers/pdf/pdfAssets');
+    const pdfjsRoot = path.dirname(path.dirname(path.dirname(require.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs'))));
+    for (const worker of ['legacy/build/pdf.worker.mjs', 'build/pdf.worker.mjs', 'build/pdf.worker.min.mjs']) {
+        const source = fs.readFileSync(path.join(pdfjsRoot, worker), 'utf8');
+        for (const [name, words] of Object.entries(PDFJS_WARNINGS)) {
+            assert.ok(source.includes(words), `pdf.js's ${worker} still words its ${name} warning ${JSON.stringify(words)}`);
+        }
+    }
+
+    // Two at once in a fresh process: the pictures' document opened first, a text one second and done first.
+    const os = await import('os');
+    const childProcess = await import('child_process');
+    const script = path.join(os.tmpdir(), `officeparser-pdf-together-${process.pid}.ts`);
+    fs.writeFileSync(script, [
+        `const { OfficeParser } = require(${JSON.stringify(path.join(__dirname, '..', 'src', 'OfficeParser'))});`,
+        `const config = { extractAttachments: true, onWarning: () => {}, pdfParserConfig: { separateProcess: false } };`,
+        `Promise.all([`,
+        `    OfficeParser.parseOffice(${JSON.stringify(path.join(__dirname, 'files', 'pdf', 'cjk_ccitt_jpx.pdf'))}, config),`,
+        `    OfficeParser.parseOffice(${JSON.stringify(path.join(__dirname, 'files', 'pdf', 'columns_untagged.pdf'))}, config),`,
+        `]).then(([pictures, text]) => { console.log('PICTURES ' + pictures.attachments.length + ' ' + text.attachments.length); process.exit(0); });`,
+    ].join('\n'));
+    let out = '';
+    try {
+        out = childProcess.execFileSync(process.execPath, [...process.execArgv, script], { encoding: 'utf8', timeout: 60_000 });
+    } finally {
+        fs.rmSync(script, { force: true });
+    }
+    assert.ok(/PICTURES 2 0/.test(out), `two PDFs read at once in one process keep their pictures; got ${JSON.stringify(out.trim())}`);
+    console.log('  PDF pictures left out: All assertions passed ✓');
+}
+
+/**
+ * pdf.js in this process has one document open at a time (see takeInProcessTurn in PdfParser), and a
+ * turn is never held while code of the caller's is waited on: an `onPassword` that parses another PDF
+ * first, an `onWarning` that starts one, and OCR (here a worker that parses one before it answers) each
+ * finished, where they waited on themselves for ever; a parse waiting on its `onPassword` held up no
+ * other, and an abort ends that wait. pdf.js's notes about pictures it was told to leave out (every one
+ * when pictures are not extracted) use up no part of the warnings a document may send before one it
+ * reports, in a separate process and in this one. A caller's own "Warning: " lines reach its console
+ * while a PDF is read, and pdf.js's lines do not.
+ */
+async function testPdfInProcessTurns(): Promise<void> {
+    const { deflateSync } = await import('zlib');
+    const pdfFrom = (objects: (string | Buffer)[]): Buffer => {
+        const parts: Buffer[] = [Buffer.from('%PDF-1.7\n')];
+        const offsets: number[] = [];
+        let at = parts[0].length;
+        objects.forEach((o, i) => { const b = Buffer.concat([Buffer.from(`${i + 1} 0 obj\n`), typeof o === 'string' ? Buffer.from(o, 'latin1') : o, Buffer.from('\nendobj\n')]); offsets.push(at); at += b.length; parts.push(b); });
+        parts.push(Buffer.from(`xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.map(o => `${String(o).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${at}\n%%EOF\n`));
+        return Buffer.concat(parts);
+    };
+    const stream = (content: Buffer, dict = '') => Buffer.concat([Buffer.from(`<< /Length ${content.length} ${dict} >>\nstream\n`), content, Buffer.from('\nendstream')]);
+    // Page 1 draws one picture `draws` times; page 2 draws a form XObject that is not a stream, which pdf.js cannot read.
+    const drawnOften = (draws: number) => pdfFrom([
+        '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> /XObject << /I 8 0 R >> >> /Contents 5 0 R >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> /XObject << /Bad 9 0 R >> >> /Contents 6 0 R >>',
+        stream(deflateSync(Buffer.from('BT /F1 12 Tf 72 700 Td (Page one text) Tj ET\n' + 'q 10 0 0 10 72 500 cm /I Do Q\n'.repeat(draws))), '/Filter /FlateDecode'),
+        stream(Buffer.from('BT /F1 12 Tf 72 700 Td (Page two text) Tj ET\n/Bad Do\n')),
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+        stream(deflateSync(Buffer.alloc(16 * 16 * 3, 0x40)), '/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode'),
+        '<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] >>',
+    ]);
+    const inProcess = { pdfParserConfig: { separateProcess: false } };
+    const plain = path.join(__dirname, 'files', 'pdf', 'columns_untagged.pdf');
+    const encrypted = path.join(__dirname, 'files', 'pdf', 'encrypted.pdf');
+    const readPlain = async () => (await OfficeParser.parseOffice(plain, { ...inProcess, onWarning: () => { } } as any) as OfficeParserAST).content.length;
+    // `run`'s outcome, or 'HUNG' after `ms`.
+    const settled = async <T>(ms: number, run: Promise<T>): Promise<T | 'HUNG'> => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try { return await Promise.race([run, new Promise<'HUNG'>(resolve => { timer = setTimeout(() => resolve('HUNG'), ms); })]); } finally { clearTimeout(timer); }
+    };
+    const textOf = (ast: OfficeParserAST) => ast.content.map(n => n.text).join('\n');
+
+    // onPassword parses another PDF in this process before it answers.
+    let innerPages = 0;
+    const nested = await settled(20_000, OfficeParser.parseOffice(encrypted, { ...inProcess, onPassword: async () => { innerPages = await readPlain(); return 'test123'; } } as any)
+        .then(ast => textOf(ast as OfficeParserAST), (e: any) => `rejected ${e?.message}`));
+    assert.ok(innerPages > 0 && typeof nested === 'string' && nested.includes('SECRET CONTENT'), `an onPassword parsing a PDF in this process does not wait on itself; got ${String(nested).slice(0, 80)}, inner ${innerPages}`);
+
+    // While one parse waits on its onPassword, another is read.
+    let answer: ((password: string) => void) | undefined;
+    const waiting = OfficeParser.parseOffice(encrypted, { ...inProcess, onPassword: () => new Promise<string>(resolve => { answer = resolve; }) } as any);
+    for (let i = 0; i < 200 && !answer; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    const beside = await settled(10_000, readPlain());
+    answer?.('test123');
+    assert.ok(typeof beside === 'number' && beside > 0, `a parse waiting on its onPassword holds up no other parse in this process; got ${beside}`);
+    assert.ok(textOf(await waiting as OfficeParserAST).includes('SECRET CONTENT'), 'and the waiting parse goes on with the password given');
+
+    // An abort ends a wait on an onPassword that never answers.
+    const unanswered = await settled(5_000, OfficeParser.parseOffice(encrypted, { ...inProcess, abortSignal: AbortSignal.timeout(300), onPassword: () => new Promise(() => { }) } as any).then(() => 'parsed', (e: any) => String(e?.name)));
+    assert.strictEqual(unanswered, 'AbortError', 'an abort ends a parse waiting on its onPassword');
+
+    // onWarning starts a parse of another PDF in this process at each warning.
+    const started: Promise<number>[] = [];
+    const warned = await settled(20_000, OfficeParser.parseOffice(drawnOften(3), { fileType: 'pdf', ...inProcess, onWarning: () => { started.push(readPlain()); } } as any).then(() => 'parsed', (e: any) => `rejected ${e?.message}`));
+    const fromWarnings = await settled(20_000, Promise.all(started));
+    assert.ok(warned === 'parsed' && started.length > 0 && Array.isArray(fromWarnings) && fromWarnings.every(pages => pages > 0), `parses an onWarning starts in this process are read; got ${warned}, ${started.length} started, ${JSON.stringify(fromWarnings)}`);
+
+    // OCR, by a worker that parses a PDF in this process before it answers.
+    let ocrInner = 0;
+    ocrTestHooks.createWorker = async () => ({
+        recognize: async () => { ocrInner = await readPlain(); return { data: { text: 'RECOGNIZED' } }; },
+        reinitialize: async () => { },
+        terminate: async () => { },
+    });
+    try {
+        const ocred = await settled(20_000, OfficeParser.parseOffice(drawnOften(1), { fileType: 'pdf', ...inProcess, ocr: true, extractAttachments: true, onWarning: () => { } } as any)
+            .then(ast => (ast as OfficeParserAST).attachments.map(a => a.ocrText).join(), (e: any) => `rejected ${e?.message}`));
+        assert.ok(ocrInner > 0 && ocred === 'RECOGNIZED', `OCR that parses a PDF in this process does not wait on its own parse; got ${ocred}, inner ${ocrInner}`);
+    } finally {
+        ocrTestHooks.createWorker = undefined;
+        await terminateOcr();
+    }
+
+    // 1,100 pictures pdf.js is told to leave out (pictures are not extracted), then an XObject it cannot read.
+    const many = drawnOften(1100);
+    for (const separateProcess of [true, false]) {
+        const found: any[] = [];
+        await OfficeParser.parseOffice(many, { fileType: 'pdf', onWarning: (issue: any) => found.push(issue), pdfParserConfig: { separateProcess } } as any);
+        const notRead = found.filter(issue => issue.code === 'CONTENT_PART_NOT_READ');
+        assert.ok(notRead.length === 1 && notRead[0].page === 2, `${separateProcess ? 'in a separate process' : 'in this process'}: an XObject not read after 1,100 pictures left out is reported; got ${JSON.stringify(found.map(i => [i.code, i.page]))}`);
+    }
+
+    // The caller's own "Warning: " lines while a PDF is read in this process, from a timer and from its onWarning.
+    const original = console.warn;
+    const printed: string[] = [];
+    let sent = 0;
+    let sentDuring = 0;
+    let reading = false;
+    const own = "Warning: getTextContent - ignoring XObject: the caller's own line";
+    console.warn = (...args: unknown[]) => { printed.push(String(args[0])); };
+    const timer = setInterval(() => { sent++; if (reading) sentDuring++; console.warn(own); }, 1);
+    const found: any[] = [];
+    try {
+        reading = true;
+        await OfficeParser.parseOffice(many, { fileType: 'pdf', ...inProcess, onWarning: (issue: any) => { found.push(issue); console.warn(`Warning: the caller's onWarning saw ${issue.code}`); } } as any);
+        reading = false;
+    } finally {
+        clearInterval(timer);
+        console.warn = original;
+    }
+    const notOwn = printed.filter(line => line !== own && !line.startsWith("Warning: the caller's onWarning saw"));
+    assert.ok(sentDuring > 0, 'the caller wrote its own lines while the PDF was read');
+    assert.deepStrictEqual(notOwn, [], 'none of pdf.js\'s lines reach the caller\'s console');
+    assert.strictEqual(printed.filter(line => line === own).length, sent, 'every line the caller wrote reached its console');
+    assert.ok(printed.some(line => line === "Warning: the caller's onWarning saw CONTENT_PART_NOT_READ"), 'a line the caller\'s onWarning writes while pdf.js\'s is reported reaches its console');
+    assert.ok(found.filter(issue => issue.code === 'CONTENT_PART_NOT_READ').length === 1 && !found.some(issue => /the caller's own line/.test(issue.message)), `only pdf.js's own line is reported; got ${JSON.stringify(found.map(i => i.message))}`);
+    console.log('  PDF in-process turns: All assertions passed ✓');
 }
 
 /**
@@ -9400,8 +9844,13 @@ async function runTests(): Promise<void> {
         ['PDF ActualText', testPdfActualText],
         ['Spreadsheet writers', testSpreadsheetWriters],
         ['Presentation writers', testPresentationWriters],
+        ['Invisible text in writers', testInvisibleTextWriters],
+        ['Slide text on its baselines', testSlideBaselines],
         ['Markdown cell breaks', testMarkdownCellBreaks],
         ['Markdown attributes', testMarkdownAttributes],
+        ['PDF warning pages', testPdfWarningPages],
+        ['PDF pictures left out', testPdfPicturesLeftOut],
+        ['PDF in-process turns', testPdfInProcessTurns],
         ['Cancellation', testCancellation],
     ];
 
