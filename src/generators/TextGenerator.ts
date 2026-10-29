@@ -5,6 +5,9 @@ import { clampRepeat, median } from '../utils/numberUtils.js';
 import { base64ByteLength } from '../utils/officeGenUtils.js';
 import { trimRepeated } from '../utils/textUtils.js';
 
+/** A letter of a right-to-left script (Hebrew, Arabic, Syriac, Thaana, N'Ko and their presentation forms). */
+const RTL_LETTER = /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/;
+
 /**
  * Separator between table/sheet cells on the paths that don't render an aligned grid (a `table`
  * with `preserveLayout` off, and `sheet`/`row`/`cell`, which never go through `renderTable`).
@@ -391,6 +394,7 @@ export class TextGenerator extends BaseGenerator<'text'> {
             let line = '';
             let prevRight: number | null = null; // right edge (x) of the last placed atom
             let prevCell: number | undefined;
+            let prevText = '';
             for (const a of row) {
                 let col = Math.round((a.x - marginX) / charW);
                 if (col < 0) col = 0;
@@ -398,12 +402,18 @@ export class TextGenerator extends BaseGenerator<'text'> {
                 // The padding comes out of the document's layout budget (as a table's does); past it, a
                 // run is set off by one space.
                 const pad = col - line.length;
-                if (pad > 0 && this.takeLayoutPadding(pad)) {
+                // (A run that touches the one before it in the same cell is the same word or sentence: "example.com"
+                // and its "." are joined, however their columns round. Not where either is right-to-left: such a
+                // run's spaces are drawn at the other edge from where its text holds them, so the runs it touches
+                // may be a word apart, set by their columns as before.)
+                const touching = line.length > 0 && prevRight != null && a.x - prevRight <= 0.25 * charW && (a.cell === undefined || a.cell === prevCell)
+                    && !RTL_LETTER.test(a.text) && !RTL_LETTER.test(prevText);
+                if (pad > 0 && !touching && this.takeLayoutPadding(pad)) {
                     line += ' '.repeat(pad);
-                } else if (pad > 0) {
+                } else if (pad > 0 && !touching) {
                     line += ' ';
                 } else if (line.length > 0) {
-                    // The column is at or before the current line end. Only insert a space when this
+                    // The column is at or before the current line end (or the run touches the one before). Only insert a space when this
                     // atom is separated from the previous one by a real horizontal gap; adjacent runs
                     // (a formatting/link boundary inside a word) must join with no space.
                     // Runs of two table cells are always set apart: a tight table's cells touch
@@ -414,6 +424,7 @@ export class TextGenerator extends BaseGenerator<'text'> {
                 line += a.text;
                 prevRight = a.x + a.w;
                 prevCell = a.cell;
+                prevText = a.text;
             }
             return line.trimEnd();
         });

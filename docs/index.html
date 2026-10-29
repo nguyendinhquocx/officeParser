@@ -3821,9 +3821,9 @@
             <div class="hero-container">
                 <div class="hero-badges">
                     <!-- package-version:start (written from package.json by scripts/sync-site-version.js: do not edit) -->
-                    <a class="badge-link" href="https://github.com/harshankur/officeParser/blob/master/CHANGELOG.md#840---2026-10-28" target="_blank"
-                        rel="noopener" aria-label="officeParser version 8.4.0: see what changed">
-                        <div class="badge badge-version" id="version-badge">v8.4.0</div>
+                    <a class="badge-link" href="https://github.com/harshankur/officeParser/blob/master/CHANGELOG.md#841---2026-10-29" target="_blank"
+                        rel="noopener" aria-label="officeParser version 8.4.1: see what changed">
+                        <div class="badge badge-version" id="version-badge">v8.4.1</div>
                     </a>
                     <!-- package-version:end -->
                     <a id="weekly-badge-link"
@@ -8312,8 +8312,10 @@ ${sectioning.filter(Boolean).join('\n')}
             // visitor's browser asks no one else for them. `week` is the last week's downloads and `total`
             // every download since the package was first published; either may be missing.
             async function updateDownloadStats() {
+                // Rounded down, as the "+" says: a million to two decimals (1.26M+, as npm's 1,263,321 a week),
+                // a thousand whole (845k+).
                 const formatNumber = (num) => {
-                    if (num >= 1000000) return (Math.floor(num / 100000) / 10) + 'M+';
+                    if (num >= 1000000) return (Math.floor(num / 10000) / 100) + 'M+';
                     if (num >= 1000) return Math.floor(num / 1000) + 'k+';
                     return num;
                 };

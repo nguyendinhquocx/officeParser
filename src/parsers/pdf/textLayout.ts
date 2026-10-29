@@ -24,10 +24,15 @@ function roundSize(n: number): number {
     return Math.round(n * 2) / 2;
 }
 
-/** Char-count-weighted mode of run font sizes (rounded to 0.5). */
+/**
+ * Char-count-weighted mode of run font sizes (rounded to 0.5). A form field's value (see RawRun.formField)
+ * counts only among runs that are all values: its size is the field's, set for its box, not the page's.
+ */
 function dominantFontSize(runs: RawRun[]): number {
     const weight = new Map<number, number>();
+    const own = runs.some(r => !r.formField);
     for (const r of runs) {
+        if (own && r.formField) continue;
         const s = roundSize(r.fontSize);
         weight.set(s, (weight.get(s) || 0) + Math.max(1, r.text.length));
     }
@@ -152,8 +157,9 @@ function linePieces(runs: RawRun[], cfg: PdfLayoutConfig): Cluster[] {
     clusters = mergeSuperSubClusters(clusters, maxFontSize);
 
     const gutters = columnGutters(clusters);
+    const headed = headedValues(clusters, cfg);
     return clusters.flatMap(c => {
-        const pieces: Cluster[] = segmentsOf(c.runs, cfg, gutters).map(runs => {
+        const pieces: Cluster[] = segmentsOf(c.runs, cfg, gutters, headed).map(runs => {
             let minX = Infinity, maxX = -Infinity;
             for (const r of runs) { minX = Math.min(minX, r.x); maxX = Math.max(maxX, r.x + r.width); }
             return { runs, baseline: c.baseline, weight: c.weight, fontSize: c.fontSize, minX, maxX };
@@ -284,16 +290,92 @@ function columnGutters(clusters: Cluster[]): number[] {
     return gutters;
 }
 
+/** The gap between runs of a line (of text of size `fs`) that cuts it: a column's or a table cell's boundary. */
+function wideGapOf(fs: number, cfg: PdfLayoutConfig): number {
+    return Math.max(18, 4 * cfg.spaceToleranceFactor * fs, 1.5 * fs);
+}
+
+/** How far apart (points) a table's head cell and its column's field may have their edges. */
+const HEAD_TOLERANCE = 4;
+
+/**
+ * The form field values (see RawRun.formField) that stand in a table's column, under its head: a line of the
+ * page's own text, of cells (two at least) and of no values, with every line from it down to the value's a row
+ * of it. A row of it is a line each of whose cells stands under one of its cells: a cell of text with its left
+ * edge, its middle or its right edge where a head cell's is, and a value with its field's box's left edge or
+ * middle where a head cell's is, however the value is set in it, or its right edge where the value is set to
+ * the right or fills it. An order form's quantities under
+ * "Quantity" are its table's cells, as they are printed; a value beside its label, where nothing heads it, is
+ * read with the label (see segmentsOf). A line above a form is not its head where the form's lines are not its
+ * rows: a title over the labels and a date set right at the margin the boxes end at, or a line with another
+ * between it and the form.
+ *
+ * One pass down the lines: each line's cells looked up in the head's edges, held in maps of a tolerance's
+ * width.
+ */
+function headedValues(clusters: readonly Cluster[], cfg: PdfLayoutConfig): Set<RawRun> {
+    const out = new Set<RawRun>();
+    if (!clusters.some(c => c.runs.some(r => r.formField && r.text.trim()))) return out;
+    // The head's cells' left edges, middles and right edges, by place.
+    let head: Set<number>[] | null = null;
+    const under = (edge: number, at: number) => {
+        const k = Math.round(at / HEAD_TOLERANCE);
+        return !!head && (head[edge].has(k - 1) || head[edge].has(k) || head[edge].has(k + 1));
+    };
+    for (const c of clusters) {
+        const runs = c.runs.filter(r => r.text.trim()).sort((a, b) => a.x - b.x);
+        if (!runs.length) continue;
+        // The line's cells: its runs of text apart by less than a wide gap are one, and each value is one.
+        const wideGap = wideGapOf(dominantFontSize(runs), cfg);
+        const cells: { from: number; to: number; value?: RawRun }[] = [];
+        for (const r of runs) {
+            const last = cells[cells.length - 1];
+            if (r.formField) cells.push({ from: r.x, to: r.x + r.width, value: r });
+            else if (last && !last.value && r.x - last.to < wideGap) last.to = Math.max(last.to, r.x + r.width);
+            else cells.push({ from: r.x, to: r.x + r.width });
+        }
+        const isRow = !!head && cells.every(cell => {
+            if (!cell.value) return under(0, cell.from) || under(1, (cell.from + cell.to) / 2) || under(2, cell.to);
+            const r = cell.value, box = r.fieldBox ?? { x: r.x, width: r.width };
+            const right = box.x + box.width;
+            // (Where its value is set in the box, from the run's place in it.)
+            const fromLeft = r.x - box.x, fromRight = right - (r.x + r.width);
+            const fills = fromLeft <= HEAD_TOLERANCE && fromRight <= HEAD_TOLERANCE;
+            // (A box's left edge under a head's is its column's, however its value is set in it, centred
+            // or set right under a head set from the left: "Qty" over a quantity centred in its box. Its right
+            // edge only where its value is set right or fills it: a date set right at the margin the boxes end
+            // at is no head of values set from their boxes' left.)
+            if (under(0, box.x) || under(1, box.x + box.width / 2)) return true;
+            if (fills) return under(2, right);
+            return fromLeft > fromRight + HEAD_TOLERANCE && under(2, right);
+        });
+        if (isRow) {
+            for (const cell of cells) if (cell.value) out.add(cell.value);
+            continue;
+        }
+        // A line of cells and of no values heads the lines under it; any other ends the head before it.
+        head = null;
+        if (cells.length < 2 || cells.some(cell => cell.value)) continue;
+        head = [new Set(), new Set(), new Set()];
+        for (const { from, to } of cells) {
+            head[0].add(Math.round(from / HEAD_TOLERANCE));
+            head[1].add(Math.round((from + to) / 2 / HEAD_TOLERANCE));
+            head[2].add(Math.round(to / HEAD_TOLERANCE));
+        }
+    }
+    return out;
+}
+
 /**
  * Splits one baseline cluster's runs into visual sub-lines at wide horizontal gaps (and at the page's column
  * gutters, see columnGutters). A wide gap (much
  * larger than a space) marks a column or table-cell boundary, so the pieces become separate atoms the
  * block segmenter can place independently.
  */
-function segmentsOf(clusterRuns: RawRun[], cfg: PdfLayoutConfig, gutters: readonly number[] = []): RawRun[][] {
+function segmentsOf(clusterRuns: RawRun[], cfg: PdfLayoutConfig, gutters: readonly number[] = [], headed: ReadonlySet<RawRun> = new Set()): RawRun[][] {
     const runs = [...clusterRuns].sort((a, b) => a.x - b.x);
     const fs = dominantFontSize(runs);
-    const wideGap = Math.max(18, 4 * cfg.spaceToleranceFactor * fs, 1.5 * fs);
+    const wideGap = wideGapOf(fs, cfg);
     const segments: RawRun[][] = [];
     let cur: RawRun[] = [];
     let last: RawRun | undefined, lastText: RawRun | undefined;
@@ -307,7 +389,13 @@ function segmentsOf(clusterRuns: RawRun[], cfg: PdfLayoutConfig, gutters: readon
         const coordGap = last ? r.x - (last.x + last.width) : 0;
         // (From the last run with text: a blank one pdf.js set over the gutter bridges it.)
         const atGutter = !!lastText && !isBlank && gutters.some(g => lastText!.x + lastText!.width <= g && g <= r.x);
-        if (cur.length && (wideBlank || coordGap >= wideGap || atGutter)) {
+        // A form field's value is read with the label before it, and a check box with the label after it,
+        // however far apart the page sets them, short of a column's gutter: cut there, the values were a
+        // column of their own, read after every label of the page. Not a value in a table's column (see
+        // headedValues): it is its cell, as it is printed.
+        const next: RawRun | undefined = isBlank ? runs[i + 1] : r;
+        const fieldJoin = !atGutter && !!lastText && ((next?.formField !== undefined && !headed.has(next)) || (lastText.formField === 'box' && !headed.has(lastText)));
+        if (cur.length && !fieldJoin && (wideBlank || coordGap >= wideGap || atGutter)) {
             segments.push(cur);
             cur = [];
         }
@@ -567,8 +655,10 @@ function clusterToLine(clusterRuns: RawRun[], cfg: PdfLayoutConfig, rtl = false)
     const visible = keptFragments.map(f => f.text).join('').trimEnd();
     const endsWithHyphen = /[-­]$/.test(visible);
 
+    // (A line of form field values alone, see RawRun.formField.)
+    const formField = runs.some(r => r.formField && r.text.trim()) && runs.every(r => r.formField || !r.text.trim());
     return {
-        fragments: keptFragments, dir, ...(rtl ? { rtl } : {}), baseline, fontSize: lineFontSize,
+        fragments: keptFragments, dir, ...(rtl ? { rtl } : {}), ...(formField ? { formField } : {}), baseline, fontSize: lineFontSize,
         bold: totalChars > 0 && boldChars * 2 > totalChars,
         endsWithHyphen,
         x: bounds.x, yTop: bounds.y, width: bounds.width, height: bounds.height,
@@ -701,7 +791,8 @@ export function emitBounds(box: NodeBounds, page: PageContext, cfg: PdfLayoutCon
 /**
  * Computes the document body font size and a size-to-heading-level ranking from all runs. Heading
  * levels are ranks of the distinct "large" sizes (descending), so headings resolve even when their
- * sizes cluster closely.
+ * sizes cluster closely. A form field's value (see RawRun.formField) is set at its field's size, not as
+ * the document's text: it counts towards neither.
  */
 export function computeDocContext(allRuns: RawRun[], cfg: PdfLayoutConfig, newlineDelimiter: string): DocContext {
     const bodyFontSize = dominantFontSize(allRuns) || 12;
@@ -711,7 +802,7 @@ export function computeDocContext(allRuns: RawRun[], cfg: PdfLayoutConfig, newli
     const headingSizes = new Set<number>();
     if (cfg.headingDetection !== 'off') {
         for (const r of allRuns) {
-            if (r.angle !== 0) continue;
+            if (r.angle !== 0 || r.formField) continue;
             const s = roundSize(r.fontSize);
             if (s >= bodyFontSize + 0.75 && !headingSizes.has(s) && r.text.trim().length >= 2) headingSizes.add(s);
         }
@@ -1061,6 +1152,10 @@ function cellFromLine(lines: PdfLine[], row: number, col: number, page: PageCont
 
 /** Each line's runs as buildLines gathered them, for cutting a line where a table's columns are (see cutAtColumnEdges). */
 const LINE_RUNS = new WeakMap<PdfLine, RawRun[]>();
+/** A line's runs, as buildLines gathered them. */
+export function lineRuns(line: PdfLine): readonly RawRun[] {
+    return LINE_RUNS.get(line) ?? [];
+}
 /** Each run's place in the order its page draws its runs (buildLines' runs), for twoColumnTable. */
 const RUN_ORDER = new WeakMap<RawRun, number>();
 
@@ -2140,7 +2235,8 @@ function headingLevel(group: ParaGroup, doc: DocContext, bodyFollows = false): n
     const size = group.fontSize, body = doc.bodyFontSize;
     const text = groupText(group);
     const chars = text.length;
-    if (group.lines.length > 3 || chars >= 200 || chars < 2 || /\.{4,}/.test(text)) return 0;
+    // (A form's values alone are what was typed into it, whatever size its field sets them in: no heading.)
+    if (group.lines.length > 3 || chars >= 200 || chars < 2 || /\.{4,}/.test(text) || group.lines.every(l => l.formField)) return 0;
     if (size >= 1.2 * body) return group.bold || size >= 1.35 * body ? doc.headingLevelForSize(size) || 1 : 0;
     const allBold = group.lines.every(l => l.bold);
     if (!allBold || chars > 150 || /[.,;]$/.test(text)) return 0;

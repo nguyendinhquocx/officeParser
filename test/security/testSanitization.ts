@@ -9,7 +9,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { strFromU8, unzipSync, unzlibSync, zipSync, zlibSync } from 'fflate';
+import { strFromU8, Unzlib, unzipSync, unzlibSync, zipSync, zlibSync } from 'fflate';
 import { PDFDocument, PDFName, PDFRawStream } from 'pdf-lib';
 import { OfficeGenerator } from '../../src/OfficeGenerator';
 import { OfficeParser } from '../../src/OfficeParser';
@@ -29,7 +29,11 @@ import { terminateOcr } from '../../src/utils/ocrUtils';
 import { OfficeErrorType } from '../../src/types';
 import { buildTaggedNodes } from '../../src/parsers/pdf/structTree';
 import { computeDocContext } from '../../src/parsers/pdf/textLayout';
+import { findRunningLines } from '../../src/parsers/pdf/runningLines';
 import { MarkedContent } from '../../src/parsers/pdf/actualText';
+import { PdfFile } from '../../src/parsers/pdf/pdfFile';
+import { KeptJpegs } from '../../src/parsers/pdf/pdfJpeg';
+import { shadeRuns } from '../../src/parsers/pdf/rulings';
 import { CffOutlines, nativeUnbrotli, sfntOf, TrueTypeOutlines } from '../../src/generators/pdf/fontFiles';
 import { cffTable, charString, EMPTY } from '../helpers/cffFontWriter';
 import * as zlib from 'zlib';
@@ -74,17 +78,62 @@ const withinTime = async <T>(limitMs: number, run: () => Promise<T>): Promise<{ 
     return { result, ms: Math.round(ms), within: ms < limitMs };
 };
 
+/**
+ * The collector, called when a case asks (V8's flag, set as the suite runs). A measure of memory starts
+ * from what is live: a reading taken without it counted what earlier cases left for the collector, and
+ * one taken over a case counts what the case allocated and the collector has not yet freed, so whether
+ * the collector happened to run decided the result (Node 22 failed in CI where Node 24 passed). From a
+ * collected start, what a case adds is at most what it allocates, whenever the collector runs.
+ */
+const collectGarbage: () => void = (() => {
+    try {
+        (require('v8') as typeof import('v8')).setFlagsFromString('--expose-gc');
+        const gc = (require('vm') as typeof import('vm')).runInNewContext('gc');
+        if (typeof gc === 'function') return gc as () => void;
+    } catch { /* no collector to call: readings start where they are */ }
+    return () => { };
+})();
+/** The bytes V8 has allocated in all, where it counts them (`total_allocated_bytes`), else undefined. */
+const allocatedSoFar = (): number | undefined => (require('v8') as typeof import('v8')).getHeapStatistics().total_allocated_bytes as number | undefined;
+/**
+ * What a run adds to the heap and to array buffers, from a collected start; what of the heap it still
+ * holds once collected again with its result alive (`retained`: what it keeps, whenever the collector
+ * runs); and what it allocated where V8 counts it (for a case's message: a limit at or above what a case
+ * allocates holds whenever the collector runs).
+ */
+const memoryOf = async <T>(run: () => T | Promise<T>): Promise<{ result: T; heap: number; retained: number; buffers: number; allocated: number | undefined }> => {
+    collectGarbage();
+    const before = process.memoryUsage(), allocatedBefore = allocatedSoFar();
+    const result = await run();
+    const after = process.memoryUsage(), allocatedAfter = allocatedSoFar();
+    collectGarbage();
+    const retained = process.memoryUsage().heapUsed - before.heapUsed;
+    return {
+        result, heap: after.heapUsed - before.heapUsed, retained, buffers: after.arrayBuffers - before.arrayBuffers,
+        allocated: allocatedBefore === undefined || allocatedAfter === undefined ? undefined : allocatedAfter - allocatedBefore,
+    };
+};
+/** A memory reading as a case's message gives it: what was added, and what was allocated where known. */
+const megabytes = (bytes: number | undefined) => (bytes === undefined ? '?' : `${Math.round(bytes / 1e6)}MB`);
+const memoryNote = (grew: number, allocated: number | undefined) => `+${megabytes(grew)} (allocated ${megabytes(allocated)})`;
+
 const linear = async (name: string, run: () => unknown, heap?: { label: string; limit: number }): Promise<void> => {
-    // The heap a full run grows by, when asked: measured over the full run alone, the smaller one's
-    // leftovers not counted.
+    // The heap a full run grows by, when asked: measured over the full run alone, from a collected
+    // start (see memoryOf), the smaller one's leftovers not counted.
     let grown = 0;
+    let allocated: number | undefined;
     const time = async (size: number): Promise<number> => {
         scale = size;
-        const heapBefore = process.memoryUsage().heapUsed;
+        if (size === 1 && heap) collectGarbage();
+        const heapBefore = process.memoryUsage().heapUsed, allocatedBefore = allocatedSoFar();
         const started = performance.now();
         try { await run(); } finally { scale = 1; }
         const took = performance.now() - started;
-        if (size === 1) grown = process.memoryUsage().heapUsed - heapBefore;
+        if (size === 1) {
+            grown = process.memoryUsage().heapUsed - heapBefore;
+            const allocatedAfter = allocatedSoFar();
+            allocated = allocatedBefore === undefined || allocatedAfter === undefined ? undefined : allocatedAfter - allocatedBefore;
+        }
         return took;
     };
     let small = await time(0.25);
@@ -95,7 +144,7 @@ const linear = async (name: string, run: () => unknown, heap?: { label: string; 
         large = Math.min(large, await time(1));
     }
     check(`${name} in linear time`, within(), `${Math.round(small)}ms at a quarter of the size, ${Math.round(large)}ms at full size`);
-    if (heap) check(heap.label, grown < heap.limit, `${Math.round(grown / 1e6)}MB`);
+    if (heap) check(heap.label, grown < heap.limit, memoryNote(grown, allocated));
 };
 
 function astWith(content: any[]): OfficeParserAST {
@@ -2268,9 +2317,9 @@ async function latexSanitizationTests() {
     };
     const escapeSmall = escapeTimed(1_000_000), escapeLarge = escapeTimed(4_000_000);
     check('latex: escapeLatex is linear in its input', escapeSmall.ok && escapeLarge.ok && escapeLarge.ms < Math.max(200, 7 * escapeSmall.ms), `${escapeSmall.ms}ms vs ${escapeLarge.ms}ms`);
-    const escapeHeap = process.memoryUsage().heapUsed;
-    const escapedRun = escapeLatex('plain words here '.repeat(1_200_000));
-    check('latex: escaping a 20 MB run holds about its own size', process.memoryUsage().heapUsed - escapeHeap < 150_000_000 && escapedRun.length === 20_400_000, `heap +${Math.round((process.memoryUsage().heapUsed - escapeHeap) / 1e6)}MB`);
+    const escaping = await memoryOf(() => escapeLatex('plain words here '.repeat(1_200_000)));
+    const escapedRun = escaping.result;
+    check('latex: escaping a 20 MB run holds about its own size', escaping.heap < 150_000_000 && escapedRun.length === 20_400_000, `heap ${memoryNote(escaping.heap, escaping.allocated)}`);
 
     // latexSourceComment: a hidden note stays inside `%` lines whatever line breaks it holds, and a
     // `-->` inside it cannot end the comment early for the LaTeX parser.
@@ -2494,12 +2543,14 @@ async function latexParserTests() {
     check('latex parser: the main file of 3,000 files including each other is found', mainPick.json.includes('Body'), mainPick.json.slice(0, 200));
 
     // Memory: an expansion is sized before it is built, and a column spec's repetition is bounded by length.
-    const heapBefore = process.memoryUsage().heapUsed;
-    const amplify = await parse('\\newcommand{\\x}[1]{' + '#1'.repeat(20000) + '}\\x{' + 'y'.repeat(20000) + '}');
-    const spec = await parse('\\begin{tabular}{*{1000}{' + 'c'.repeat(100000) + '}}a\\end{tabular}');
-    const heapGrowth = process.memoryUsage().heapUsed - heapBefore;
+    const latexMemory = await memoryOf(async () => ({
+        amplify: await parse('\\newcommand{\\x}[1]{' + '#1'.repeat(20000) + '}\\x{' + 'y'.repeat(20000) + '}'),
+        spec: await parse('\\begin{tabular}{*{1000}{' + 'c'.repeat(100000) + '}}a\\end{tabular}'),
+    }));
+    const { amplify, spec } = latexMemory.result;
+    const heapGrowth = latexMemory.heap;
     check('latex parser: a macro repeating a long argument is refused before it is built', amplify.codes.includes('LATEX_EXPANSION_LIMIT_REACHED'), amplify.codes.join(','));
-    check('latex parser: a long repeated column spec is bounded', heapGrowth < 200_000_000, `${spec.ms}ms, heap +${Math.round(heapGrowth / 1e6)}MB`);
+    check('latex parser: a long repeated column spec is bounded', heapGrowth < 200_000_000, `${spec.ms}ms, heap ${memoryNote(heapGrowth, latexMemory.allocated)}`);
 
     // Included text counts against the expansion budget: including a large file many times over is bounded.
     const repeated = await parse(zip({ 'main.tex': '\\documentclass{article}\\begin{document}' + '\\input{big}'.repeat(400) + '\\end{document}', 'big.tex': 'z '.repeat(500000) }));
@@ -2541,11 +2592,10 @@ async function latexParserTests() {
         ['broken ASCII85', '<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter [/ASCII85Decode /FlateDecode] /Length 12 >>\nstream\n{{{{vvvv~>xx\nendstream'],
         ['a Length past the end', '<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 99999999 >>\nstream\nabcd'],
     ] as const) {
-        const started = process.memoryUsage().heapUsed;
-        const r = await parse(carried(pdfWith(image)));
-        const grew = process.memoryUsage().heapUsed - started;
+        const carriedMemory = await memoryOf(() => parse(carried(pdfWith(image))));
+        const r = carriedMemory.result, grew = carriedMemory.heap;
         check(`latex parser: ${label} in a carried PDF stays a PDF, within bounds`, grew < 100_000_000 && r.ast.attachments.length === 1 && r.ast.attachments[0].mimeType === 'application/pdf',
-            `${r.ms}ms, heap +${Math.round(grew / 1e6)}MB, ${r.ast.attachments.map(a => a.mimeType).join(',')}`);
+            `${r.ms}ms, heap ${memoryNote(grew, carriedMemory.allocated)}, ${r.ast.attachments.map(a => a.mimeType).join(',')}`);
     }
     // The object scan is linear: text an unclosed string or dictionary swallowed is read once, not
     // again from every `obj` inside it (300 KB took minutes).
@@ -2564,9 +2614,8 @@ async function latexParserTests() {
             'main.tex': new TextEncoder().encode('\\documentclass{article}\\begin{document}\\includegraphics{x.pdf}\\end{document}'),
             'x.pdf': new Uint8Array(Buffer.from(pdf, 'latin1')),
         }));
-        const before = process.memoryUsage().arrayBuffers;
-        const r = await parse(project);
-        return { r, grew: process.memoryUsage().arrayBuffers - before };
+        const decoding = await memoryOf(() => parse(project));
+        return { r: decoding.result, grew: decoding.buffers };
     };
     const refused = await decodeCase(4000, 16, zlibSync(new Uint8Array(4096)));
     check('latex parser: a carried image past the decoding budget stays a PDF, nothing allocated', refused.grew < 50_000_000 && refused.r.ast.attachments[0]?.mimeType === 'application/pdf', `${refused.r.ms}ms, +${Math.round(refused.grew / 1e6)}MB`);
@@ -2817,12 +2866,11 @@ async function parserHardeningTests() {
     // into their output at every reference.
     const bigText = 'word '.repeat(40000); // 200 KB
     const heapBudget = async (label: string, run: () => Promise<unknown>) => {
-        global.gc?.();
-        const before = process.memoryUsage().heapUsed;
-        const result = await run();
-        const grown = process.memoryUsage().heapUsed - before;
-        check(`${label} without copying it per reference`, grown < 300_000_000, `${Math.round(grown / 1e6)}MB`);
-        return result;
+        // What the result keeps: a block copied per reference stays in it; what the run allocated and let
+        // go is the collector's to free, whenever it runs.
+        const budget = await memoryOf(run);
+        check(`${label} without copying it per reference`, budget.retained < 300_000_000, `${megabytes(budget.retained)} kept, ${memoryNote(budget.heap, budget.allocated)}`);
+        return budget.result;
     };
     const docxRefs = (tag: 'footnote' | 'endnote' | 'comment') => repack('test.docx', z => {
         const doc = new TextDecoder().decode(z['word/document.xml']);
@@ -3079,9 +3127,9 @@ async function parserHardeningTests() {
         'c.xhtml': enc(`<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><p>${'x'.repeat(100000)}</p>${'<img src="a.png" alt="a"/>'.repeat(images)}</body></html>`),
         'a.png': new Uint8Array(png),
     }));
-    const heapBefore = process.memoryUsage().heapUsed;
-    const shownOften = await parseQuiet(epub(3000, 1), 'epub', { extractAttachments: true });
-    const heapGrowth = process.memoryUsage().heapUsed - heapBefore;
+    const shownOftenMemory = await memoryOf(() => parseQuiet(epub(3000, 1), 'epub', { extractAttachments: true }));
+    const shownOften = shownOftenMemory.result;
+    const heapGrowth = shownOftenMemory.heap;
     const pictures: any[] = [];
     const collect = (ns: any[] | undefined) => ns?.forEach((n: any) => { if (n.type === 'image') pictures.push(n.metadata?.attachmentName); collect(n.children); });
     collect(shownOften.ast?.content);
@@ -3894,12 +3942,21 @@ async function parserHardeningTests() {
         // checked is the last run's, the full one.
         let result: { out: Uint8Array | undefined; code: string | undefined } = { out: undefined, code: undefined };
         let wanted: string | undefined;
+        // A case whose own work allocates more than the 300 MB the others are held to is held to a little
+        // more than it allocates (measured with V8's count), so the collector's timing cannot fail it, and
+        // still far less than copying per reference costs there (its blocks times its depth or its runs).
+        const ownWork: Record<string, number> = {
+            'a block among 200,000 fields in one paragraph': 500_000_000, // allocates about 376 MB
+            '20,000 paragraph blocks 20,000 content controls deep': 750_000_000, // about 548 MB
+            '40,000 inline blocks 40,000 content controls deep': 1_000_000_000, // about 807 MB
+            '3,000,000 nested text runs beside a block': 750_000_000, // about 548 MB
+        };
         await timed(`template: ${label}`, async () => {
             const [body, data, expected, parts, cfg] = make();
             wanted = expected;
             result = await renderQuiet(body, data, cfg ?? {}, parts);
         },
-            { label: `template: ${label} without copying it per reference`, limit: 300_000_000 });
+            { label: `template: ${label} without copying it per reference`, limit: ownWork[label] ?? 300_000_000 });
         check(`template: ${label} ${wanted ? `is refused with ${wanted}` : 'renders'}`, result.code === wanted && (wanted !== undefined || result.out instanceof Uint8Array), String(result.code));
     }
     // Prototype keys in a template's paths are never read from the prototype; a data key named
@@ -4210,6 +4267,55 @@ async function pdfProcessTests(h: {
     let tabled = { error: '', text: '' } as { error: string; text: string };
     await linear('pdf: a page of 2,000 small tables between lines of prose is read', async () => { tabled = await read(tablesPage(n(2000))); });
     check('pdf: a page of small tables keeps its text', !tabled.error && tabled.text.includes('c7') && tabled.text.includes('prose'), tabled.error || tabled.text.slice(0, 80));
+    // Running headers and footers, found by comparing the pages (see runningLines): in time in proportion to
+    // the lines in the pages' bands, however many pages there are and however many lines a band holds. Each
+    // page's bands full of lines, every one running, its header's taken and given back one by one (each close
+    // over the next); a row of many cells over another, each checked for the cells under it.
+    let bandNotes = 0;
+    const bandRuns = (lines: number, cells: number) => {
+        const runs: any[] = [];
+        const run = (text: string, x: number, y: number) => runs.push({ text, x, yTop: y, yBaseline: y + 1.6, width: 1.5 * text.length, height: 2, fontSize: 2, dir: 'ltr', angle: 0, turn: 0, mcid: null, inArtifact: false, formatting: {} });
+        // (Lines of letters alone, each its own: no two alike once their numbers are one.)
+        const letters = (k: number) => { let out = ''; do { out = String.fromCharCode(97 + (k % 26)) + out; k = Math.floor(k / 26); } while (k); return out; };
+        for (let l = 0; l < lines; l++) { run(`Head ${letters(l)}`, 10, 10 + l * 3); run(`Foot ${letters(l)}`, 10, 99_980 - l * 3); }
+        for (let c = 0; c < cells; c++) { run(`c${c}`, 10 + c * 20, 10 + lines * 3); run(`d${c}`, 10 + c * 20, 13 + lines * 3); }
+        run(`Note ${letters(bandNotes++)}`, 10, 16 + lines * 3);
+        runs.push({ text: 'Body', x: 10, yTop: 50_000, yBaseline: 50_010, width: 40, height: 12, fontSize: 12, dir: 'ltr', angle: 0, turn: 0, mcid: null, inArtifact: false, formatting: {} });
+        return runs;
+    };
+    const bandLayout: any = { useTags: false, detectColumns: true, mergeHyphenatedWords: true, lineToleranceFactor: 0.35, spaceToleranceFactor: 0.25, headingDetection: 'auto', normalizeText: true, extractTextColor: false, includeBounds: true };
+    const bandPages = (pages: number, lines: number, cells: number) => Array.from({ length: pages }, (_, i) => ({ pageNumber: i + 1, width: 200_000, height: 100_000, authoredW: 200_000, authoredH: 100_000, authoredY1: 100_000, rotation: 0, runs: bandRuns(lines, cells), images: [], structTree: null }));
+    let runningFound = 0;
+    const manyPages = bandPages(400, 20, 20), fewPages = bandPages(100, 20, 20);
+    await linear('pdf: 400 pages of 40 band lines are compared', () => { runningFound = findRunningLines(scale < 1 ? fewPages : manyPages, bandLayout, 12, null).size; });
+    check('pdf: every page of running lines has its running lines', runningFound === 400, `${runningFound}`);
+    const longBands = bandPages(4, 4000, 4000), shortBands = bandPages(4, 1000, 1000);
+    await linear('pdf: 4 pages of 8,000 band lines and rows of 4,000 cells are compared', () => { findRunningLines(scale < 1 ? shortBands : longBands, bandLayout, 12, null); });
+    // Each page labelled with 400,000 characters (a /PageLabels prefix as long), of letters and of digits, and
+    // 4,000 lines in its bands: a label longer than any line a page number is looked for in is in none, so it
+    // is never read, and each page's lines take no longer for it.
+    for (const [kind, digit] of [['letters', 'A'], ['digits', '1']] as const) {
+        const labelled = (lines: number) => ({ pages: bandPages(4, lines, 0), labels: Array.from({ length: 4 }, () => digit.repeat(lines * 200)) });
+        const fullLabels = labelled(2000), quarterLabels = labelled(500);
+        await linear(`pdf: 4 pages of 4,000 band lines labelled with 400,000 ${kind} are compared`, () => {
+            const { pages, labels } = scale < 1 ? quarterLabels : fullLabels;
+            findRunningLines(pages, bandLayout, 12, labels);
+        });
+    }
+    const bandedDoc = (pages: number) => {
+        const objs: (string | Buffer)[] = ['<< /Type /Catalog /Pages 2 0 R >>', '', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'];
+        const kids: number[] = [];
+        let head = 'BT /F1 2 Tf\n';
+        for (let l = 0; l < 30; l++) head += `1 0 0 1 40 ${830 - l * 3} Tm (Running head ${String.fromCharCode(97 + l)}) Tj 1 0 0 1 300 ${830 - l * 3} Tm (Page) Tj 1 0 0 1 40 ${20 + l * 3} Tm (Running foot ${l}) Tj\n`;
+        head += 'ET\nBT /F1 10 Tf 40 400 Td (Body of the page) Tj ET\n';
+        objs.push(flate(Buffer.from(head)));
+        for (let p = 0; p < pages; p++) { objs.push('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>'); kids.push(objs.length); }
+        objs[1] = `<< /Type /Pages /Kids [${kids.map(k => `${k} 0 R`).join(' ')}] /Count ${kids.length} >>`;
+        return pdfFrom(objs);
+    };
+    let banded = { error: '', text: '' } as { error: string; text: string };
+    await linear('pdf: 200 pages of 90 running lines each are read', async () => { banded = await read(bandedDoc(n(200))); });
+    check('pdf: pages of running lines keep their body', !banded.error && banded.text.includes('Body of the page'), banded.error || banded.text.slice(0, 80));
     // A page's marked content is read for its ActualText (see actualText): in time in proportion to its
     // operators, and within its bound on what it inflates (a stream of zeros inflating far past it).
     const markedPage = (body: Buffer) => pdfFrom(['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [5 0 R] /Count 1 >>', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>', flate(body),
@@ -4227,6 +4333,42 @@ async function pdfProcessTests(h: {
         longWord = await read(markedPage(Buffer.from(`BT /F1 12 Tf 72 700 Td /P BMC (Long word page) Tj EMC ET\n${'7'.repeat(n(160_000))}x\n`)));
     });
     check('pdf: a page with a long digit word keeps its text', !longWord.error && longWord.text.includes('Long word page'), longWord.error || longWord.text.slice(0, 80));
+    // A form's values are read as the page's text (see PdfParser's fieldRuns): a page of many filled fields,
+    // a value of a megabyte and one of tens of thousands of lines are read in time in proportion, each line
+    // counted against the text budget as a text item is.
+    const formPdf = (fields: number, long: string, lines: number) => {
+        const perPage = 400, pages = Math.ceil(fields / perPage);
+        const objs: (string | Buffer)[] = ['', '', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>', flate(Buffer.from('BT /F1 10 Tf 40 820 Td (Form page) Tj ET'))];
+        const widgets: number[] = [], kids: number[] = [];
+        for (let p = 0; p < pages; p++) {
+            const pageObj = objs.length + 1, annots: number[] = [];
+            objs.push('');
+            for (let i = p * perPage; i < Math.min(fields, (p + 1) * perPage); i++) {
+                const k = i - p * perPage, x = 40 + (k % 4) * 140, y = 800 - Math.floor(k / 4) * 8;
+                objs.push(`<< /Type /Annot /Subtype /Widget /FT /Tx /T (f${i}) /V (value ${i}) /Rect [${x} ${y - 7} ${x + 120} ${y}] /DA (/Helv 6 Tf 0 g) /P ${pageObj} 0 R >>`);
+                annots.push(objs.length);
+            }
+            if (p === 0) {
+                objs.push(`<< /Type /Annot /Subtype /Widget /FT /Tx /T (long) /V (${long}) /Rect [40 20 560 40] /DA (/Helv 10 Tf 0 g) /P ${pageObj} 0 R >>`);
+                annots.push(objs.length);
+                objs.push(`<< /Type /Annot /Subtype /Widget /FT /Tx /Ff 4096 /T (lines) /V (${'line\\n'.repeat(lines)}) /Rect [40 45 560 60] /DA (/Helv 10 Tf 0 g) /P ${pageObj} 0 R >>`);
+                annots.push(objs.length);
+            }
+            objs[pageObj - 1] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R /Annots [${annots.map(a => `${a} 0 R`).join(' ')}] >>`;
+            kids.push(pageObj);
+            widgets.push(...annots);
+        }
+        objs[0] = `<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [${widgets.map(w => `${w} 0 R`).join(' ')}] /DR << /Font << /Helv 3 0 R >> >> >> >>`;
+        objs[1] = `<< /Type /Pages /Kids [${kids.map(k => `${k} 0 R`).join(' ')}] /Count ${kids.length} >>`;
+        return pdfFrom(objs);
+    };
+    let filled = { error: '', text: '' } as { error: string; text: string };
+    await linear('pdf: a form of 4,000 filled fields, a value of a megabyte and one of 20,000 lines is read', async () => {
+        filled = await read(formPdf(n(4_000), 'word '.repeat(n(200_000)), n(20_000)));
+    }, { label: 'pdf: a form of many filled fields holds the heap', limit: 400e6 });
+    // (Its pages' "Form page", the same at the top of each, is their running header.)
+    const formHeaders = ((filled as { ast?: OfficeParserAST }).ast?.auxiliary?.headers ?? []).map(h => h.text).join(' ');
+    check('pdf: a form\'s values are read', !filled.error && formHeaders.includes('Form page') && filled.text.includes('value 3') && filled.text.includes('word word'), filled.error || filled.text.slice(0, 80));
     const zeros = Buffer.alloc(96 * 1024 * 1024, 0x20);
     zeros.write('BT /F1 10 Tf 40 800 Td (Past the zeros) Tj ET', zeros.length - 64);
     const bombRun = await withinTime(20_000, () => read(markedPage(zeros)));
@@ -4242,11 +4384,11 @@ async function pdfProcessTests(h: {
         flate(Buffer.from('/A BMC EMC\n'.repeat(marks)), '/Type /XObject /Subtype /Form /BBox [0 0 10 10]'),
         ...Array.from({ length: pages }, () => '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 842] /Resources << /Font << /F1 3 0 R >> /XObject << /X0 5 0 R >> >> /Contents 4 0 R >>')]);
     await linear('pdf: a form of 20,000 marked-content spans drawn by 400 pages is read page by page', () => {
-        const pages = n(400), mc = new MarkedContent(new Uint8Array(formPages(pages, 20_000)), pages);
+        const pages = n(400), mc = new MarkedContent(new PdfFile(new Uint8Array(formPages(pages, 20_000)), pages));
         for (let i = 0; i < pages; i++) mc.eventsOf(i);
     }, { label: 'pdf: a form drawn by 400 pages holds the heap', limit: 400e6 });
     const ofThousand = formPages(1000, 250_000);
-    const allPages = new MarkedContent(new Uint8Array(ofThousand), 1000);
+    const allPages = new MarkedContent(new PdfFile(new Uint8Array(ofThousand), 1000));
     let documentEvents = 0;
     for (let i = 0; i < 1000; i++) documentEvents += allPages.eventsOf(i)?.length ?? 0;
     check('pdf: a document\'s marked-content events are bounded', documentEvents <= 10_500_000, `${documentEvents}`);
@@ -4255,10 +4397,133 @@ async function pdfProcessTests(h: {
     const quarterGigabyte = (require('zlib') as typeof import('zlib')).deflateSync(Buffer.alloc(256 * 1024 * 1024, 0x20), { level: 9 });
     const bombDoc = pdfFrom(['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>', '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>',
         Buffer.concat([Buffer.from(`<< /Length ${quarterGigabyte.length} /Filter /FlateDecode >>\nstream\n`), quarterGigabyte, Buffer.from('\nendstream')])]);
-    const buffersBefore = process.memoryUsage().arrayBuffers, inflateStarted = performance.now();
-    new MarkedContent(new Uint8Array(bombDoc), 1).eventsOf(0);
-    const inflateMs = performance.now() - inflateStarted, inflateGrew = process.memoryUsage().arrayBuffers - buffersBefore;
-    check('pdf: a stream inflating to 256 MB is read no further than the inflate bound', inflateMs < 1500 && inflateGrew < 200e6, `${Math.round(inflateMs)}ms ${Math.round(inflateGrew / 1e6)}MB`);
+    // What the inflater is given and gives, counted as it runs: the memory a process reports includes what
+    // the collector has yet to free, so it measured the collector's timing (Node 22 failed, Node 24 passed).
+    const push = Unzlib.prototype.push;
+    let fedBytes = 0, largestFeed = 0, inflatedBytes = 0;
+    Unzlib.prototype.push = function (this: any, chunk: Uint8Array, final?: boolean) {
+        fedBytes += chunk.length;
+        largestFeed = Math.max(largestFeed, chunk.length);
+        const ondata = this.ondata;
+        this.ondata = (data: Uint8Array, last: boolean) => { inflatedBytes += data.length; ondata.call(this, data, last); };
+        try { return push.call(this, chunk, final); } finally { this.ondata = ondata; }
+    };
+    const inflateStarted = performance.now();
+    try { new MarkedContent(new PdfFile(new Uint8Array(bombDoc), 1)).eventsOf(0); } finally { Unzlib.prototype.push = push; }
+    const inflateMs = performance.now() - inflateStarted;
+    // The bound is 64 MB inflated for the document; a push of at most 8 KB gives at most about 8.5 MB more.
+    check('pdf: a stream inflating to 256 MB is read no further than the inflate bound, a small slice at a time',
+        inflateMs < 1500 && inflatedBytes <= 64 * 1024 * 1024 + 9e6 && largestFeed <= 8 * 1024 && fedBytes < quarterGigabyte.length / 2,
+        `${Math.round(inflateMs)}ms, ${Math.round(inflatedBytes / 1e6)} MB inflated, fed ${fedBytes} of ${quarterGigabyte.length} bytes, ${largestFeed} at most`);
+    // A simple font's codes are read by their glyphs' names where pdf.js reads them as their own characters
+    // (see glyphNames): a /Differences of a million entries, a /ToUnicode CMap of 100,000 ranges over every
+    // code but the one it lacks, and a page setting 1,000 such fonts are each read in time in proportion,
+    // each font's CMap read once, and the text read by the names.
+    const glyphNamed = (fonts: number, differences: string, cmap: string, shown: string) => {
+        const objs: (string | Buffer)[] = ['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>', '',
+            `<< /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [${differences}] >>`,
+            flate(Buffer.from(`/CIDInit /ProcSet findresource begin 12 dict begin begincmap 1 begincodespacerange <00> <FF> endcodespacerange\n${cmap}\nendcmap end end`)), ''];
+        const names: string[] = [];
+        let body = '';
+        for (let i = 0; i < fonts; i++) {
+            objs.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding 4 0 R /ToUnicode 5 0 R >>');
+            names.push(`/F${i} ${objs.length} 0 R`);
+            body += `BT /F${i} 6 Tf ${30 + (i % 10) * 55} ${820 - Math.floor(i / 10) * 8} Td (${shown}) Tj ET\n`;
+        }
+        objs[2] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 842] /Resources << /Font << ${names.join(' ')} >> >> /Contents 6 0 R >>`;
+        objs[5] = flate(Buffer.from(body));
+        return pdfFrom(objs);
+    };
+    const printable = Array.from({ length: 95 }, (_, i) => 32 + i).filter(c => c !== 33);
+    const lacking33 = `${printable.length} beginbfchar\n${printable.map(c => `<${c.toString(16)}> <00${c.toString(16)}>`).join('\n')}\nendbfchar`;
+    let longDifferences = { error: '', text: '' } as { error: string; text: string };
+    await linear('pdf: a font of a /Differences of a million entries is read by its glyph names', async () => {
+        longDifferences = await read(glyphNamed(1, `33 /c.sc ${'/a '.repeat(n(1_000_000))}`, lacking33, 'ni!ht'));
+    });
+    check('pdf: a font of a million /Differences entries reads its names', !longDifferences.error && longDifferences.text.includes('nicht'), longDifferences.error || longDifferences.text.slice(0, 80));
+    let ranges = { error: '', text: '' } as { error: string; text: string };
+    await linear('pdf: a /ToUnicode CMap of 100,000 ranges over every code is read in time in proportion', async () => {
+        ranges = await read(glyphNamed(1, '255 /c.sc', `${n(100_000)} beginbfrange\n${'<00> <FE> <0000>\n'.repeat(n(100_000))}endbfrange`, 'ni\\377ht'));
+    });
+    check('pdf: a code a CMap of many ranges lacks reads its name', !ranges.error && ranges.text.includes('nicht'), ranges.error || ranges.text.slice(0, 80));
+    let manyFonts = { error: '', text: '' } as { error: string; text: string };
+    await linear('pdf: a page setting 1,000 fonts read by their glyph names is read', async () => {
+        manyFonts = await read(glyphNamed(n(1_000), '33 /c.sc', lacking33, 'ni!ht'));
+    }, { label: 'pdf: a page of 1,000 fonts read by their glyph names holds the heap', limit: 400e6 });
+    check('pdf: every font of a page of 1,000 reads its names', !manyFonts.error && (manyFonts.text.match(/nicht/g) ?? []).length === 1_000 && !manyFonts.text.includes('ni!ht'), manyFonts.error || manyFonts.text.slice(0, 80));
+    // A picture the file stores as a JPEG is kept as it is (see pdfJpeg), found by the object number pdf.js gives
+    // it. Its sizes are the file's to claim: a header of 65,535 x 65,535 over a dictionary of 16 x 16, a /Length of
+    // a terabyte on thousands of pictures (with an `endstream` to find, and with none, the file not searched to its
+    // end for each), and one JPEG of half a megabyte drawn hundreds of times, are each read in bounded time and
+    // memory, the JPEGs kept within the document's bound (the rest the PNGs of their pixels).
+    const jpegPixels = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAA0JCgsKCA0LCgsODg0PEyAVExISEyccHhcgLikxMC4pLSwzOko+MzZGNywtQFdBRkxOUlNSMj5aYVpQYEpRUk//wAALCAAQABABAREA/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/9oACAEBAAA/AOYtdO6fLWva6d0+Wte107p8tbFrp3T5a//Z', 'base64');
+    const imageDict = `/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode`;
+    /** A page drawing pictures (object 5 on) by index, each stream's length as written (`lies`: a terabyte), its `endstream` kept or not. */
+    const jpegPage = (pictures: Buffer[], draws: number[], lies = false, endstream = true) => pdfFrom([
+        '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 842] /Resources << /XObject << ${pictures.map((_, i) => `/I${i} ${5 + i} 0 R`).join(' ')} >> >> /Contents 4 0 R >>`,
+        flate(Buffer.from(draws.map((d, k) => `q 8 0 0 8 ${10 + (k % 70) * 8} ${10 + Math.floor(k / 70) * 8} cm /I${d} Do Q\n`).join(''))),
+        ...pictures.map(p => Buffer.concat([Buffer.from(`<< /Length ${lies ? 99999999999 : p.length} ${imageDict} >>\nstream\n`), p, Buffer.from(endstream ? '\nendstream' : '')])),
+    ]);
+    const lyingFrame = Buffer.from(jpegPixels);
+    lyingFrame.writeUInt16BE(65535, lyingFrame.indexOf(Buffer.from([0xff, 0xc0])) + 5);
+    lyingFrame.writeUInt16BE(65535, lyingFrame.indexOf(Buffer.from([0xff, 0xc0])) + 7);
+    const liedAbout = await read(jpegPage([lyingFrame], [0]), { extractAttachments: true });
+    check('pdf: a JPEG whose header claims 65,535 x 65,535 pixels is no JPEG kept', !liedAbout.error && (liedAbout.ast?.attachments ?? []).every(a => a.mimeType !== 'image/jpeg'), liedAbout.error || String(liedAbout.ast?.attachments.map(a => a.mimeType)));
+    let lengths = { error: '', ast: undefined } as unknown as Awaited<ReturnType<typeof read>>;
+    await linear('pdf: 3,000 pictures with a length of a terabyte are read, each kept as a JPEG', async () => {
+        const count = n(3_000);
+        lengths = await read(jpegPage(Array.from({ length: count }, () => jpegPixels), Array.from({ length: count }, (_, i) => i), true), { extractAttachments: true });
+    }, { label: 'pdf: 3,000 pictures with a length of a terabyte hold the heap', limit: 600e6 });
+    check('pdf: pictures whose length lies are read to their end', !lengths.error && (lengths.ast?.attachments ?? []).length === n(3_000) && lengths.ast!.attachments.every(a => Buffer.from(a.data, 'base64').equals(jpegPixels)), lengths.error || String(lengths.ast?.attachments.length));
+    // With no `endstream` after them, the search for one is paid for from a budget of the file's size: pdf.js
+    // itself searches each stream's end on its own (in time in the square of the pictures), so this is the
+    // library's reader alone, asked for every picture.
+    let found = 0;
+    await linear('pdf: 3,000 pictures with a length of a terabyte and no end of stream are looked for', () => {
+        const count = n(3_000), bytes = new Uint8Array(jpegPage(Array.from({ length: count }, () => jpegPixels), [0], true, false));
+        const kept = new KeptJpegs(new PdfFile(bytes, 1));
+        found = 0;
+        for (let i = 0; i < count; i++) if (kept.keep(`${5 + i}R`, 16, 16)) found++;
+    });
+    check('pdf: pictures with no end of stream are not all found', found < n(3_000), `${found} found`);
+    const comment = Buffer.concat([Buffer.from([0xff, 0xfe, 0xff, 0xff]), Buffer.alloc(0xffff - 2, 0x41)]);
+    const bigJpeg = Buffer.concat([jpegPixels.subarray(0, 2), ...Array.from({ length: 9 }, () => comment), jpegPixels.subarray(2)]);
+    let often = { error: '', ast: undefined } as unknown as Awaited<ReturnType<typeof read>>;
+    const oftenMemory = await memoryOf(async () => { often = await read(jpegPage([bigJpeg], Array.from({ length: n(300) }, () => 0)), { extractAttachments: true }); });
+    const keptBytes = (often.ast?.attachments ?? []).filter(a => a.mimeType === 'image/jpeg').reduce((sum, a) => sum + Buffer.byteLength(a.data, 'base64'), 0);
+    check('pdf: a JPEG drawn 300 times is kept within the document\'s bound, the rest PNGs', !often.error && keptBytes <= 128 * 1024 * 1024 + bigJpeg.length && (often.ast?.attachments ?? []).length === n(300), `${Math.round(keptBytes / 1e6)} MB kept of ${(often.ast?.attachments ?? []).length} pictures, ${often.error}`);
+    check('pdf: a JPEG drawn 300 times holds the heap', oftenMemory.heap < 1.2e9, memoryNote(oftenMemory.heap, oftenMemory.allocated));
+    // Text on a filled rectangle takes its colour as its background (see rulings' shadeRuns): 15,000 rectangles,
+    // each with a run on it, spread over a page, and 15,000 overlapping in one band of it, each tested against the
+    // runs of that band, are looked up by band and within a budget of tests, in time in proportion.
+    const filledPage = (cells: number) => {
+        let body = '';
+        for (let i = 0; i < cells; i++) {
+            const x = 5 + (i % 100) * 5, y = 10 + Math.floor(i / 100) * 5;
+            body += `${0.2 + (i % 7) / 10} 0.3 0.5 rg ${x} ${y} 4 4 re f\n0 g BT /F1 3 Tf 1 0 0 1 ${x + 0.5} ${y + 0.5} Tm (a) Tj ET\n`;
+        }
+        return pdfFrom(['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [5 0 R] /Count 1 >>', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>', flate(Buffer.from(body)),
+            '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>']);
+    };
+    const shadedRuns = (result: Awaited<ReturnType<typeof read>>) => {
+        let shaded = 0, plain = 0;
+        const stack: any[] = [...(result.ast?.content ?? [])];
+        while (stack.length) { const node = stack.pop(); if (node.type === 'text') { if (node.formatting?.backgroundColor) shaded++; else plain++; } stack.push(...(node.children ?? [])); }
+        return { shaded, plain };
+    };
+    let filledRead = { error: '', ast: undefined } as unknown as Awaited<ReturnType<typeof read>>;
+    await linear('pdf: a page of 15,000 filled rectangles with a run on each is read', async () => { filledRead = await read(filledPage(n(15_000))); },
+        { label: 'pdf: a page of 15,000 filled rectangles holds the heap', limit: 600e6 });
+    const counts = shadedRuns(filledRead);
+    check('pdf: runs on many filled rectangles are shaded', !filledRead.error && counts.shaded >= counts.plain && counts.shaded > 0, `${filledRead.error} ${counts.shaded} shaded, ${counts.plain} not`);
+    // The rectangles overlapping in one band, each run of the band wider than any of them and tested against all: within a budget of tests.
+    await linear('pdf: 15,000 runs over 15,000 overlapping filled rectangles of one band, none inside one, are tested', () => {
+        const count = n(15_000);
+        const shapes = Array.from({ length: count }, (_, i) => ({ x: (i % 400) * 1.2, y: 400, width: 4, height: 4 + (i % 3), filled: true, stroked: false, fill: '#336699', lineWidth: 1, curved: false, segments: [] as [number, number, number, number][] }));
+        const runs = Array.from({ length: count }, (_, i) => ({ text: 'a', x: (i % 400) * 1.2 + 0.5, yTop: 400.5, width: 50, height: 2, formatting: {} as any }));
+        shadeRuns(runs as any, shapes as any, 600, 842);
+    });
     check('pdf: a plan of 3,000 symbols is read whole, its paths costing none of the operator budget', !planned.error && planned.pages === 21 && planned.text.includes('Note 20.50') && !planned.codes.includes('PDF_CONTENT_LIMIT_EXCEEDED') && !planned.codes.includes('PDF_NO_TEXT_EXTRACTED'), `${planned.pages} pages ${planned.codes} ${planned.error}`);
     const operatorChecks = async (separateProcess: boolean) => {
         const where = separateProcess ? 'separate process' : 'in process';

@@ -52,6 +52,15 @@ export interface RawRun {
     formatting: TextFormatting;
     /** Hyperlink metadata resolved from annotations, if any. */
     link?: TextMetadata;
+    /**
+     * A form field's value, not the page's own text: a text or choice field's value, or the characters of
+     * a row of boxes drawn one to a character (a comb, see rulings), as 'text'; a check box's or radio
+     * button's state as 'box'. Its size does not count towards the page's sizes, it is never a heading,
+     * and it is read on the line of the label beside it (see textLayout).
+     */
+    formField?: 'text' | 'box';
+    /** A form field's value's box across the page (its widget's), where it is not the run's own (see textLayout's headedValues). */
+    fieldBox?: { x: number; width: number };
 }
 
 /** A contiguous span of text on a single visual line, with its own box and formatting. */
@@ -81,6 +90,8 @@ export interface PdfLine {
     rtl?: boolean;
     /** The x of a column gutter the line was cut at, beside it (see textLayout's columnGutters). */
     gutter?: number;
+    /** True when the line's text is form field values alone (see RawRun.formField): it is never a heading. */
+    formField?: boolean;
 }
 
 /** An image placed on a page, in viewport space. */
@@ -88,11 +99,13 @@ export interface PdfImage {
     name: string;
     bounds: NodeBounds;
     /**
-     * PNG-encoded pixels. Encoded at collection time (not at emit) so the raw uncompressed RGBA
-     * buffer, which is many times larger, is released as soon as its page is done rather than being
-     * held for every page at once until the emit pass.
+     * The picture's file: PNG-encoded pixels, or the JPEG the PDF stores where that shows what the pixels
+     * do (see pdfJpeg). Made at collection time (not at emit) so the raw uncompressed RGBA buffer, which
+     * is many times larger, is released as soon as its page is done rather than being held for every
+     * page at once until the emit pass.
      */
-    png: Buffer;
+    data: Buffer;
+    format: 'png' | 'jpeg';
     pixelWidth: number;
     pixelHeight: number;
 }

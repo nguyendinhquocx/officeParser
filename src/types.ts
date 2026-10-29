@@ -725,22 +725,44 @@ export interface PdfParserConfig {
      * DOCX/RTF parsers report it. Runs painted with a pattern, shading or transparent fill are left
      * uncolored rather than guessed.
      *
+     * The colour a run stands on is read from the same drawing: a run whose whole box is inside a
+     * filled rectangle of the page carries the colour of the one drawn last (where it paints, within
+     * its clip, and not see-through) as `formatting.backgroundColor`, as a word processor's paragraph
+     * shading reaches its runs, so white text on a coloured bar keeps the bar. A run only partly over a
+     * rectangle, text on the paper or on a white rectangle (a white card on a grey panel), and text in a
+     * table's cell that is shaded as the page shades it (the cell's `backgroundColor` shows it) carry
+     * none. Set to `false`, none is read.
+     *
      * Highlight annotations are unaffected by this flag: they populate `formatting.backgroundColor`
-     * regardless, since they come from the annotation list that is already read for hyperlinks.
+     * regardless, since they come from the annotation list that is already read for hyperlinks, and a
+     * highlighted run keeps its highlight's colour.
      *
      * Default is true.
      */
     extractTextColor?: boolean;
     /**
      * Keep each page's running header and footer in that page's content, where they stand on the
-     * page (the header first, the footer last), instead of in `auxiliary.headers` and
+     * page (the header before its text, the footer after it), instead of in `auxiliary.headers` and
      * `auxiliary.footers`. A tagged PDF marks its running headers and footers as artifacts, outside its
-     * structure: they are read into `auxiliary`, as a word processor's header is, so a writer that lays
-     * out pages (Word, ODT, RTF, LaTeX, PDF) repeats the first page's on every page and one that does
-     * not (text, Markdown, HTML, EPUB, PowerPoint) leaves them out. Turn this on for a writer that
-     * shows each page as it was, a slide per page, so a page keeps its own header and footer text (a
-     * page number, a chapter title) in its place. An untagged PDF's headers and footers are page text
-     * already. `ignoreHeadersAndFooters` still drops them.
+     * structure; an untagged PDF's (or one whose tags are not trusted) are found by comparing its
+     * pages: lines repeated in one place at the top or the bottom of at least two in five of the pages
+     * (and three), with their numbers as one where they number the pages ("1/4", "2/4") or the line is
+     * printed alike on other pages (a chapter's head), no larger than the text and standing apart from
+     * it, or the page's own number on two pages. "Question 3" at the top of one page and "Question 4" at
+     * the top of the next are the pages' own. A page number in one is marked as the page field it prints
+     * (TextMetadata.field), where the pages read are the document's from its first (a `pageRange` from a
+     * later page marks none), and its pages' count only where all are read. Either is read into
+     * `auxiliary`, as a word processor's header is, where it is the same on every page read (the first of
+     * three or more may have none, a cover's) once its page numbers are fields: a writer that lays out pages (Word, ODT, RTF, LaTeX, the PDF writer's
+     * native engine) writes it on every page, each page numbered its own, and one that does not (text,
+     * Markdown, HTML and the PDF writer's default HTML engine, EPUB, PowerPoint) leaves it out. A header or
+     * footer whose text changes from page to page (a chapter's head, pages numbered from 147), or that some
+     * pages have and others not (a sheet's name on its sheet's pages), stays in its pages, where it is, as no
+     * such writer could print it; where only the first page read differs (a cover's, every other page, two at
+     * least, having the same one), that one stays on its page and the others' is the document's. A header's
+     * line larger than the text is a paragraph of it, not a heading. Turn this on for a writer that shows each
+     * page as it was, a slide per page, so every page keeps its own header and footer in its place.
+     * `ignoreHeadersAndFooters` still drops them.
      *
      * Default is false.
      */

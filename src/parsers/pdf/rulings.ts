@@ -16,6 +16,7 @@
 import { CellMetadata, NodeBounds, OfficeContentNode } from '../../types.js';
 import type { PdfShape } from './pdfShapes.js';
 import type { PdfLayoutConfig, RawRun } from './pdfTypes.js';
+import { digitsValue } from './runningLines.js';
 import { CELL_PAGE_BOX } from './textLayout.js';
 
 /** At most this many rules a page, this many crossing tests, and this many grid cells a frame. */
@@ -194,13 +195,118 @@ export interface CellLayout {
     bounds: (box: NodeBounds) => NodeBounds | undefined;
 }
 
+/** How far a comb's boxes' widths may be from their middle one's, as a share of it (see isComb). */
+const COMB_WIDTH_SPREAD = 0.15;
+/**
+ * The fewest boxes a row of choices fills (see isScale): two characters in two boxes ("1 2", "A B") may as well
+ * be a value's.
+ */
+const SCALE_BOXES = 3;
+/** The boxes a scale counting by more than one has at least (see isScale). */
+const SCALE_STEP_BOXES = 5;
+/**
+ * How a row of boxes the page draws, a character to a box, is a comb (see isComb): its boxes about square,
+ * taller than wide or a little wider (no wider than COMB_SHAPE times their height; a row of digits alone up to
+ * COMB_DIGITS_SHAPE, a date's in boxes of 20 by 15 or 16 by 12) and tight to their characters (no wider than
+ * COMB_EMS of them): a date's digits of 14 points in square boxes of 20 (1.4 ems), of 8 in boxes of 18 (2.25
+ * ems). A row of choices is ruled apart: weekdays' letters in boxes of 26 by 18 or 30 by 18 (1.44 and 1.67
+ * times as wide as tall), a scale's numbers of 11 points in boxes of 30 by 24 (2.7 ems).
+ */
+const COMB_SHAPE = 1.3;
+const COMB_DIGITS_SHAPE = 1.5;
+const COMB_EMS = 2.5;
+/** The characters a scale's choices count through, one after another, and a school's grades (no E). */
+const SCALE_RUNS = ['0123456789', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'];
+const GRADES = ['ABCDF', 'abcdf'];
+
+/**
+ * Whether a row of boxes, one character to a box, prints a scale's choices rather than holds a value: every
+ * box filled, with characters that count up or down one at a time ("1 2 3 4 5", "0 1 2 ... 9", "A B C D E",
+ * "5 4 3 2 1"), in digits of any script too, five digits and more counting by another step ("1 3 5 7 9"), or
+ * a school's grades ("A B C D F"), three at least. A value's characters (a date's "15041985", a name's) do not count so; one that does, a comb filled
+ * with "12345" however tight its boxes, is read as the row of choices it looks like, its characters still in
+ * order, each in its cell.
+ */
+function isScale(chars: readonly string[]): boolean {
+    if (chars.length < SCALE_BOXES || chars.some(c => [...c].length !== 1)) return false;
+    const text = chars.join(''), back = [...chars].reverse().join('');
+    if (SCALE_RUNS.some(run => run.includes(text) || run.includes(back)) || GRADES.includes(text) || GRADES.includes(back)) return true;
+    // Digits of any script counting by one, or (five boxes and more: "2 4 6" in boxes is as likely a value) by
+    // a step of their own, the odd or even choices ("1 3 5 7 9", "0 2 4 6 8").
+    if (!chars.every(c => /^\p{Nd}$/u.test(c))) return false;
+    const values = chars.map(digitsValue);
+    const step = values[1] - values[0];
+    return (Math.abs(step) === 1 || (step !== 0 && chars.length >= SCALE_STEP_BOXES)) && values.every((v, i) => i === 0 || v - values[i - 1] === step);
+}
+
+/**
+ * Whether a frame is a comb: a row of like boxes (two at least, of widths within COMB_WIDTH_SPREAD of
+ * their middle one's, about square: no wider than two and a half times their height, no taller than four
+ * times their width) a form draws to be filled one character to a box, a date's digits or a tax number's.
+ * It is one where its text is form field values (see RawRun.formField) alone, or where each box holds a
+ * character at most, in boxes of a comb's shape and tight to them (see COMB_SHAPE, COMB_EMS), and its
+ * characters are not a scale's choices (see isScale). A row of words, a row of letters, a scale's numbers or
+ * grades, or a grid of two rows, is a table: where it is unsure, a row stays a table, each character in its
+ * cell.
+ */
+function isComb(f: RuledFrame, contents: readonly RawRun[][]): boolean {
+    if (f.ys.length !== 2 || f.cells.length < 2 || f.cells.some(c => c.colSpan !== 1 || c.rowSpan !== 1)) return false;
+    const height = f.ys[1] - f.ys[0];
+    const widths = f.cells.map(c => f.xs[c.col + 1] - f.xs[c.col]);
+    const middle = [...widths].sort((a, b) => a - b)[widths.length >> 1];
+    if (!(middle > 0 && height > 0) || middle > 2.5 * height || height > 4 * middle) return false;
+    if (widths.some(w => Math.abs(w - middle) > COMB_WIDTH_SPREAD * middle)) return false;
+    const texts = contents.flat().filter(r => r.text.trim());
+    if (texts.length && texts.every(r => r.formField)) return true;
+    const size = texts.reduce((m, r) => Math.max(m, r.fontSize), 0);
+    if (size > 0 && middle > COMB_EMS * size) return false;
+    const chars: string[] = [];
+    for (const runs of contents) {
+        let box = '', count = 0;
+        for (const r of runs) for (const ch of r.text) if (ch.trim()) { if (++count > 1) return false; box = ch; }
+        chars.push(box);
+    }
+    // (Wider boxes hold a comb's characters only where they are all digits: "Y N" or "M T W T F S S" in boxes
+    // a half again as wide as tall are choices.)
+    const digits = chars.every(c => !c || /^\p{Nd}$/u.test(c));
+    if (middle > (digits ? COMB_DIGITS_SHAPE : COMB_SHAPE) * height) return false;
+    // (In the boxes' order across the row.)
+    const order = f.cells.map((c, i) => i).sort((a, b) => f.cells[a].col - f.cells[b].col);
+    return !isScale(order.map(i => chars[i]));
+}
+
+/**
+ * A comb's characters (see isComb) as one run across its boxes: a box left empty between two filled ones
+ * is a space, those before the first and after the last are none. A form field's value, read where its
+ * boxes are, as its field's are (RawRun.formField).
+ */
+function combRun(f: RuledFrame, contents: readonly RawRun[][]): RawRun | undefined {
+    const order = f.cells.map((c, i) => i).sort((a, b) => f.cells[a].col - f.cells[b].col);
+    const chars = order.map(i => contents[i].filter(r => r.text.trim()).sort((a, b) => a.x - b.x).map(r => r.text.trim()).join(''));
+    const first = chars.findIndex(Boolean);
+    if (first < 0) return undefined;
+    let last = chars.length - 1;
+    while (!chars[last]) last--;
+    const runs = order.flatMap(i => contents[i]).filter(r => r.text.trim());
+    const like = runs[0];
+    const fontSize = runs.reduce((m, r) => Math.max(m, r.fontSize), 0) || like.fontSize;
+    return {
+        ...like, text: chars.slice(first, last + 1).map(c => c || ' ').join(''),
+        x: f.xs[0], width: f.xs[f.xs.length - 1] - f.xs[0], fontSize, link: undefined, formField: 'text',
+    };
+}
+
 /**
  * The tables a page's frames hold, with the runs they took: each run goes to the cell its middle is in,
  * a frame inside another's cell first (it is that cell's, among its paragraphs by its place). A frame
- * whose cells hold no text is no table.
+ * whose cells hold no text is no table. Nor is a comb (see isComb): its characters are one run (see
+ * combRun), its cell's where it is inside a table's, else one of `combs`, read with the page's text; or
+ * the form field values over it are read as they are. A
+ * field's value is not cut at a table's rules (it is one value), and goes to the cell its middle is in.
  */
-export function ruledTables(frames: RuledFrame[], runs: readonly RawRun[], layout: CellLayout): { tables: OfficeContentNode[]; consumed: Set<RawRun> } {
+export function ruledTables(frames: RuledFrame[], runs: readonly RawRun[], layout: CellLayout): { tables: OfficeContentNode[]; consumed: Set<RawRun>; combs: RawRun[] } {
     const consumed = new Set<RawRun>();
+    const combs: RawRun[] = [];
     const tables: OfficeContentNode[] = [];
     const inside = (a: NodeBounds, b: NodeBounds) => a !== b && a.x >= b.x - SNAP && a.y >= b.y - SNAP && a.x + a.width <= b.x + b.width + SNAP && a.y + a.height <= b.y + b.height + SNAP;
     // Smaller frames first, so a frame inside another's cell is read before it, as that cell's.
@@ -235,14 +341,15 @@ export function ruledTables(frames: RuledFrame[], runs: readonly RawRun[], layou
             }
             return out;
         };
-        for (const run of runs) {
+        // (A comb read before, inside this frame's cell, is that cell's: see combs below.)
+        for (const run of combs.length ? runs.concat(combs) : runs) {
             if (consumed.has(run) || run.angle !== 0) continue;
             // Only a run within the frame's rows is cut, and only at the borders of its own row's cells.
             const cy = run.yTop + run.height / 2;
             if (!(cy >= f.ys[0] && cy <= f.ys[f.ys.length - 1]) || run.x + run.width < f.xs[0] || run.x > f.xs[f.xs.length - 1]) continue;
             let row = 0;
             while (row < f.ys.length - 2 && cy > f.ys[row + 1]) row++;
-            const pieces = cutAtRules(run, rowBorders(row));
+            const pieces = run.formField ? [run] : cutAtRules(run, rowBorders(row));
             if (pieces.length > 1) for (const p of pieces) { pieceOf.set(p, run); place(p); }
             else place(run);
         }
@@ -258,6 +365,15 @@ export function ruledTables(frames: RuledFrame[], runs: readonly RawRun[], layou
             (innerOf.get(at) ?? innerOf.set(at, []).get(at)!).push(node);
         }
         if (!contents.some(c => c.some(r => r.text.trim())) && !innerOf.size) continue;
+        if (!innerOf.size && isComb(f, contents)) {
+            // (Values over it are read as they are, the frame's characters as one.)
+            const comb = contents.some(c => c.some(r => r.text.trim() && !r.formField)) ? combRun(f, contents) : undefined;
+            if (comb) {
+                for (const c of contents) for (const r of c) consumed.add(pieceOf.get(r) ?? r);
+                combs.push(comb);
+            }
+            continue;
+        }
         // A cell joined across a grid line its text does not cross, its text in one column (or row) and
         // another, is cells a producer drew no rule between (partial borders), not a merged one: the
         // frame is left to the alignment reader, which reads such tables from their text.
@@ -317,19 +433,49 @@ export function ruledTables(frames: RuledFrame[], runs: readonly RawRun[], layou
         built.set(fi, table);
     }
     for (const [fi, node] of built) if (!nestedIn.has(fi)) tables.push(node);
-    return { tables, consumed };
+    // A comb inside a table's cell is that cell's; the others are the page's text.
+    return { tables, consumed, combs: combs.filter(c => !consumed.has(c)) };
+}
+
+/** A filled rectangle where it paints (see backgroundFills), and its colour. */
+interface Fill { x: number; y: number; width: number; height: number; fill: string }
+
+/**
+ * The rectangles a page fills with a colour that something may stand on, in the order the page draws them
+ * (one drawn later covers those before it), each where it paints: its box within the clip it was painted
+ * through (see PdfShape.clip), as a browser fills a whole box clipped to its left border's strip. Filled
+ * with a colour and not see-through (a shadow under a box is no background), straight, of at most five
+ * edges, thicker than a rule, and not the page's own background (nearly all of it in both directions). White ones too: a white card on a grey panel is what the text on
+ * it stands on (see colourOf).
+ */
+function backgroundFills(shapes: readonly PdfShape[] | undefined, pageW: number, pageH: number): Fill[] {
+    const out: Fill[] = [];
+    for (const s of shapes ?? []) {
+        if (!s.filled || !s.fill || s.seeThrough || s.curved || s.segments.length > 5) continue;
+        let { x, y, width, height } = s;
+        if (s.clip) {
+            const x1 = Math.min(x + width, s.clip.x + s.clip.width), y1 = Math.min(y + height, s.clip.y + s.clip.height);
+            x = Math.max(x, s.clip.x); y = Math.max(y, s.clip.y);
+            width = x1 - x; height = y1 - y;
+        }
+        if (width > MAX_THICKNESS && height > MAX_THICKNESS && !(width >= 0.9 * pageW && height >= 0.9 * pageH)) out.push({ x, y, width, height, fill: s.fill });
+    }
+    return out;
+}
+
+/** The colour a fill gives what stands on it: none for white, the paper's own colour. */
+function colourOf(fill: Fill): string | undefined {
+    return fill.fill.toLowerCase() !== '#ffffff' ? fill.fill : undefined;
 }
 
 /**
  * Tables' cells shaded as their page shades them: each cell (read from the page, with no colour yet)
- * takes the colour of the smallest coloured rectangle under its middle, so a header row's white text is
- * read on the colour it was set on, not on none.
+ * takes the colour of the rectangle the page draws last under its middle (none where it is white), so a
+ * header row's white text is read on the colour it was set on, not on none.
  */
 export function shadeCells(tables: readonly OfficeContentNode[], shapes: readonly PdfShape[] | undefined, pageW: number, pageH: number): void {
     if (!shapes?.length || !tables.length) return;
-    const fills = shapes.filter(s => s.filled && s.fill && s.fill.toLowerCase() !== '#ffffff' && !s.curved && s.segments.length <= 5
-        && s.width > MAX_THICKNESS && s.height > MAX_THICKNESS && !(s.width >= 0.9 * pageW && s.height >= 0.9 * pageH))
-        .sort((a, b) => a.width * a.height - b.width * b.height);
+    const fills = backgroundFills(shapes, pageW, pageH);
     if (!fills.length) return;
     let tests = 0;
     const visit = (node: OfficeContentNode) => {
@@ -337,14 +483,85 @@ export function shadeCells(tables: readonly OfficeContentNode[], shapes: readonl
             const box = child.type === 'cell' ? CELL_PAGE_BOX.get(child) : undefined;
             if (box && !(child.metadata as CellMetadata | undefined)?.backgroundColor && tests < MAX_CROSSINGS) {
                 const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
-                tests += fills.length;
-                const under = fills.find(f => cx >= f.x && cx <= f.x + f.width && cy >= f.y && cy <= f.y + f.height);
-                if (under) child.metadata = { ...(child.metadata as CellMetadata), backgroundColor: under.fill };
+                // (From the last drawn: the first under it is the one on top.)
+                let under: Fill | undefined;
+                for (let i = fills.length - 1; i >= 0 && tests < MAX_CROSSINGS; i--) {
+                    tests++;
+                    const f = fills[i];
+                    if (cx >= f.x && cx <= f.x + f.width && cy >= f.y && cy <= f.y + f.height) { under = f; break; }
+                }
+                const colour = under && colourOf(under);
+                if (colour) child.metadata = { ...(child.metadata as CellMetadata), backgroundColor: colour };
             }
+            // The cell shows its colour: its text is not also on that colour (see shadeRuns).
+            const shown = child.type === 'cell' ? (child.metadata as CellMetadata | undefined)?.backgroundColor : undefined;
+            if (shown) clearRunShading(child, shown);
             visit(child);
         }
     };
     for (const t of tables) visit(t);
+}
+
+/** The bands a page's height is cut into, to find the rectangles holding a place without testing them all. */
+const BANDS = 256;
+/** A rectangle taller than this many bands is kept in a list of its own, tested for every place. */
+const MAX_BANDS_A_RECTANGLE = 16;
+/** How far (in points) a run's box may reach past the rectangle it stands on and still be on it. */
+const REACH = 1.5;
+
+/**
+ * Text that stands on a colour keeps it: each run whose whole box is inside a filled rectangle of the page
+ * takes the colour of the one the page draws last (see backgroundFills) as the run's `backgroundColor`, as a
+ * word processor's paragraph shading reaches its runs: none where that one is white, as text on a white card
+ * inside a grey panel is on white. White text on a purple bar is then read on the bar, not as white text on
+ * none. A run only partly over a rectangle, one with a background already (a highlight) and invisible text
+ * are left as they are; a table's cells, shaded as the page shades them (see shadeCells), take their runs'
+ * background of the same colour back, the cell showing it.
+ * Bounded: the rectangles are looked up by the band of the page they touch, and the tests are no more than
+ * MAX_CROSSINGS in all, past which the page's other runs are left unshaded.
+ */
+export function shadeRuns(runs: readonly RawRun[], shapes: readonly PdfShape[] | undefined, pageW: number, pageH: number): void {
+    if (!shapes?.length || !runs.length) return;
+    const fills = backgroundFills(shapes, pageW, pageH);
+    if (!fills.some(colourOf)) return;
+    // The fills (in the order drawn) by the bands they touch: a run is looked for in the band its middle is in.
+    const size = Math.max(pageH, 1) / BANDS;
+    const band = (y: number) => Math.min(BANDS - 1, Math.max(0, Math.floor(y / size)));
+    const bands: number[][] = [];
+    const tall: number[] = [];
+    fills.forEach((f, i) => {
+        const lo = band(f.y), hi = band(f.y + f.height);
+        if (hi - lo + 1 > MAX_BANDS_A_RECTANGLE) { tall.push(i); return; }
+        for (let b = lo; b <= hi; b++) (bands[b] ??= []).push(i);
+    });
+    let tests = 0;
+    for (const run of runs) {
+        if (run.formatting.backgroundColor || run.formatting.invisible || !run.text.trim()) continue;
+        const inBand = bands[band(run.yTop + run.height / 2)] ?? [];
+        // The two lists are each in the order drawn: the rectangle on top holding the run is the last of either.
+        let a = inBand.length - 1, b = tall.length - 1;
+        while ((a >= 0 || b >= 0) && tests < MAX_CROSSINGS) {
+            tests++;
+            const f = fills[b < 0 || (a >= 0 && inBand[a] > tall[b]) ? inBand[a--] : tall[b--]];
+            if (run.x >= f.x - REACH && run.x + run.width <= f.x + f.width + REACH && run.yTop >= f.y - REACH && run.yTop + run.height <= f.y + f.height + REACH) {
+                const colour = colourOf(f);
+                if (colour) run.formatting = { ...run.formatting, backgroundColor: colour };
+                break;
+            }
+        }
+        if (tests >= MAX_CROSSINGS) return;
+    }
+}
+
+/** Takes the background `color` off the text under `node` (a shaded cell's own, which the cell shows). */
+function clearRunShading(node: OfficeContentNode, color: string): void {
+    for (const child of node.children ?? []) {
+        if (child.formatting?.backgroundColor?.toLowerCase() === color.toLowerCase()) {
+            const { backgroundColor: _shown, ...rest } = child.formatting;
+            child.formatting = rest;
+        }
+        clearRunShading(child, color);
+    }
 }
 
 /**
