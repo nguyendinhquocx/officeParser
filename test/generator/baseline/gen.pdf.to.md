@@ -84,15 +84,15 @@ Next, we have something a little more complex, a nested table, i.e. a table insi
   <tr>
     <td><table>
   <tr>
-    <td rowspan="2"><p><span style="font-size: 11pt">One</span></p><p><span style="font-size: 11pt">Three</span></p></td>
-    <td><p><span style="font-size: 11pt">Two</span></p></td>
+    <td rowspan="2"><p>One</p><p>Three</p></td>
+    <td><p>Two</p></td>
   </tr>
   <tr>
-    <td><p><span style="font-size: 11pt">Four</span></p></td>
+    <td><p>Four</p></td>
   </tr>
 </table>
 </td>
-    <td><p><span style="font-size: 11pt">To the left is a table inside a table, with some cells merged.</span></p></td>
+    <td><p>To the left is a table inside a table, with some cells merged.</p></td>
   </tr>
 </table>
 
@@ -200,10 +200,10 @@ All types of lists are supported by the conversion, with the exception of lists 
 ## Multi-level Lists {#multi-level-lists}
 
 1. One
-    1. Two
-        1. Three
-        2. Four with a very long line to demonstrate that the hanging indent for the list is working correctly.
-        3. Five
+    - 1.1. Two
+        - 1.1.1. Three
+        - 1.1.2. Four with a very long line to demonstrate that the hanging indent for the list is working correctly.
+        - 1.1.3. Five
 2. Six
 
 A Multi-level list with bullets:
@@ -216,13 +216,13 @@ A Multi-level list with bullets:
 
 ## Continued Lists {#continued-lists}
 
-1. One
-2. Two
+- i. One
+- ii. Two
 
 An interruption in our regularly scheduled listing, for this essential and very relevant public service announcement.
 
-3. We now resume our normal programming
-4. Four
+- iii. We now resume our normal programming
+- iv. Four
 
 [^1]: In paged media, footnotes are usually displayed at the bottom of the text. However, in ebooks, a better paradigm is to make them clickable endnotes that the user can browse at her pleasure. This conversion is handled automatically by calibre.
 

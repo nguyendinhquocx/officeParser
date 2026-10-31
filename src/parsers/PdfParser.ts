@@ -32,7 +32,7 @@
 import { zlibSync } from 'fflate';
 import { passwordAttemptLimit } from '../crypto/decryptContainer.js';
 import { DEFAULT_OFFICE_PARSER_CONFIG, DEFAULT_PDF_WORKER_SRC } from '../defaults.js';
-import { FullOfficeParserConfig, HeadingMetadata, ImageMetadata, ListMetadata, OfficeAttachment, OfficeContentNode, OfficeErrorType, OfficeMetadata, OfficeParserAST, OfficeWarningType, ParagraphMetadata, TextFormatting, TextMetadata } from '../types.js';
+import { FullOfficeParserConfig, HeadingMetadata, ImageMetadata, ListMetadata, OfficeAttachment, OfficeContentNode, OfficeErrorType, OfficeMetadata, OfficeParserAST, OfficeWarningType, ParagraphMetadata, TextFormatting, TextMetadata, BreakMetadata, HeaderFooterMetadata } from '../types.js';
 import { createAST } from '../utils/astUtils.js';
 import { parseOfficeDate } from '../utils/dateUtils.js';
 import { assertNode, isBrowser } from '../utils/envUtils.js';
@@ -44,7 +44,7 @@ import { collectColorMarks, ColorLookup, makeColorLookup } from './pdf/pdfColor.
 import { collectGlyphs, GlyphFont, PageGlyphs } from './pdf/textGlyphs.js';
 import { collectShapes, PdfShape, shapeBullets } from './pdf/pdfShapes.js';
 import { MarkedContent, readableItems } from './pdf/actualText.js';
-import { GlyphNames } from './pdf/glyphNames.js';
+import { askedFonts, GlyphNames } from './pdf/glyphNames.js';
 import { PdfFile } from './pdf/pdfFile.js';
 import { KeptJpegs } from './pdf/pdfJpeg.js';
 import { RuledFrame, ruledFrames, ruledTables, shadeCells, shadeRuns } from './pdf/rulings.js';
@@ -52,9 +52,10 @@ import { annotationMatrix, computeRunBox, identityMatrix, mulMatrix, roundBounds
 import { PageExtract, PdfImage, PdfLayoutConfig, RawRun, ResolvedFont } from './pdf/pdfTypes.js';
 import { blockToNodes, buildLines, computeDocContext, detectTables, DocContext, emitBounds, indentLevels as indentLevelsOf, joinMarkerLines, leadingMarker, ListCarry, markerLefts, PageContext, lineDirections, recoverTaggedGrids, rightToLeftLean, relevelHeadings, runsToParagraph, segmentIntoBlocks } from './pdf/textLayout.js';
 import { buildTaggedNodes } from './pdf/structTree.js';
-import { FURNITURE_BAND, findRunningLines, furnitureChanging, markPageFields, PageFurniture, RunningRuns, unmarkPageFields } from './pdf/runningLines.js';
+import { FURNITURE_BAND, findRunningLines, markPageFields, PageFurniture, planFurniture, RunningRuns, unmarkPageFields } from './pdf/runningLines.js';
 import { setOwn } from '../utils/lookupUtils.js';
-import { acquirePdfProcess, PdfProcess } from './pdf/pdfProcess.js';
+import { BROTLI_AVOIDED_LINE, acquirePdfProcess, PdfProcess } from './pdf/pdfProcess.js';
+import { avoidBrotliInThisProcess, BROTLI_FIXED_RELEASES, onBrotliRefused, runtimeHasBrotliFlaw, runtimeName } from '../utils/brotliFlaw.js';
 import { captureConsoleWarnings, openWarningWorker, PdfAssetSession, pdfjsWorkerFile, resolvePdfAssetFolders, WarningWorker } from './pdf/pdfAssets.js';
 import { appendAll } from '../utils/nodeListUtils.js';
 
@@ -384,6 +385,8 @@ async function resolveFont(fontKey: string, commonObjs: any, styles: Record<stri
             const fontData: any = await new Promise((resolve) => commonObjs.get(fontKey, (d: any) => resolve(d)));
             const rawName: string | undefined = typeof fontData?.name === 'string' ? fontData.name : undefined;
             if (rawName) {
+                // (A Type 3 font is never a composite one: it is not looked for by name.)
+                if (!fontData.isType3Font) resolved.rawName = rawName;
                 const name = rawName.replace(/^[A-Z]{6}\+/, '');
                 if (name && !(fontData.isType3Font && name === 'Type3') && !fontData.isInvalidPDFjsFont && !TEXT_LAYER_FONT.test(name)) resolved.name = name;
                 const lower = rawName.toLowerCase();
@@ -1148,6 +1151,9 @@ const keptOperators = (OPS: any): Set<number> => {
     return kept;
 };
 
+/** The lists readOperatorList left partway: what they hold is true, and what they do not hold is unknown. */
+const cutLists = new WeakSet<object>();
+
 /**
  * A page's operator list within the budget, holding only what `keep` asks for: nothing when it is read
  * only so pdf.js resolves the page's `fonts`, and then only until pdf.js has sent them all. pdf.js
@@ -1175,6 +1181,7 @@ async function readOperatorList(pdfjs: any, page: any, work: PdfWorkBudget, keep
     /** Stops reading the list, which resolves to what was read of it. */
     const leave = (intentState: any) => {
         done = true;
+        if (intentState?.operatorList) cutLists.add(intentState.operatorList);
         work.leaveUnread(intentState?.streamReader);
         stopped(intentState?.operatorList ?? null);
     };
@@ -1220,11 +1227,53 @@ async function readOperatorList(pdfjs: any, page: any, work: PdfWorkBudget, keep
     finally { if (hooked && !done) delete page._renderPageChunk; }
 }
 
+/** At most this many characters of a font's name go into a warning. */
+const MAX_FONT_NAME_REPORTED = 128;
+
+/** What the pages say of fonts that may read as their glyph ids, judged once they are all read (see reportUnmappedFonts). */
+interface UnreadableText {
+    /** pdf.js's id of each font to the pages with readable text in it. */
+    pages: Map<string, number[]>;
+    /** The fonts some item of which that stays in the text had control characters taken out. */
+    controlled: Set<string>;
+    /** The fonts some glyph of which pdf.js read as other than its code, or whose glyphs could not be seen. */
+    mapped: Set<string>;
+}
+
+/**
+ * Warns of each font whose text is likely its glyph ids: control characters were taken out of its text,
+ * every glyph drawn with it read as its own code, and the file says nothing of what its codes are. Once
+ * per name per document, with every page it has text on. After all pages: what the file's bounds spend
+ * here takes nothing from any page's text.
+ */
+function reportUnmappedFonts(unreadable: UnreadableText, fontCache: Map<string, ResolvedFont>, glyphNames: GlyphNames, config: FullOfficeParserConfig): void {
+    // The fonts that may be reported: only fonts of their names are looked for in the file.
+    const candidates: { font: ResolvedFont; rawName: string; pages: number[] }[] = [];
+    for (const [id, pages] of unreadable.pages) {
+        const font = fontCache.get(id);
+        if (unreadable.controlled.has(id) && !unreadable.mapped.has(id) && font?.rawName !== undefined) candidates.push({ font, rawName: font.rawName, pages });
+    }
+    const asked = askedFonts(candidates.map(c => c.rawName));
+    const unmapped = new Map<string, Set<number>>();
+    for (const { font: resolved, rawName, pages } of candidates) {
+        if (!glyphNames.readsGlyphIds(rawName, pages, asked)) continue;
+        // (A file's name for a font goes into a message: of no control characters, and short.)
+        const font = (resolved.name ?? rawName).replace(/[\p{Cc}\p{Cf}]/gu, '').slice(0, MAX_FONT_NAME_REPORTED);
+        let all = unmapped.get(font);
+        if (!all) unmapped.set(font, all = new Set());
+        for (const page of pages) all.add(page);
+    }
+    for (const [font, all] of unmapped) {
+        const pages = [...all].sort((a, b) => a - b);
+        logWarning(OfficeWarningType.PDF_FONT_UNMAPPED, config, { font, pages }, undefined, { page: pages[0] });
+    }
+}
+
 /** Collects one page's text runs, images and annotations into a PageExtract. */
 async function collectPage(
     pdfjs: any, pdfDocument: any, pageNumber: number, config: FullOfficeParserConfig,
     pdfCfg: PdfLayoutConfig, fontCache: Map<string, ResolvedFont>, destCache: Map<string, SectionTarget | null>,
-    sectionLinks: SectionLinks, work: PdfWorkBudget, assets: PdfAssetSession, markedContent?: MarkedContent, glyphNames?: GlyphNames, jpegs?: KeptJpegs,
+    sectionLinks: SectionLinks, work: PdfWorkBudget, assets: PdfAssetSession, unreadable: UnreadableText, markedContent?: MarkedContent, glyphNames?: GlyphNames, jpegs?: KeptJpegs,
 ): Promise<PageExtract | undefined> {
     const page = await work.within(pdfDocument.getPage(pageNumber) as Promise<any>);
     if (!page) return undefined;
@@ -1255,6 +1304,7 @@ async function collectPage(
     // The page's drawing is read too: its shapes (a bullet drawn as a disc, a table's ruling lines) and its
     // glyphs (where each is drawn, and whether it is seen) tell what its text alone does not.
     ops = await readOperatorList(pdfjs, page, work, config.extractAttachments || pdfCfg.extractTextColor ? 'drawing' : 'shapes', newFonts);
+    const listCut = !!ops && cutLists.has(ops);
     for (const key of seen) if (!fontCache.has(key)) fontCache.set(key, await resolveFont(key, page.commonObjs, styles));
 
     // Past the budget the document is closed: the page keeps the text read, without what pdf.js would read next.
@@ -1287,6 +1337,7 @@ async function collectPage(
         return glyphFonts.get(id);
     };
     const glyphs: PageGlyphs | undefined = ops ? collectGlyphs(ops, pdfjs.OPS, glyphFont) : undefined;
+    if (glyphs) for (const [id, mapped] of glyphs.read) if (mapped) unreadable.mapped.add(id);
 
     // Per-run fill color (opt-in): recovered from the operator list, which is now fetched above.
     const colorFor: ColorLookup | null = (pdfCfg.extractTextColor && glyphs)
@@ -1299,6 +1350,7 @@ async function collectPage(
     // thousands deep took time in the square of the page.
     const stack: { mcid: string | null; artifact: boolean }[] = [];
     const runs: RawRun[] = [];
+    const readable = new Set<string>();
     // The text a producer gave its glyph clusters (ActualText), where the glyphs map to none of it.
     // Read from the file only for a page whose text has marked content, and once its budget allows.
     const hasMarked = !work.spent && textContent.items.some((it: any) => it.type === 'beginMarkedContentProps' || it.type === 'beginMarkedContent');
@@ -1314,6 +1366,8 @@ async function collectPage(
             }
             continue;
         }
+        if ((item as { controlsTaken?: boolean }).controlsTaken) unreadable.controlled.add(item.fontName);
+        if (/[^\s\p{Cc}\p{Cf}]/u.test(item.str)) readable.add(item.fontName);
         if (!item.str) continue;
         const font = fontCache.get(item.fontName) || { bold: false, italic: false, ascent: 0.8, descent: -0.2 };
         const m = pdfjs.Util.transform(layoutViewport.transform, item.transform);
@@ -1382,6 +1436,13 @@ async function collectPage(
                 link: seg.link,
             });
         }
+    }
+
+    for (const id of readable) {
+        const pages = unreadable.pages.get(id);
+        if (pages) pages.push(pageNumber); else unreadable.pages.set(id, [pageNumber]);
+        // (A glyph of the font not seen in the page's list, or the list cut, says nothing of whether pdf.js mapped it.)
+        if (glyphs?.read.get(id) === undefined || listCut) unreadable.mapped.add(id);
     }
 
     // The form's values, in their boxes among the page's text (see fieldRuns).
@@ -1749,7 +1810,14 @@ export const parsePdf = async (buffer: Buffer, config: FullOfficeParserConfig): 
 
     // The CMaps and image decoders pdf.js may need, and what its worker says it left out (see pdfAssets).
     const assets = new PdfAssetSession(await resolvePdfAssetFolders(config), config, pdfCfg.maxImagePixels);
-    const takeWarning = (line: string) => assets.workerWarning(line);
+    // A PDF's Brotli stream decoded by pdf.js itself, on a runtime whose decoder has a flaw (see brotliFlaw): said once a parse.
+    let brotliAvoidedSaid = false;
+    const brotliAvoided = () => {
+        if (brotliAvoidedSaid) return;
+        brotliAvoidedSaid = true;
+        logWarning(OfficeWarningType.BROTLI_DECODER_AVOIDED, config, { what: "this PDF's Brotli streams were", runtime: runtimeName(), fixed: BROTLI_FIXED_RELEASES });
+    };
+    const takeWarning = (line: string) => { if (line === BROTLI_AVOIDED_LINE) brotliAvoided(); else assets.workerWarning(line); };
 
     // pdf.js's worker in a process of its own (see pdfProcess), so what pdf.js does inside one stream
     // cannot exhaust this one's memory. Only for a worker Node can import from disk; one the caller
@@ -1783,10 +1851,12 @@ export const parsePdf = async (buffer: Buffer, config: FullOfficeParserConfig): 
                 const worker = new pdfjs.PDFWorker({ verbosity: workerFile ? 1 : 0 });
                 ownWorker = { worker, close: () => worker.destroy() };
             }
+            if (runtimeHasBrotliFlaw()) avoidBrotliInThisProcess();
             inProcessTurn = async () => {
                 const endTurn = await takeInProcessTurn(config.abortSignal);
                 const stopCapture = workerFile ? captureConsoleWarnings(takeWarning, workerFile) : undefined;
-                return () => { stopCapture?.(); endTurn(); };
+                onBrotliRefused(brotliAvoided);
+                return () => { onBrotliRefused(undefined); stopCapture?.(); endTurn(); };
             };
         }
         return await readPdf(pdfjs, buffer, config, pdfCfg, maxImageSize, pdfProcess, assets, pdfProcess?.worker ?? ownWorker?.worker, inProcessTurn);
@@ -2074,12 +2144,13 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
     const glyphNames = new GlyphNames(pdfFile);
     // The JPEGs the file stores, kept as they are where they show what pdf.js's pixels do (see pdfJpeg).
     const keptJpegs = new KeptJpegs(pdfFile);
+    const unreadable: UnreadableText = { pages: new Map(), controlled: new Set(), mapped: new Set() };
     for (const pageNum of pageNumbers) {
         checkAbortSignal(config.abortSignal);
         if (work.spent) break;
         work.reading(pageNum);
         try {
-            const extract = await collectPage(pdfjs, pdfDocument, pageNum, config, pdfCfg, fontCache, destCache, sectionLinks, work, assets, markedContent, glyphNames, keptJpegs);
+            const extract = await collectPage(pdfjs, pdfDocument, pageNum, config, pdfCfg, fontCache, destCache, sectionLinks, work, assets, unreadable, markedContent, glyphNames, keptJpegs);
             if (extract) extracts.push(extract);
         } catch (e: any) {
             // A page failing because its parse has ended (its process ended with it) is not reported.
@@ -2116,6 +2187,7 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
     // Warn when much of the extracted text is unmappable glyphs (broken/missing ToUnicode), so consumers
     // can tell "genuinely empty" from "font could not be decoded" and reach for OCR.
     warnIfEncodingSuspect(allRuns, config);
+    reportUnmappedFonts(unreadable, fontCache, glyphNames, config);
 
     // Warn when a document yields essentially no text and OCR is off: it is very likely scanned (or its
     // text is in fonts whose CMaps could not be loaded, which the warning then says instead), and silent
@@ -2294,8 +2366,8 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
             finalizeBounds(pageHeaders, pageCtx, pdfCfg.includeBounds);
             finalizeBounds(pageFooters, pageCtx, pdfCfg.includeBounds);
             const label = pageLabels?.[extract.pageNumber - 1];
-            const header: PageFurniture = { pageNumber: extract.pageNumber, kind: 'header', nodes: pageHeaders, rotation: extract.rotation, label };
-            const footer: PageFurniture = { pageNumber: extract.pageNumber, kind: 'footer', nodes: pageFooters, rotation: extract.rotation, label };
+            const header: PageFurniture = { pageNumber: extract.pageNumber, kind: 'header', nodes: pageHeaders, rotation: extract.rotation, label, tagged: artifactHeader.length > 0 };
+            const footer: PageFurniture = { pageNumber: extract.pageNumber, kind: 'footer', nodes: pageFooters, rotation: extract.rotation, label, tagged: artifactFooter.length > 0 };
             furniture.push(header, footer);
             appendAll(auxHeaders, pageHeaders);
             appendAll(auxFooters, pageFooters);
@@ -2338,27 +2410,25 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
 
     // The page numbers in the pages' headers and footers, marked as the page fields they print, now that
     // every page's are read (a number is marked only where each page's of that text is its own). Only what
-    // stays true of the pages read: a writer numbers its own pages from one, so a page's number is its field
-    // only where the pages read are the document's from its first, one after another, and the pages' count
-    // only where they are all of them. A range from a later page (pageRange '2-4') marks none: "Page 2 of 4"
-    // printed on its first page is no number of the output's.
-    const fromFirst = extracts.every((e, i) => e.pageNumber === i + 1);
-    if (fromFirst) markPageFields(furniture, numPages, extracts.length === numPages);
-    // A header or footer whose text is not the same on every page it is on, once its page fields are its
-    // fields (a chapter's head, a journal's pages numbered from 147), or that only some pages have (a sheet's
-    // name), stays in its pages: a writer prints one header on every page, the first page's, which lost the
-    // other pages' text or printed it where a page had none. Where the first page's alone differs or is
-    // missing (a cover's, before two pages at least), that one stays in its page and the others' is the
-    // document's.
-    const changing = furnitureChanging(furniture, extracts.map(e => e.pageNumber));
-    for (const [kind, only] of changing) {
+    // stays true of the pages read: the pages' count only where they are all of them ("of 4" printed over
+    // pageRange '2-4' is the document's). A writer numbers its own pages from one, so where the pages read
+    // print others, each section says where it starts (see planFurniture).
+    markPageFields(furniture, numPages, extracts.length === numPages);
+    const pagesWithText = new Set(furniture.filter(p => p.nodes.length).map(p => p.pageNumber));
+    for (const node of content) {
+        const pageNumber = node.type === 'page' ? (node.metadata as { pageNumber?: number } | undefined)?.pageNumber : undefined;
+        if (pageNumber !== undefined && node.children?.length) pagesWithText.add(pageNumber);
+    }
+    const plan = planFurniture(furniture, extracts.map(e => e.pageNumber), pagesWithText);
+    // (Kept in the pages, what stays in them is no field either: a range's numbers would print from 1.)
+    if (pdfCfg.keepHeadersAndFootersInPages) for (const node of plan.back) unmarkPageFields(node);
+    for (const kind of ['header', 'footer'] as const) {
         const aux = kind === 'header' ? auxHeaders : auxFooters;
-        const moved = new Set<OfficeContentNode>();
         for (const page of routed) {
-            if (!page[kind].length || (only !== null && (page.page.metadata as { pageNumber?: number } | undefined)?.pageNumber !== only)) continue;
+            const staying = page[kind].filter(([, went]) => plan.back.has(went));
+            if (!staying.length) continue;
             const children = page.page.children!;
-            const back = page[kind].map(([read, went]) => {
-                moved.add(went);
+            const back = staying.map(([read, went]) => {
                 // (Its box as finalized with the page's header; the fields cut in it are its text again.)
                 const node = read === went.children?.[0] ? read : { ...read, ...(went.children?.[0]?.bounds ? { bounds: went.children[0].bounds } : {}) };
                 if (node !== read && !went.children?.[0]?.bounds) delete node.bounds;
@@ -2374,9 +2444,53 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
             if (kind === 'header') children.splice(page.above, 0, ...back); else children.splice(children.length - page.below, 0, ...back);
             page.page.text = children.map(n => n.text).join(config.newlineDelimiter);
         }
-        const kept = aux.filter(n => !moved.has(n));
+        const kept = aux.filter(n => !plan.back.has(n));
         aux.length = 0;
         appendAll(aux, kept);
+    }
+    // Sections where the pages' lines change, among the sections of the pages' sizes, numbered in order.
+    if (plan.sections.size || plan.parts.size || Object.keys(plan.first).length || plan.differentFirstPage) {
+        let section = 0;
+        const sectionOf = new Map<number, number>(extracts.length ? [[extracts[0].pageNumber, 0]] : []);
+        for (let i = 0; i < content.length; i++) {
+            const node = content[i];
+            const pageNumber = node.type === 'page' ? (node.metadata as { pageNumber?: number } | undefined)?.pageNumber : undefined;
+            if (pageNumber === undefined) continue;
+            const how = plan.sections.get(pageNumber);
+            const before = i > 0 ? content[i - 1] : undefined;
+            const opened = before?.type === 'break' && typeof (before.metadata as BreakMetadata | undefined)?.section === 'number' ? before : undefined;
+            if (how && !opened && i > 0) {
+                const meta = node.metadata as { pageWidth?: number; pageHeight?: number };
+                const size = meta.pageWidth !== undefined && meta.pageHeight !== undefined ? { width: meta.pageWidth, height: meta.pageHeight } : {};
+                content.splice(i, 0, { type: 'break', text: '', metadata: { breakType: 'page', section: 0, pageSetup: { ...size, ...how } } as BreakMetadata });
+                i++;
+            } else if (how && opened) {
+                const meta = opened.metadata as BreakMetadata;
+                meta.pageSetup = { ...meta.pageSetup, ...how };
+            }
+            sectionOf.set(pageNumber, section);
+        }
+        // (Numbered once all are in, by the order they stand in.)
+        section = 0;
+        for (const node of content) {
+            if (node.type === 'break' && typeof (node.metadata as BreakMetadata | undefined)?.section === 'number') (node.metadata as BreakMetadata).section = ++section;
+            else if (node.type === 'page') {
+                const pageNumber = (node.metadata as { pageNumber?: number } | undefined)?.pageNumber;
+                if (pageNumber !== undefined) sectionOf.set(pageNumber, section);
+            }
+        }
+        for (const list of [auxHeaders, auxFooters]) {
+            for (const node of list) {
+                const part = plan.parts.get(node);
+                if (!part) continue;
+                const meta = node.metadata as HeaderFooterMetadata;
+                meta.type = part.type;
+                meta.section = sectionOf.get(part.startsAt) ?? 0;
+            }
+        }
+        if (Object.keys(plan.first).length || plan.differentFirstPage) {
+            metadata.pageSetup = { ...metadata.pageSetup, ...plan.first, ...(plan.differentFirstPage ? { differentFirstPage: true } : {}) };
+        }
     }
 
     // Now that every page's headings and their positions are known, point each internal link at the

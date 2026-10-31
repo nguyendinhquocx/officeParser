@@ -132,6 +132,7 @@ const WARNING_MESSAGES: Record<OfficeWarningType, string | ((...args: any[]) => 
     [OfficeWarningType.NO_SLIDES_FOUND]: `Presentation contains no slides (ppt/slides/). A legitimately empty presentation produces this too, but if you expected content the file may be incomplete.`,
     [OfficeWarningType.INVALID_STYLE_MAP_TAG]: (tag: string) => `styleMap output.tag ${JSON.stringify(tag)} is not an allowed element name and was ignored; the node's default tag was used instead. A tag name is written into both the opening and closing tag, so only a known-safe set of block, heading and inline elements is accepted.`,
     [OfficeWarningType.PDF_STRUCT_TREE_UNRELIABLE]: (reason: string) => `PDF tagged-structure tree was not used${reason ? ` (${reason})` : ''}; recovered structure from page geometry instead.`,
+    [OfficeWarningType.PDF_FONT_UNMAPPED]: (info: { font: string; pages: number[] }) => `PDF font ${info.font || '(unnamed)'} has no map from its codes to characters and its text has control characters among it, so what is drawn with it is likely its glyph ids read as characters (first on page ${info.pages[0]}, ${info.pages.length} page${info.pages.length === 1 ? '' : 's'}). Consider OCR.`,
     [OfficeWarningType.PDF_TEXT_ENCODING_SUSPECT]: (info: string) => `PDF text extraction produced many unmappable glyphs${info ? ` (${info})` : ''}; the font is likely missing a usable ToUnicode map, so the extracted text may be garbage. Consider OCR.`,
     [OfficeWarningType.PDF_NO_TEXT_EXTRACTED]: (info: number | { pages: number; cMaps: string[] }) => {
         const pages = typeof info === 'number' ? info : info?.pages;
@@ -165,6 +166,8 @@ const WARNING_MESSAGES: Record<OfficeWarningType, string | ((...args: any[]) => 
         return `pdf.js could not load ${what}${at} because ${why}: ${loss}. ${fix}`;
     },
     [OfficeWarningType.PDF_SEPARATE_PROCESS_UNAVAILABLE]: `pdf.js could not start in a separate process, so it runs in this one: a hostile PDF can then exhaust this process's memory, and the time pdf.js takes is not bounded (pdfParserConfig.maxTimeMs applies to the separate process; bound the parse with abortSignal). Set pdfParserConfig.separateProcess to false to read in this process without trying.`,
+    [OfficeWarningType.BROTLI_DECODER_AVOIDED]: (info: { what: string; runtime: string; fixed: string }) =>
+        `${info.runtime} has a flaw in its Brotli decoder (CVE-2026-111497) that a crafted file can use to run code, so ${info.what} decoded by a slower decoder written in JavaScript instead. What it decodes is the same, and what it cannot decode is reported or left out as with any other. Upgrade to ${info.fixed}: this protects officeParser's own reading only, not anything else in your application that decompresses Brotli, such as fetch().`,
     [OfficeWarningType.OCR_REQUIRES_ATTACHMENTS]: () => `'ocr: true' was set without 'extractAttachments: true'; OCR runs over extracted images, so no OCR was performed. Add 'extractAttachments: true' to recognize text from the document's images.`,
     [OfficeWarningType.INVALID_CONFIG_VALUE]: (info: { option: string; value: unknown; expected: string; fallback: unknown }) => {
         // A number JSON cannot write (NaN, -Infinity) is shown as itself, not as null.

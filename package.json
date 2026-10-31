@@ -1,6 +1,6 @@
 {
   "name": "officeparser",
-  "version": "8.4.1",
+  "version": "8.5.0",
   "description": "A robust, strictly-typed Node.js and Browser library for parsing office files (.docx, .pptx, .xlsx, .odt, .odp, .ods, .odg, .pdf, .rtf, .csv, .md, .html, .epub, .tex) and generating high-fidelity outputs in DOCX, ODT, XLSX, ODS, PPTX, ODP, LaTeX, Markdown, HTML, CSV, RTF, PDF, EPUB, and RAG-focused chunks.",
   "funding": "https://github.com/sponsors/harshankur",
   "main": "dist/index.js",
@@ -29,7 +29,7 @@
   },
   "sideEffects": false,
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.23.4 <23 || >=24.22.1 <25 || >=26.12.1"
   },
   "files": [
     "dist"

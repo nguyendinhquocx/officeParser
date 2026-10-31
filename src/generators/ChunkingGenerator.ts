@@ -1,3 +1,4 @@
+import { writtenMarkerLabel } from '../utils/listMarkers.js';
 import {
     DEFAULT_DOCUMENT_STRUCTURE_CHUNKING_CONFIG,
     DEFAULT_FIXED_SIZE_CHUNKING_CONFIG,
@@ -20,7 +21,8 @@ import {
     PageMetadata,
     SemanticChunkingConfig,
     SheetMetadata,
-    SlideMetadata
+    SlideMetadata,
+    ListMetadata,
 } from '../types.js';
 import { getOfficeError, checkAbortSignal } from '../utils/errorUtils.js';
 import { BaseGenerator } from './BaseGenerator.js';
@@ -94,6 +96,11 @@ function collectNodeText(node: OfficeContentNode, context: ChunkTextContext): st
             out += collectNodeText(child, context);
             afterBlock = block;
         }
+    }
+    // A numbered item's label is its text to a reader ("see (l)"), as the text generator writes it.
+    const meta = node.metadata as ListMetadata | undefined;
+    if (node.type === 'list' && meta?.listType === 'ordered' && typeof meta.marker === 'string' && meta.marker.trim() && out.trim()) {
+        out = `${writtenMarkerLabel(meta.marker)} ${out}`;
     }
     if (node.notes && node.notes.length > 0) {
         for (const note of node.notes) {

@@ -18,6 +18,7 @@
  */
 
 import { fillPageNumber } from '../../utils/pageNumbers.js';
+import { clampInt } from '../../utils/numberUtils.js';
 import { EmbedMetadata, FullGeneratorConfig, ImageMode, IndentationMetadata, OfficeContentNode, OfficeErrorType, OfficeMetadata, OfficeParserAST, OfficeWarningType, PageSetup, ParagraphSpacing, SheetMetadata, TextAlignment, TextFormatting, BreakMetadata, ChartData, HeaderFooterMetadata, NodeBounds, ShapeMetadata, SlideMetadata, PageNumberFormat } from '../../types.js';
 import { hasPageSize, onDocumentPage } from '../../utils/pageLimits.js';
 import { getAbortError, getOfficeError } from '../../utils/errorUtils.js';
@@ -27,6 +28,7 @@ import { sanitizeOfficePackageUrl } from '../../utils/sanitize.js';
 import { cssColorHex } from '../../utils/colorUtils.js';
 import { formatListNumber } from '../../utils/listMarkers.js';
 import { drawSvg, readSvg } from './svgDrawing.js';
+import { BROTLI_FIXED_RELEASES, runtimeHasBrotliFlaw, runtimeName } from '../../utils/brotliFlaw.js';
 import { cffOutlines, colorTables, fontkitUnbrotli, nativeUnbrotli, sfntOf, substitutes, trueTypeOutlines, Unbrotli, UnreadableFont } from './fontFiles.js';
 
 /** The largest of `values` and `floor`, without spreading them into one call (which a long list overflows). */
@@ -1164,9 +1166,13 @@ class NativeLayout {
         this.furniture = true;
         // Each footer's height at each page width, measured once (a page number's own width aside).
         const footerHeights = new Map<OfficeContentNode, Map<number, number>>();
+        let shown = 0;
         try {
             for (const [index, record] of this.pageRecords.entries()) {
-                this.fieldPage = index + 1;
+                // (A section restarting its numbers restarts them on its first page; the pages after go on.)
+                const start = record.firstOfSection || index === 0 ? this.sectionSetups.get(record.section)?.pageNumberStart : undefined;
+                shown = start === undefined ? shown + 1 : clampInt(start, 0, 2_147_483_647, 1);
+                this.fieldPage = shown;
                 this.fieldFormat = this.sectionSetups.get(record.section)?.pageNumberFormat;
                 this.pageW = record.w; this.pageH = record.h; this.margin = record.margin;
                 const header = choose(headers, record, index + 1), footer = choose(footers, record, index + 1);
@@ -3352,9 +3358,15 @@ async function embedFonts(pdf: any, lib: any, pc: FullGeneratorConfig['pdfConfig
 
     const fontkit = await loadFontkit(config);
     pdf.registerFontkit(fontkit);
-    // (Brotli, for a WOFF2 font: Node's where it has one, else the decoder fontkit carries.)
+    // (Brotli, for a WOFF2 font: Node's where it has one, else the decoder fontkit carries; fontkit's, and
+    // a warning, where Node's has a flaw: see brotliFlaw.)
     let unbrotli: Unbrotli | undefined;
-    const brotli = () => unbrotli ??= nativeUnbrotli() ?? fontkitUnbrotli(fontkit);
+    const brotli = () => {
+        if (unbrotli) return unbrotli;
+        const flawed = runtimeHasBrotliFlaw();
+        if (flawed) reportWarning(OfficeWarningType.BROTLI_DECODER_AVOIDED, { what: 'this WOFF2 font was', runtime: runtimeName(), fixed: BROTLI_FIXED_RELEASES });
+        return unbrotli = (flawed ? undefined : nativeUnbrotli()) ?? fontkitUnbrotli(fontkit);
+    };
     // The same bytes given for two styles are embedded once: the same view, or views of the same part of
     // one buffer (an ArrayBuffer given twice is viewed anew each time).
     const embedded = new Map<ArrayBufferLike, Map<string, Face | null>>();

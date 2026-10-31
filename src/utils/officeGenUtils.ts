@@ -272,13 +272,24 @@ export function sectionFurnitureIndex(nodes: OfficeContentNode[], kind: 'header'
     let index = byKind.get(`${kind}|${type}`);
     if (!index) {
         const bySection = new Map<number, OfficeContentNode>();
+        const linesOfPart = new Map<number, OfficeContentNode[]>();
         const running = type === 'default' ? undefined : runningFurniture(nodes, kind)[0];
         for (const n of nodes) {
             const m = n.metadata as { type?: string; section?: number; hidden?: boolean; page?: number } | undefined;
-            if (n.type !== kind || n === running || m?.page !== undefined || m?.hidden || (m?.type ?? 'default') !== type) continue;
+            if (n.type !== kind || n === running || m?.hidden || (m?.type ?? 'default') !== type) continue;
             const section = typeof m?.section === 'number' ? m.section : type === 'default' ? -1 : 0;
             if (section < (type === 'default' ? 1 : 0)) continue;
-            if (!bySection.has(section)) bySection.set(section, n);
+            const own = bySection.get(section);
+            if (!own) bySection.set(section, n);
+            // A part read from a page (a PDF's) is that page's lines, each a node: all of them.
+            else if (m?.page !== undefined && (own.metadata as { page?: number } | undefined)?.page === m.page) {
+                let lines = linesOfPart.get(section);
+                if (!lines) linesOfPart.set(section, lines = [own]);
+                lines.push(n);
+            }
+        }
+        for (const [section, lines] of linesOfPart) {
+            bySection.set(section, { ...lines[0], children: lines.flatMap(line => line.children ?? []), text: lines.map(line => line.text).filter(Boolean).join('\n') });
         }
         index = { bySection, sections: [...bySection.keys()].sort((a, b) => a - b) };
         byKind.set(`${kind}|${type}`, index);

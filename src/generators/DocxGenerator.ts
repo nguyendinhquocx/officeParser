@@ -7,6 +7,7 @@ import { escapeXml, isSafeStyleMapTag, sanitizeOfficePackageUrl, stripInvalidXml
 import { heldColumns } from '../utils/columnUtils.js';
 import { onDocumentPage } from '../utils/pageLimits.js';
 import { pageFieldInstruction, wordFmtOf } from '../utils/pageNumbers.js';
+import { clampInt } from '../utils/numberUtils.js';
 import { ADMONITION_COLOR, decodeBase64, embedUrl, encUrl, fillSheetRowGaps, hexColor, isHeaderRow, furnitureKind, lengthToPt, MIME_EXT, ooxmlCustomPropertiesXml, resolvePaper, resolveZipInstant, runningFurniture, sectionFurniture, sectionFurnitureIndex, sniffImageSize, toBookmarkNameRaw, toW3CDTF, writableSpacing } from '../utils/officeGenUtils.js';
 import { markerPattern, MarkerPattern } from '../utils/listMarkers.js';
 import { BaseGenerator } from './BaseGenerator.js';
@@ -231,6 +232,9 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
             if (typeof override === 'string') { if (override) lastBlockAt = out.length; out.push(override); prevPaginated = null; prevBareList = false; continue; }
             // Preserve source pagination: a page break between consecutive page (or slide) nodes.
             if ((node.type === 'page' || node.type === 'slide') && prevPaginated === node.type) {
+                // (A section ending on a blank page ends after this break, in a paragraph of its own there: in
+                // the paragraph before the break, the blank page was lost.)
+                lastBlockAt = -1;
                 out.push('<w:p><w:r><w:br w:type="page"/></w:r></w:p>');
             }
             // A run of consecutive lists that carry no listId of their own gets one synthetic id, so a
@@ -249,6 +253,9 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
             if (held !== undefined) out.splice(lastBlockAt, out.length - lastBlockAt, held);
             else out.push(block);
             if (block && held === undefined) lastBlockAt = at;
+            // (A paragraph on a blank page, for a section ending there: LibreOffice leaves out a section's
+            // last paragraph where it is empty, and the page with it.)
+            if (!block && node.type === 'page' && prevPaginated === 'page') out.push('<w:p/>');
             prevPaginated = (node.type === 'page' || node.type === 'slide') ? node.type : null;
             prevBareList = isBareList;
         }
@@ -940,7 +947,7 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
      * A section's properties (`w:sectPr`): its page's size and margins (under format 'auto' the
      * section's own, else the format's), its columns, how it starts, and `refs` (its header and footer).
      */
-    private sectionProperties(setup: PageSetup | undefined, start: 'nextPage' | 'continuous', refs: string, titlePage: boolean | string): string {
+    private sectionProperties(setup: PageSetup | undefined, sectionStart: 'nextPage' | 'continuous', refs: string, titlePage: boolean | string): string {
         const cfg = this.config.docxConfig;
         const paper = resolvePaper(cfg.format, cfg.landscape, setup, cfg.margin);
         const twips = (pt: number) => Math.round(pt * TWIPS_PER_PT);
@@ -961,8 +968,9 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
             this.unwrittenNumbering.add(format);
             this.warn(OfficeWarningType.CONTENT_NOT_REPRESENTABLE, { format: 'docx', feature: `page numbers in ${format} (written in digits)` });
         }
-        const pgNumType = fmt ? `<w:pgNumType w:fmt="${fmt}"/>` : '';
-        return `<w:sectPr>${refs}${start === 'continuous' ? '<w:type w:val="continuous"/>' : ''}<w:pgSz w:w="${twips(paper.w)}" w:h="${twips(paper.h)}"${orient}/>${pgMar}${pgNumType}${cols}${title}</w:sectPr>`;
+        const start = setup?.pageNumberStart;
+        const pgNumType = fmt || start !== undefined ? `<w:pgNumType${fmt ? ` w:fmt="${fmt}"` : ''}${start !== undefined ? ` w:start="${clampInt(start, 0, 2_147_483_647, 1)}"` : ''}/>` : '';
+        return `<w:sectPr>${refs}${sectionStart === 'continuous' ? '<w:type w:val="continuous"/>' : ''}<w:pgSz w:w="${twips(paper.w)}" w:h="${twips(paper.h)}"${orient}/>${pgMar}${pgNumType}${cols}${title}</w:sectPr>`;
     }
     /** The page number formats a section had that Word has none of, each reported once. */
     private unwrittenNumbering = new Set<string>();

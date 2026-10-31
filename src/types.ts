@@ -150,6 +150,8 @@ export enum OfficeWarningType {
     PDF_STRUCT_TREE_UNRELIABLE = 'PDF_STRUCT_TREE_UNRELIABLE',
     /** A fifth or more of a PDF's characters (of at least 50) are unmappable glyphs (broken/missing ToUnicode); extracted text is likely garbage */
     PDF_TEXT_ENCODING_SUSPECT = 'PDF_TEXT_ENCODING_SUSPECT',
+    /** A PDF's font has no map from its codes to characters and its text has control characters among it, so what is drawn with it is likely its glyph ids read as characters. Once per font name per document, with the first page as `page`, every page with its text in `details.pages`, and in `details.font` the name its text's runs give */
+    PDF_FONT_UNMAPPED = 'PDF_FONT_UNMAPPED',
     /** A PDF yielded essentially no text: it is very likely a scanned/image-only document needing OCR, or, when a CMap its fonts need could not be had (see `PDF_ASSET_UNAVAILABLE`), its text is in those fonts */
     PDF_NO_TEXT_EXTRACTED = 'PDF_NO_TEXT_EXTRACTED',
     /** A PDF's bookmark outline was cut short by the depth/size cap or could not be read; `ast.auxiliary.outline` holds only what was recovered */
@@ -158,6 +160,8 @@ export enum OfficeWarningType {
     PDF_CONTENT_LIMIT_EXCEEDED = 'PDF_CONTENT_LIMIT_EXCEEDED',
     /** pdf.js could not start in a separate process (see `pdfParserConfig.separateProcess`), so it runs in this one */
     PDF_SEPARATE_PROCESS_UNAVAILABLE = 'PDF_SEPARATE_PROCESS_UNAVAILABLE',
+    /** The runtime's Brotli decoder has a known flaw (CVE-2026-111497), so a PDF's Brotli stream or a WOFF2 font was decoded by a slower decoder written in JavaScript. Upgrade the runtime. */
+    BROTLI_DECODER_AVOIDED = 'BROTLI_DECODER_AVOIDED',
     /**
      * A file pdf.js needed for a PDF could not be had: a CMap (the text of the fonts using it is
      * missing) or an image decoder (pictures needing it are not decoded). Raised once per file per
@@ -750,18 +754,23 @@ export interface PdfParserConfig {
      * printed alike on other pages (a chapter's head), no larger than the text and standing apart from
      * it, or the page's own number on two pages. "Question 3" at the top of one page and "Question 4" at
      * the top of the next are the pages' own. A page number in one is marked as the page field it prints
-     * (TextMetadata.field), where the pages read are the document's from its first (a `pageRange` from a
-     * later page marks none), and its pages' count only where all are read. Either is read into
-     * `auxiliary`, as a word processor's header is, where it is the same on every page read (the first of
-     * three or more may have none, a cover's) once its page numbers are fields: a writer that lays out pages (Word, ODT, RTF, LaTeX, the PDF writer's
-     * native engine) writes it on every page, each page numbered its own, and one that does not (text,
-     * Markdown, HTML and the PDF writer's default HTML engine, EPUB, PowerPoint) leaves it out. A header or
-     * footer whose text changes from page to page (a chapter's head, pages numbered from 147), or that some
-     * pages have and others not (a sheet's name on its sheet's pages), stays in its pages, where it is, as no
-     * such writer could print it; where only the first page read differs (a cover's, every other page, two at
-     * least, having the same one), that one stays on its page and the others' is the document's. A header's
-     * line larger than the text is a paragraph of it, not a heading. Turn this on for a writer that shows each
-     * page as it was, a slide per page, so every page keeps its own header and footer in its place.
+     * (TextMetadata.field), and its pages' count only where all are read. Either is read into `auxiliary`, as a
+     * word processor's header is: a writer that lays out pages (Word, ODT, RTF, LaTeX, the PDF writer's native
+     * engine) writes it, each page numbered as it printed, and one that does not (text, Markdown, HTML and the
+     * PDF writer's default HTML engine, EPUB, PowerPoint) leaves it out. A line the PDF marks as an artifact goes
+     * there whatever it says; a line found by comparing an untagged PDF's pages where it is the same, its page
+     * numbers as one, on every page that has any, on all odd or even ones, or but for the first page, and missing
+     * from no more than one page in five with text between its first and last (a chapter's opening). A number
+     * that counts no pages is the line's own. One whose words
+     * or own number change from page to page (a customer's name on merged letters, "Account 10101"), or a kind on
+     * fewer than two of three pages with text (a sheet's name on its sheet's pages), stays in its pages, where it is. Where
+     * the lines in `auxiliary` differ, they are parts as a word processor's are (HeaderFooterMetadata `type` and
+     * `section`): a first page's, even pages', or a section at each change or restart of the numbers, numbered
+     * where it restarts (PageSetup.pageNumberStart), past 64 of them staying in the pages too. Pages before a
+     * kind's first line are a section without it. A writer's first and even parts being the whole document's,
+     * where one kind has them each kind does, and which pages are even goes by the numbers they print. A header's line larger than the text is a paragraph of it, not a heading.
+     * Turn this on for a writer that shows each page as it was, a slide per page, so every page keeps its own
+     * header and footer in its place.
      * `ignoreHeadersAndFooters` still drops them.
      *
      * Default is false.
@@ -1072,7 +1081,8 @@ export interface OfficeIssue {
     /**
      * The page of the PDF being read that the issue is on (1-based), where the reader knows it: a
      * picture that could not be extracted or decoded, a page or its links that could not be read, an
-     * object a page waited for, and the page a content budget ran out on. The message names it too.
+     * object a page waited for, the page a content budget ran out on, and the first page of a font whose
+     * text is its glyph ids. The message names it too.
      */
     page?: number;
 }
@@ -1681,6 +1691,11 @@ export interface PageSetup {
      * page field in the section with no format of its own (TextMetadata.fieldFormat) prints its page in it.
      */
     pageNumberFormat?: PageNumberFormat;
+    /**
+     * The number the first of these pages prints, where it does not go on from the pages before (a
+     * body's 1 after a front matter's v). Absent: it goes on.
+     */
+    pageNumberStart?: number;
 }
 
 /**
@@ -2306,8 +2321,8 @@ export interface FallbackToHtmlConfig {
     itemLineBreaks?: boolean;
     /**
      * Inline text color, highlight, and font size via a `<span style="color:...;background-color:...;
-     * font-size:...">` run, which the Markdown parser reads back. These have no Markdown syntax and
-     * are silently lost otherwise. Unlike the other fields this is **off by default even when
+     * font-size:...">` run, which the Markdown parser reads back, in prose and in table cells alike.
+     * These have no Markdown syntax and are silently lost otherwise. Unlike the other fields this is **off by default even when
      * `fallbackToHtml` is `true`**, because it changes default output; enable it explicitly with
      * `fallbackToHtml: { inlineFormatting: true }`.
      */
@@ -2342,6 +2357,14 @@ export interface MdGeneratorConfig {
      * Defaults to true.
      */
     fallbackToHtml?: boolean | FallbackToHtmlConfig;
+
+    /**
+     * How an ordered list item the document labels other than `1.` is written. `'keep'` (the default)
+     * writes its label as text after a bullet (`- (l) Annual reports`, `- 2.1. Scope`), as Markdown numbers
+     * in digits alone (a label that is only a number stays Markdown's own: `5. Five`); `'numbers'` writes the
+     * item's number (`12. Annual reports`), a native ordered list that shows another label than the document's.
+     */
+    listMarkers?: 'keep' | 'numbers';
 
     /**
      * Target Markdown dialect for generation - which native syntax to emit for constructs that
