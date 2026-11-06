@@ -152,7 +152,7 @@ export enum OfficeWarningType {
     PDF_TEXT_ENCODING_SUSPECT = 'PDF_TEXT_ENCODING_SUSPECT',
     /** A PDF's font has no map from its codes to characters and its text has control characters among it, so what is drawn with it is likely its glyph ids read as characters. Once per font name per document, with the first page as `page`, every page with its text in `details.pages`, and in `details.font` the name its text's runs give */
     PDF_FONT_UNMAPPED = 'PDF_FONT_UNMAPPED',
-    /** A PDF yielded essentially no text: it is very likely a scanned/image-only document needing OCR, or, when a CMap its fonts need could not be had (see `PDF_ASSET_UNAVAILABLE`), its text is in those fonts */
+    /** A PDF yielded essentially no text (fewer than 10 non-space characters, or than one a page read): it may well be a scanned/image-only document needing OCR, and the message says how many characters were read; or, when a CMap its fonts need could not be had (see `PDF_ASSET_UNAVAILABLE`), its text is in those fonts; or, when its text is in fonts with no map from codes to characters (see `PDF_FONT_UNMAPPED`), what was read is likely glyph ids. `details` is the number of pages read, or `{ pages, cMaps }` naming the CMaps, `{ pages, fonts }` naming the fonts, or `{ pages, cMaps, fonts }` when both apply */
     PDF_NO_TEXT_EXTRACTED = 'PDF_NO_TEXT_EXTRACTED',
     /** A PDF's bookmark outline was cut short by the depth/size cap or could not be read; `ast.auxiliary.outline` holds only what was recovered */
     PDF_OUTLINE_TRUNCATED = 'PDF_OUTLINE_TRUNCATED',
@@ -172,6 +172,8 @@ export enum OfficeWarningType {
     PDF_ASSET_UNAVAILABLE = 'PDF_ASSET_UNAVAILABLE',
     /** `ocr: true` was set without `extractAttachments: true`; OCR runs over extracted images (in every format), so no OCR was performed */
     OCR_REQUIRES_ATTACHMENTS = 'OCR_REQUIRES_ATTACHMENTS',
+    /** A template check found as many problems as it lists (`details.limit`: 1,000 for one data entry, or 10,000 in all for a batch, `details.batch`) and stopped there, in `details.entry` of a batch, with `details.unchecked` entries after it not checked; fix these and check again */
+    TEMPLATE_CHECK_LIMITED = 'TEMPLATE_CHECK_LIMITED',
     /** A config option was passed that this version does not recognize (e.g. a key renamed in a major release); it had no effect */
     UNRECOGNIZED_CONFIG_OPTION = 'UNRECOGNIZED_CONFIG_OPTION',
     /**
@@ -853,8 +855,14 @@ export interface PdfParserConfig {
      * `abortSignal` fires). They end when the host exits. When a process cannot start (a runtime that
      * cannot run its own executable as Node), pdf.js runs in this one with a
      * `PDF_SEPARATE_PROCESS_UNAVAILABLE` warning; it also runs here, without one, when this is false or
-     * the caller preloaded a worker as `globalThis.pdfjsWorker`. The browser runs pdf.js in a Web
-     * Worker regardless.
+     * pdf.js's worker file cannot be found and a worker is preloaded as `globalThis.pdfjsWorker` (a
+     * bundle that inlines it). A worker module merely loaded in this process, as pdf.js's own does
+     * when a document of yours is opened with it, leaves the separate process in use. Where the worker
+     * file is found, pdf.js's worker runs in this process on a module of the library's own, so your own
+     * pdf.js, of this version or another, keeps its worker and its warning level; a worker preloaded
+     * where no file is found (the library's own bundled one included) is shared with any pdf.js in the
+     * process. The browser runs pdf.js in a Web Worker
+     * regardless.
      *
      * Default is true.
      */
@@ -1037,9 +1045,10 @@ export interface DecompressionLimits {
      * once and use it many times: an ODF cell or row repeated with `table:number-columns-repeated` /
      * `table:number-rows-repeated`, an XLSX shared string shown in many cells, a style's font or colour
      * given to every run using it, a relationship's link target given to every hyperlink naming it, a
-     * comment author named by id, a chart's text at every frame showing it, a repeated chart value, and
-     * in LaTeX a heading's title at every `\nameref`, a theorem title at every theorem and beamer's
-     * title block at every `\maketitle`. The AST shares the value, so it stays small, but everything that reads
+     * comment author named by id, a chart's text at every frame showing it, a repeated chart value, a
+     * form control's text at each `draw:control` naming it, and in LaTeX a heading's title at every
+     * `\nameref`, a theorem title at every theorem and beamer's title block at every `\maketitle`.
+     * The AST shares the value, so it stays small, but everything that reads
      * the AST afterwards (each generator, `toText`) writes it at each use: 700 bytes asking for 100,000
      * copies of a 2,000-span cell made 200 MB of text, and 1.7 KB of DOCX giving one 64 KB font to 2,000
      * runs made 131 MB of HTML. `maxTableCells` counts cells, not what they hold.
@@ -1047,9 +1056,9 @@ export interface DecompressionLimits {
      * Each use after the first costs what it weighs (characters, plus 16 for each node a repeated cell
      * holds) past 64, so short values repeat freely. Past the limit, with a
      * `REPEATED_CONTENT_LIMIT_EXCEEDED` warning, the remaining repeats of a content-bearing ODF cell are
-     * not made (later cells keep their row and column numbers), an XLSX cell, chart value, frame or
-     * reference shows the start of its text, and a node repeating a long style value or link goes
-     * without it. Raise it for documents
+     * not made (later cells keep their row and column numbers), an XLSX cell, chart value, frame,
+     * form control or reference shows the start of its text, and a node repeating a long style value or
+     * link goes without it. Raise it for documents
      * that legitimately repeat large content.
      *
      * Default is 16777216.
@@ -1693,7 +1702,9 @@ export interface PageSetup {
     pageNumberFormat?: PageNumberFormat;
     /**
      * The number the first of these pages prints, where it does not go on from the pages before (a
-     * body's 1 after a front matter's v). Absent: it goes on.
+     * body's 1 after a front matter's v): Word's `w:pgNumType w:start`, RTF's `\pgnrestart` at `\pgnstarts`,
+     * an ODF paragraph's or table's `style:page-number` with the master page it starts, the numbers a PDF's
+     * pages print. Absent: it goes on. Readers leave out a first section's 1, where its pages start anyway.
      */
     pageNumberStart?: number;
 }
@@ -2728,6 +2739,57 @@ export interface TemplateDataDetails {
     /** For `unformattable`, the filter, and what it takes (`number` or `date` for `format`). */
     filter?: string;
     takes?: string;
+}
+
+/** A loop a template tag is read in: the list as typed in its `for` tag (`lines`, `order.lines`), and the pass, from 0. */
+export interface TemplateLoopPlace {
+    list: string;
+    index: number;
+}
+
+/**
+ * A tag of a template, as {@link OfficeTemplate.tags} lists it: a field, or a block's opening or
+ * branch tag (`endif` and `endfor` close what they open and are not listed). In the order of each part.
+ */
+export interface TemplateTagInfo {
+    /** `field` (`{{ name }}`), `if`, `elseif`, `else` or `for`. */
+    kind: 'field' | 'if' | 'elseif' | 'else' | 'for';
+    /** The tag as typed, delimiters included (a very long one is cut short). */
+    tag: string;
+    /** The document part holding it, e.g. `word/document.xml` or `word/header1.xml`. */
+    part: string;
+    /**
+     * What the tag reads from the data, each as typed: a field's path, every path in a condition, a
+     * loop's list. A path may start with a loop's item (`line.qty`) or `loop` (`loop.last`), which the
+     * enclosing `for` tags name.
+     */
+    fields: string[];
+    /** A field's filters, by name, in order. */
+    filters?: string[];
+    /** A `for` tag's item name (`line` in `{{ for line in lines }}`). */
+    item?: string;
+    /**
+     * The `for` tags this tag is inside, outermost first, each as its item name and list as typed. A note
+     * only loops refer to is listed as its part holds it, outside them: its fields may start with the
+     * item of a loop that refers to it.
+     */
+    loops: { item: string; list: string }[];
+}
+
+/** A problem {@link OfficeTemplate.check} finds with a template's data: what a render with `onMissing: 'error'` would reject. */
+export interface TemplateProblem {
+    /** `TEMPLATE_FIELD_MISSING` (the data does not have a field the template reads) or `TEMPLATE_DATA_INVALID` (a value does not fit its tag). */
+    code: OfficeErrorType.TEMPLATE_FIELD_MISSING | OfficeErrorType.TEMPLATE_DATA_INVALID;
+    /** What a render would say. */
+    message: string;
+    /** For a missing field: the field as typed (`name`, `line.qty`). */
+    field?: string;
+    /** For a value that does not fit: why, and the tag (see {@link TemplateDataDetails}). */
+    details?: TemplateDataDetails;
+    /** The document part the tag is in. */
+    part: string;
+    /** The loops it was read in, outermost first, with each one's pass: `line.qty` in the third line is `[{ list: 'lines', index: 2 }]`. Frozen, and shared by the problems of one pass. */
+    loops: TemplateLoopPlace[];
 }
 
 /**

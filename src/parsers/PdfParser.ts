@@ -56,7 +56,7 @@ import { FURNITURE_BAND, findRunningLines, markPageFields, PageFurniture, planFu
 import { setOwn } from '../utils/lookupUtils.js';
 import { BROTLI_AVOIDED_LINE, acquirePdfProcess, PdfProcess } from './pdf/pdfProcess.js';
 import { avoidBrotliInThisProcess, BROTLI_FIXED_RELEASES, onBrotliRefused, runtimeHasBrotliFlaw, runtimeName } from '../utils/brotliFlaw.js';
-import { captureConsoleWarnings, openWarningWorker, PdfAssetSession, pdfjsWorkerFile, resolvePdfAssetFolders, WarningWorker } from './pdf/pdfAssets.js';
+import { captureConsoleWarnings, openOwnWorker, openWarningWorker, PdfAssetSession, pdfjsWorkerFile, resolvePdfAssetFolders, setWorkerVerbosity, WarningWorker } from './pdf/pdfAssets.js';
 import { appendAll } from '../utils/nodeListUtils.js';
 
 /**
@@ -1244,9 +1244,9 @@ interface UnreadableText {
  * Warns of each font whose text is likely its glyph ids: control characters were taken out of its text,
  * every glyph drawn with it read as its own code, and the file says nothing of what its codes are. Once
  * per name per document, with every page it has text on. After all pages: what the file's bounds spend
- * here takes nothing from any page's text.
+ * here takes nothing from any page's text. Returns the names reported.
  */
-function reportUnmappedFonts(unreadable: UnreadableText, fontCache: Map<string, ResolvedFont>, glyphNames: GlyphNames, config: FullOfficeParserConfig): void {
+function reportUnmappedFonts(unreadable: UnreadableText, fontCache: Map<string, ResolvedFont>, glyphNames: GlyphNames, config: FullOfficeParserConfig): string[] {
     // The fonts that may be reported: only fonts of their names are looked for in the file.
     const candidates: { font: ResolvedFont; rawName: string; pages: number[] }[] = [];
     for (const [id, pages] of unreadable.pages) {
@@ -1267,6 +1267,7 @@ function reportUnmappedFonts(unreadable: UnreadableText, fontCache: Map<string, 
         const pages = [...all].sort((a, b) => a - b);
         logWarning(OfficeWarningType.PDF_FONT_UNMAPPED, config, { font, pages }, undefined, { page: pages[0] });
     }
+    return [...unmapped.keys()];
 }
 
 /** Collects one page's text runs, images and annotations into a PageExtract. */
@@ -1735,16 +1736,18 @@ function imageBounds(viewport: any, ctm: number[]): { x: number; y: number; widt
 }
 
 /**
- * Whether the caller preloaded pdf.js's worker as `globalThis.pdfjsWorker`, which runs pdf.js in this
- * process (see `separateProcess`). pdf.js's own worker module sets that global too, when it loads
- * here: the first time pdf.js runs in this process (`separateProcess: false`, or the fallback). So
- * the global is read until then and settled when it happens (settleCallerPreloadedWorker); read
- * afterwards, one parse in this process took pdf.js's own worker for the caller's, and every later
- * parse ran pdf.js here too, without its memory limit.
+ * Whether pdf.js's worker is preloaded as `globalThis.pdfjsWorker`, the way pdf.js itself tells: by its
+ * `WorkerMessageHandler`. pdf.js then runs the worker in this realm and loads no worker file (a
+ * truthy global without the handler is not one: pdf.js starts a Worker from `workerSrc` as usual).
+ * A page or a bundle preloads it so that no worker file is fetched or looked for. In Node the global
+ * is also set by pdf.js's own worker module whenever it loads in this process (any document a
+ * caller's own pdf.js opened; this library's own module puts it back, see openOwnWorker), so there it
+ * says nothing of the caller's intent and is relied on only where no worker file can be found (see
+ * parsePdf).
  */
-let workerPreloaded: boolean | undefined;
-const callerPreloadedWorker = (): boolean => workerPreloaded ?? !!(globalThis as any).pdfjsWorker;
-const settleCallerPreloadedWorker = (): void => { workerPreloaded ??= !!(globalThis as any).pdfjsWorker; };
+const workerPreloaded = (): boolean => {
+    try { return !!(globalThis as any).pdfjsWorker?.WorkerMessageHandler; } catch { return false; }
+};
 
 /**
  * Parses a PDF file and extracts content.
@@ -1768,17 +1771,25 @@ export const parsePdf = async (buffer: Buffer, config: FullOfficeParserConfig): 
         }
     };
     if (isBrowser) {
-        blockRemoteWorker();
-        pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
+        if (config.allowRemoteAssets === false && workerSrc === DEFAULT_PDF_WORKER_SRC && workerPreloaded()) {
+            // pdf.js runs the preloaded worker on the page and fetches nothing. Given no address, a
+            // fallback of pdf.js's would fail rather than fetch the default.
+            pdfjs.GlobalWorkerOptions.workerSrc = '';
+        } else {
+            blockRemoteWorker();
+            pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
+        }
     } else {
         assertNode('pdf-worker-auto-resolution', config);
         let resolved = false;
         if (workerSrc !== DEFAULT_OFFICE_PARSER_CONFIG.pdfWorkerSrc && workerSrc !== '') {
             pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
             resolved = true;
-        } else if (callerPreloadedWorker()) {
-            resolved = true;
         } else {
+            // pdf.js's worker file, which the separate process imports, is used wherever it is found,
+            // whether or not a worker module already loaded here (see workerPreloaded). A preloaded
+            // worker is for where there is no such file, a bundle that inlines pdf.js's worker.
+            let notFound: unknown;
             try {
                 // @ts-ignore - 'require' is available in Node.js/CommonJS environment
                 const localWorkerPath = require.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs');
@@ -1786,7 +1797,12 @@ export const parsePdf = async (buffer: Buffer, config: FullOfficeParserConfig): 
                 pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(localWorkerPath).href;
                 resolved = true;
             } catch (e) {
-                logWarning(OfficeWarningType.PDF_WORKER_FALLBACK, config, undefined, e);
+                notFound = e;
+            }
+            if (!resolved && workerPreloaded()) {
+                resolved = true;
+            } else if (!resolved) {
+                logWarning(OfficeWarningType.PDF_WORKER_FALLBACK, config, undefined, notFound);
             }
         }
         if (!resolved) {
@@ -1820,15 +1836,14 @@ export const parsePdf = async (buffer: Buffer, config: FullOfficeParserConfig): 
     const takeWarning = (line: string) => { if (line === BROTLI_AVOIDED_LINE) brotliAvoided(); else assets.workerWarning(line); };
 
     // pdf.js's worker in a process of its own (see pdfProcess), so what pdf.js does inside one stream
-    // cannot exhaust this one's memory. Only for a worker Node can import from disk; one the caller
-    // preloaded as `globalThis.pdfjsWorker`, or no separate process at all, runs pdf.js here.
+    // cannot exhaust this one's memory. Only for a worker Node can import from disk; one preloaded as
+    // `globalThis.pdfjsWorker` where no such file is found, or no separate process at all, runs pdf.js here.
     const workerUrl = String(pdfjs.GlobalWorkerOptions.workerSrc ?? '');
     let pdfProcess: PdfProcess | undefined;
-    if (!isBrowser && pdfCfg.separateProcess && !callerPreloadedWorker() && workerUrl.startsWith('file:')) {
+    if (!isBrowser && pdfCfg.separateProcess && workerUrl.startsWith('file:')) {
         pdfProcess = await acquirePdfProcess(pdfjs, workerUrl, pdfCfg.processMemoryMb, config.abortSignal);
         if (!pdfProcess) logWarning(OfficeWarningType.PDF_SEPARATE_PROCESS_UNAVAILABLE, config);
     }
-    if (!pdfProcess && !isBrowser) settleCallerPreloadedWorker();
     // pdf.js's worker for this parse runs at warning verbosity, and its warnings are taken: from the
     // separate process's messages; in this process from the console while the parse's document is open
     // (see takeInProcessTurn and captureConsoleWarnings), in a PDFWorker of the parse's own, as also in a
@@ -1836,27 +1851,54 @@ export const parsePdf = async (buffer: Buffer, config: FullOfficeParserConfig): 
     // Worker is started, nothing is fetched); in another browser from a Worker that sends them back (see
     // openWarningWorker), or, where none can be made, from nowhere, pdf.js starting its own. In this
     // process a worker whose file cannot be told (see pdfjsWorkerFile) runs at verbosity 0, as pdf.js
-    // did before its warnings were taken: its lines could not be told from the caller's own.
+    // did before its warnings were taken: its lines could not be told from the caller's own. In Node the
+    // worker is on a module of this library's own (see openOwnWorker), whose lines are told by the code
+    // writing them.
     let ownWorker: WarningWorker | undefined;
     let inProcessTurn: (() => Promise<() => void>) | undefined;
     try {
         if (pdfProcess) {
             pdfProcess.onWarning(takeWarning);
-        } else if (isBrowser && !callerPreloadedWorker()) {
+        } else if (isBrowser && !workerPreloaded()) {
             ownWorker = await openWarningWorker(pdfjs, String(pdfjs.GlobalWorkerOptions.workerSrc ?? ''), takeWarning, config.abortSignal);
         } else {
             // A worker port the caller set is pdf.js's to use; one PDFWorker per port.
-            const workerFile = pdfjs.GlobalWorkerOptions.workerPort ? undefined : await pdfjsWorkerFile(pdfjs);
-            if (!pdfjs.GlobalWorkerOptions.workerPort) {
+            const callerPort = !!pdfjs.GlobalWorkerOptions.workerPort;
+            // In Node, pdf.js's worker runs on a module of this library's own (see openOwnWorker): an
+            // application's own pdf.js, of any version, keeps its worker and that worker's warning level.
+            const own = isBrowser || callerPort ? undefined : await openOwnWorker(pdfjs, workerUrl);
+            let workerFile: string | undefined;
+            // A worker module shared with the caller's own documents: a preloaded `globalThis.pdfjsWorker`
+            // (a bundle with no worker file, or a browser page), or the one pdf.js imports where this
+            // library's own does not load. It keeps one warning level for every document it reads, the
+            // caller's among them: raised for the turn this parse's document is open in (a parse before may
+            // have set it to 0 meanwhile) and set to 0 once that document has closed. The level it had
+            // before cannot be read back (pdf.js keeps it private to the module and its `configure` message
+            // only sets it), so it is left at 0, as every release before 8.4.0 left it.
+            let raised: any;
+            if (own) {
+                ownWorker = own;
+            } else if (!callerPort) {
+                workerFile = await pdfjsWorkerFile(pdfjs);
                 const worker = new pdfjs.PDFWorker({ verbosity: workerFile ? 1 : 0 });
                 ownWorker = { worker, close: () => worker.destroy() };
+                raised = workerFile ? worker : undefined;
             }
             if (runtimeHasBrotliFlaw()) avoidBrotliInThisProcess();
             inProcessTurn = async () => {
                 const endTurn = await takeInProcessTurn(config.abortSignal);
-                const stopCapture = workerFile ? captureConsoleWarnings(takeWarning, workerFile) : undefined;
-                onBrotliRefused(brotliAvoided);
-                return () => { onBrotliRefused(undefined); stopCapture?.(); endTurn(); };
+                if (raised) {
+                    try { await raised.promise; } catch { /* the document reports a worker that did not start */ }
+                    setWorkerVerbosity(raised, 1);
+                }
+                const stopCapture = own ? own.captureWarnings(takeWarning) : workerFile ? captureConsoleWarnings(takeWarning, workerFile) : undefined;
+                onBrotliRefused(own ? () => own.outside(brotliAvoided) : brotliAvoided);
+                return () => {
+                    onBrotliRefused(undefined);
+                    stopCapture?.();
+                    if (raised) setWorkerVerbosity(raised, 0);
+                    endTurn();
+                };
             };
         }
         return await readPdf(pdfjs, buffer, config, pdfCfg, maxImageSize, pdfProcess, assets, pdfProcess?.worker ?? ownWorker?.worker, inProcessTurn);
@@ -2187,12 +2229,14 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
     // Warn when much of the extracted text is unmappable glyphs (broken/missing ToUnicode), so consumers
     // can tell "genuinely empty" from "font could not be decoded" and reach for OCR.
     warnIfEncodingSuspect(allRuns, config);
-    reportUnmappedFonts(unreadable, fontCache, glyphNames, config);
+    const unmappedFonts = reportUnmappedFonts(unreadable, fontCache, glyphNames, config);
 
-    // Warn when a document yields essentially no text and OCR is off: it is very likely scanned (or its
-    // text is in fonts whose CMaps could not be loaded, which the warning then says instead), and silent
-    // empty output is otherwise indistinguishable from a genuine failure. Only when OCR is off, since
-    // with OCR the caller is already handling image-only content.
+    // Warn when a document yields essentially no text and OCR is off: it may well be scanned (or its text
+    // is in fonts whose CMaps could not be loaded, or in fonts with no map from codes to characters, which
+    // the warning then says instead), and silent empty output is otherwise indistinguishable from a
+    // genuine failure. Only when OCR is off, since with OCR the caller is already handling image-only
+    // content. The count of characters read is said, not weighed: a scanned page with a short stamp in
+    // a text layer is still one to OCR.
     if (!config.ocr) {
         // Scale the "looks empty" threshold to the pages actually read, not the whole document: with
         // a pageRange, `allRuns` covers only the selected pages, and a content limit can stop the read
@@ -2202,7 +2246,11 @@ async function buildAst(pdfjs: any, pdfDocument: any, config: FullOfficeParserCo
         const textChars = allRuns.reduce((sum, r) => sum + r.text.replace(/\s/g, '').length, 0);
         if (processedPages > 0 && textChars < Math.max(10, processedPages)) {
             const cMaps = assets.unavailableCMaps;
-            logWarning(OfficeWarningType.PDF_NO_TEXT_EXTRACTED, config, cMaps.length ? { pages: processedPages, cMaps } : processedPages);
+            const fonts = unmappedFonts;
+            const details = cMaps.length || fonts.length
+                ? { pages: processedPages, ...(cMaps.length ? { cMaps } : {}), ...(fonts.length ? { fonts } : {}) }
+                : processedPages;
+            logWarning(OfficeWarningType.PDF_NO_TEXT_EXTRACTED, config, { pages: processedPages, characters: textChars, cMaps, fonts }, details);
         }
     }
 

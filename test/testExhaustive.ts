@@ -17,7 +17,7 @@ import { guardShaping } from '../src/generators/pdf/nativePdfEngine';
 import { OfficeTemplate } from '../src/OfficeTemplate';
 import { OfficeConverter } from '../src/OfficeConverter';
 import { zipSync, strToU8, unzipSync, unzlibSync, strFromU8 } from 'fflate';
-import { PDFDocument, PDFHexString, PDFName, PDFOperator, PDFRawStream, StandardFonts, TextAlignment, degrees, rgb } from 'pdf-lib';
+import { PDFDict, PDFDocument, PDFHexString, PDFName, PDFOperator, PDFRawStream, StandardFonts, TextAlignment, degrees, rgb } from 'pdf-lib';
 import * as assert from 'assert';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -3961,6 +3961,119 @@ async function testTemplate(): Promise<void> {
 }
 
 /**
+ * A template's tags are listed without data, and data is checked against them without writing a
+ * document: every problem a render with onMissing 'error' would reject for, each once, with its loops.
+ */
+async function testTemplateTagsAndCheck(): Promise<void> {
+    const { p, docx } = ooxmlHelpers();
+    const tpl = path.join(__dirname, 'files', 'template', 'invoice.docx');
+    const lines = [{ description: 'Bolts', qty: 2, price: '$500.00' }, { description: 'Nuts', qty: 1, price: '$250.00' }];
+    const full = { name: 'Acme Corp', amount: '$1,250.00', date: '2026-10-01', item: 'Widget', note: 'n', company: 'GLOBEX', missing: 'R-1', paid: false, due: '2026-11-01', lines, discount: '$50.00', contacts: [{ name: 'Ann' }], total: 1250.5, dueDate: '2026-11-01' };
+
+    // --- the tags, with no data ---
+    const tags = await OfficeTemplate.tags(tpl);
+    const brief = tags.map(t => [t.kind, t.part, t.fields.join(','), t.loops.map(l => `${l.item} in ${l.list}`).join('/')].join(' '));
+    assert.deepStrictEqual(brief, [
+        'field word/document.xml name ', 'field word/document.xml amount ', 'field word/document.xml date ', 'field word/document.xml item ',
+        'field word/document.xml missing ', 'field word/document.xml note ', 'if word/document.xml paid ', 'else word/document.xml  ',
+        'field word/document.xml amount ', 'field word/document.xml due ', 'for word/document.xml lines ',
+        'field word/document.xml line.description line in lines', 'field word/document.xml line.qty line in lines', 'field word/document.xml line.price line in lines',
+        'if word/document.xml discount ', 'field word/document.xml discount ', 'field word/document.xml total ', 'field word/document.xml dueDate ',
+        'for word/document.xml contacts ', 'field word/document.xml c.name c in contacts', 'if word/document.xml loop.last c in contacts', 'field word/header1.xml company ',
+    ], `every field and block tag, in order, a header's too; got ${JSON.stringify(brief)}`);
+    assert.strictEqual(tags[0].tag, '{{name}}', 'a tag split across runs is one tag, as typed');
+    assert.deepStrictEqual(tags.find(t => t.fields[0] === 'total')?.filters, ['format'], "a field's filters are named");
+    assert.strictEqual(tags.find(t => t.kind === 'for')?.item, 'line', "a loop names its item");
+    const conditions = await OfficeTemplate.tags(docx(p('{{ if a and (b or not c.d) and e == g and a }}x{{ else if f > 3 }}y{{ else }}z{{ endif }}')));
+    assert.deepStrictEqual(conditions.map(t => [t.kind, t.fields]), [['if', ['a', 'b', 'c.d', 'e', 'g']], ['elseif', ['f']], ['else', []]], 'a condition names every path it reads, once, in order');
+    // Notes: a footnote referred to outside loops, and one only a loop refers to (compiled on its own), each once.
+    const footnotes = (notes: Record<number, string>) => `<?xml version="1.0"?><w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">${Object.entries(notes).map(([id, x]) => `<w:footnote w:id="${id}">${x}</w:footnote>`).join('')}</w:footnotes>`;
+    const fnRef = (id: number) => `<w:r><w:footnoteReference w:id="${id}"/></w:r>`;
+    const withNotes = docx(`<w:p><w:r><w:t>{{a}}</w:t></w:r>${fnRef(1)}</w:p>${p('{{ for l in ls }}')}<w:p xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" w14:paraId="1A2B3C4D"><w:r><w:t>{{ l.n }}</w:t></w:r>${fnRef(2)}</w:p>${p('{{ endfor }}')}`,
+        { 'word/footnotes.xml': footnotes({ 1: p('Source: {{ x }}'), 2: p('{{ l.y }} {{ z }}') }) });
+    const noteTags = (await OfficeTemplate.tags(withNotes)).map(t => `${t.part} ${t.fields[0] ?? ''}`);
+    assert.deepStrictEqual(noteTags, ['word/document.xml a', 'word/document.xml ls', 'word/document.xml l.n', 'word/footnotes.xml x', 'word/footnotes.xml l.y', 'word/footnotes.xml z'],
+        `each note's tags once, those of a note only a loop refers to after its part's own; got ${JSON.stringify(noteTags)}`);
+    const custom = await OfficeTemplate.tags(docx(p('[[who]] {{not}}')), { delimiters: { start: '[[', end: ']]' } });
+    assert.deepStrictEqual(custom.map(t => t.tag), ['[[who]]'], 'tags with the delimiters asked for');
+    await assert.rejects(OfficeTemplate.tags(docx(p('{{ if a }}x'))), (e: any) => e.officeIssue?.code === 'TEMPLATE_SYNTAX', "a template's own error rejects as a render's does");
+    assert.deepStrictEqual(await OfficeTemplate.tags(docx(p('No tags here.'))), [], 'a template of no tag lists none');
+
+    // --- data checked ---
+    assert.deepStrictEqual(await OfficeTemplate.check(tpl, { data: full }), [], 'data a render needs all of has no problem');
+    const brief2 = (problems: any[]) => problems.map(x => `${x.code === 'TEMPLATE_FIELD_MISSING' ? x.field : x.details.reason} ${x.part} ${x.loops.map((l: any) => `${l.list}[${l.index}]`).join('')}`.trim());
+    const { name, paid, ...rest } = full;
+    const problems = await OfficeTemplate.check(tpl, { data: { ...rest, lines: [{ description: 'Bolts', price: '$5' }, { qty: 1 }], contacts: 'Ann', total: 'abc' } as any });
+    assert.deepStrictEqual(brief2(problems), [
+        'name word/document.xml', 'paid word/document.xml', 'line.qty word/document.xml lines[0]', 'line.description word/document.xml lines[1]',
+        'line.price word/document.xml lines[1]', 'unformattable word/document.xml', 'not-a-list word/document.xml',
+    ], `every problem at once, each once, a loop's with its pass; got ${JSON.stringify(brief2(problems))}`);
+    assert.ok(problems.every(x => typeof x.message === 'string' && x.message.length > 20), 'each problem says what a render would');
+    assert.deepStrictEqual(brief2(await OfficeTemplate.check(docx(p('{{a}} and {{ a }}')), { data: {} })), ['a word/document.xml'], 'a field read twice in a part is one problem');
+    // Loops, outermost first, for a missing field, a missing list and a value that does not fit.
+    const nested = docx(p('{{ for o in orders }}') + p('{{ for l in o.lines }}') + p('{{ l.q }} {{ l.v | upper }}') + p('{{ endfor }}') + p('{{ endfor }}'));
+    const deep = await OfficeTemplate.check(nested, { data: { orders: [{ lines: [{ q: 1, v: 'a' }] }, { lines: [{ v: {} }] }, {}] } as any });
+    assert.deepStrictEqual(brief2(deep), ['l.q word/document.xml orders[1]o.lines[0]', 'unformattable word/document.xml orders[1]o.lines[0]', 'o.lines word/document.xml orders[2]'],
+        `each problem with its loops, outermost first; got ${JSON.stringify(brief2(deep))}`);
+    // A missing field in a note copied per pass of a loop is noted in the note's part, with its pass.
+    const inNote = await OfficeTemplate.check(withNotes, { data: { a: 1, x: 2, z: 3, ls: [{ n: 1, y: 2 }, { n: 3 }] } });
+    assert.deepStrictEqual(brief2(inNote), ['l.y word/footnotes.xml ls[1]'], `a note's field in its part, with the loop it is copied in; got ${JSON.stringify(brief2(inNote))}`);
+    assert.deepStrictEqual(brief2(await OfficeTemplate.check(withNotes, { data: { a: 1, x: 2, z: 3 } })), ['ls word/document.xml'], "a note only a missing loop refers to is not checked");
+    // A block whose condition is missing is not written in a check: the budget a render's writing would spend is not spent.
+    const long = docx(p('{{ for a in as }}') + p('{{ if a.c }}') + p('L'.repeat(2000)) + p('{{ endif }}') + p('{{ endfor }}'));
+    const many: any[] = [];
+    const capped = await OfficeTemplate.check(long, { data: { as: Array.from({ length: 1200 }, () => ({})) }, decompressionLimits: { maxRepeatedContent: 200_000 }, onWarning: (w: any) => many.push(w) });
+    assert.strictEqual(capped.length, 1000, `a check lists at most 1,000 problems for an entry; got ${capped.length}`);
+    assert.deepStrictEqual(many.map(w => [w.code, w.details?.limit]), [['TEMPLATE_CHECK_LIMITED', 1000]], 'and says it stopped there');
+    // A batch lists at most 10,000 in all: the entries after the one it stops in are not checked, and it says so.
+    const rows = docx(p('{{ for r in rows }}') + p('{{ r.x }}') + p('{{ endfor }}'));
+    const batchWarnings: any[] = [];
+    const entries = Array.from({ length: 12 }, () => ({ rows: Array.from({ length: 1001 }, () => ({})) }));
+    const lists = await OfficeTemplate.check(rows, { data: entries, onWarning: (w: any) => batchWarnings.push(w) });
+    assert.deepStrictEqual(lists.map(l => l.length), [1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 0, 0], `ten entries of 1,000, then none checked; got ${lists.map(l => l.length)}`);
+    assert.deepStrictEqual(batchWarnings.map(w => [w.details.entry, w.details.limit, !!w.details.batch, w.details.unchecked]).slice(-2), [[8, 1000, false, undefined], [9, 10000, true, 2]], 'each entry it stopped in is named, and the batch where it stopped, with the entries not checked');
+    const lastWarnings: any[] = [];
+    const ten = await OfficeTemplate.check(rows, { data: entries.slice(0, 10), onWarning: (w: any) => lastWarnings.push(w) });
+    assert.ok(ten.every(l => l.length === 1000) && lastWarnings.at(-1).details.unchecked === 0 && !/not checked/.test(lastWarnings.at(-1).message), 'a batch stopping in its last entry leaves none unchecked, and says none');
+    const pass = await OfficeTemplate.check(docx(p('{{ for r in rows }}') + p('{{ r.x }} {{ r.y }}') + p('{{ endfor }}')), { data: { rows: [{}] } });
+    assert.ok(pass.length === 2 && Object.isFrozen(pass[0].loops) && pass[0].loops === pass[1].loops, "the problems of one pass share their frozen loops");
+    // Loops over the same list are one place; loops over two lists are two, and a field missing in two parts is two problems.
+    const twice = docx(p('{{ for a in xs }}') + p('{{ a.q }}') + p('{{ endfor }}') + p('{{ for a in xs }}') + p('{{ a.q }}') + p('{{ endfor }}') + p('{{ for b in ys }}') + p('{{ z }}') + p('{{ endfor }}') + p('{{ for c in zs }}') + p('{{ z }}') + p('{{ endfor }}') + p('{{ h }}'),
+        { 'word/header1.xml': `<?xml version="1.0"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">${p('{{ h }}')}</w:hdr>` });
+    assert.deepStrictEqual(brief2(await OfficeTemplate.check(twice, { data: { xs: [{}, {}], ys: [1], zs: [1] } })),
+        ['a.q word/document.xml xs[0]', 'a.q word/document.xml xs[1]', 'z word/document.xml ys[0]', 'z word/document.xml zs[0]', 'h word/document.xml', 'h word/header1.xml'],
+        'two loops over one list are one place, two lists two, and two parts two');
+    // A long condition is listed in time linear in its paths.
+    const longCondition = docx(p(`{{ if ${Array.from({ length: 80000 }, (_, i) => 'p' + i.toString(36)).join(' or ')} }}x{{ endif }}`));
+    const listed = await withinTime(4000, () => OfficeTemplate.tags(longCondition));
+    assert.ok(listed.within && listed.result[0].fields.length === 80000, `80,000 paths of one condition are listed quickly; took ${listed.ms} ms`);
+    // Only the branch the data picks is needed: paid shows no due.
+    const { due, ...noDue } = full;
+    assert.deepStrictEqual(await OfficeTemplate.check(tpl, { data: { ...noDue, paid: true } }), [], 'a field only the branch not taken reads is not needed');
+    assert.deepStrictEqual(brief2(await OfficeTemplate.check(tpl, { data: noDue })), ['due word/document.xml'], 'and is where the data takes that branch');
+    // What the data does not lead to is not checked until it does.
+    const { lines: _l, ...noLines } = full;
+    assert.deepStrictEqual(brief2(await OfficeTemplate.check(tpl, { data: noLines })), ['lines word/document.xml'], "a missing list's own fields are not reported");
+    // The kinds of value that do not fit, beyond those above.
+    const misfit = await OfficeTemplate.check(docx(p('{{ who }} {{ if n > "a" }}x{{ endif }} {{ who | upper }}')), { data: { who: { first: 'A' }, n: 3 } as any });
+    assert.deepStrictEqual(misfit.map(x => x.details?.reason), ['not-text', 'incomparable', 'unformattable'], `a value of no text, an incomparable condition, a case filter on an object; got ${JSON.stringify(misfit.map(x => x.details))}`);
+    // onMissing does not change what a check reports.
+    assert.strictEqual((await OfficeTemplate.check(tpl, { data: {}, onMissing: 'keep' })).length > 0, true, "a check reports what is missing whatever onMissing says");
+    // A batch: a list of problems per entry.
+    const batch = await OfficeTemplate.check(tpl, { data: [full, { ...full, name: undefined } as any, rest as any] });
+    assert.deepStrictEqual(batch.map(b => brief2(b)), [[], [], ['name word/document.xml', 'paid word/document.xml']], 'a batch has one list per entry; a key present as undefined is given');
+    // A check and a render agree.
+    for (const data of [full, rest, { ...full, contacts: 3 }]) {
+        const found = await OfficeTemplate.check(tpl, { data: data as any });
+        const rendered = await OfficeTemplate.render(tpl, { data: data as any, onMissing: 'error' }).then(() => null, (e: any) => e.officeIssue);
+        assert.strictEqual(rendered?.code ?? null, found[0]?.code ?? null, 'a render rejects exactly when a check finds a problem, for the first of them');
+        if (rendered) assert.strictEqual(rendered.message, found[0].message, 'with the same message');
+    }
+    await assert.rejects(OfficeTemplate.check(tpl, { data: 3 as any }), (e: any) => e.officeIssue?.code === 'IMPROPER_ARGUMENTS', 'data of the wrong shape is refused, as a render refuses it');
+    console.log('  Template tags and check: All assertions passed ✓');
+}
+
+/**
  * DOCX templating with block tags: `if`/`else if`/`else`/`endif` and `for`/`endfor`, in each of their
  * scopes (inline, paragraphs, table rows), their conditions, the data they read, the errors they raise,
  * and the document they leave (balanced XML, unique ids, every cell ending in a paragraph).
@@ -4811,6 +4924,73 @@ async function testNativePdfFontKinds(): Promise<void> {
     const fontOf = (text: string) => collectAllNodes(back).find(n => n.type === 'text' && (n.text || '').includes(text))?.formatting?.font;
     assert.deepStrictEqual(['Serif title', 'Sans', 'inline code', 'italic serif', 'bold mono', 'noto sans'].map(fontOf),
         ['Times-Bold', 'Helvetica', 'Courier', 'Times-Italic', 'Courier-Bold', 'Helvetica'], 'each run is printed in a stand-in of its kind');
+}
+
+/**
+ * The ballot boxes (U+2610 to U+2612), a form's check boxes as the readers give them: drawn by the native
+ * engine as boxes where no font has them (the Standard-14 fonts have none), in a Type 3 font of their own,
+ * as text that reads back as its character; not reported as characters lost. A font given that has them
+ * draws them.
+ */
+async function testNativePdfBallotBoxes(): Promise<void> {
+    const [empty, ticked, crossed] = ['☐', '☑', '☒'];
+    const t = (text: string, formatting: any = {}) => ({ type: 'text', text, formatting });
+    const para = (children: any[], metadata: any = {}) => ({ type: 'paragraph', text: children.map(c => c.text).join(''), children, metadata });
+    const long = 'Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore ';
+    const doc: any = { type: 'docx', metadata: {}, attachments: [{ type: 'chart', name: 'chart1', extension: 'chart', data: '', chartData: { yAxisTitle: `${crossed} counted`, labels: ['a', 'b'], dataSets: [{ name: 's', values: ['1', '2'], pointLabels: [] }] } }], content: [
+        para([t(`${crossed} Agree ${empty} Disagree ${ticked} Maybe`)]),
+        para([t(`${crossed} Bold ${empty}`, { bold: true, size: '16pt' }), t(` ${ticked} red`, { color: '#CC0000', italic: true })]),
+        para([t(`${long}${crossed} ${long}${empty} end.`)], { alignment: 'justify' }),
+        { type: 'table', children: [{ type: 'row', children: [{ type: 'cell', children: [para([t('Gift')])] }, { type: 'cell', children: [para([t(crossed)])] }] }] },
+        para([t('Inline'), t(crossed, { size: '20pt' }), t('glued')]),
+        para([t(`Unseen ${ticked}`, { invisible: true })]),
+        { type: 'chart', text: '', metadata: { attachmentName: 'chart1' } },
+    ] };
+    const read = async (pdf: Uint8Array) => (await OfficeParser.parseOffice(Buffer.from(pdf), { fileType: 'pdf', ocr: false, pdfParserConfig: { separateProcess: false } } as any) as OfficeParserAST).content.map(n => n.text).join('\n');
+    const type3Fonts = async (pdf: Uint8Array) => {
+        const loaded = await PDFDocument.load(pdf);
+        let n = 0;
+        for (const [, obj] of loaded.context.enumerateIndirectObjects()) if (obj instanceof PDFDict && obj.get(PDFName.of('Subtype')) === PDFName.of('Type3')) n++;
+        return n;
+    };
+    const result: any = await OfficeGenerator.generate(doc, 'pdf', { pdfConfig: { engine: 'native' } } as any);
+    const lost = (result.messages || []).filter((m: any) => m.code === 'CONTENT_NOT_REPRESENTABLE');
+    // (The chart's turned axis title is drawn by pdf-lib in the first font: its box is one none draws, and counted.)
+    assert.deepStrictEqual(lost.map((m: any) => [m.details?.reason, m.details?.count, m.details?.sample]), [['unencodable-text', 1, crossed]], `native PDF: only the turned axis title's box is lost; got ${JSON.stringify(lost)}`);
+    const pdf = result.value as Uint8Array;
+    assert.strictEqual(await type3Fonts(pdf), 1, 'native PDF: the boxes are drawn in one Type 3 font');
+    const text = await read(pdf);
+    for (const line of [`${crossed} Agree ${empty} Disagree ${ticked} Maybe`, `${crossed} Bold ${empty} ${ticked} red`, `Inline${crossed}glued`, `Unseen ${ticked}`])
+        assert.ok(text.includes(line), `native PDF: "${line}" reads back as written (each box as wide as it is measured); got ${JSON.stringify(text)}`);
+    assert.ok(/labore\s+☒\s+Lorem/.test(text) && /labore\s+☐\s+end\./.test(text) && /Gift\s+☒/.test(text), `native PDF: a box in a justified line and in a cell reads in its place; got ${JSON.stringify(text)}`);
+    // Drawn invisibly where the text is invisible: in text rendering mode 3.
+    const loaded = await PDFDocument.load(pdf);
+    let streams = '';
+    for (const [, obj] of loaded.context.enumerateIndirectObjects()) if (obj instanceof PDFRawStream) { try { streams += strFromU8(unzlibSync(obj.contents)); } catch { streams += strFromU8(obj.contents); } }
+    assert.ok(/3 Tr[\s\S]*?\/BallotBoxes-\d+ [\d.]+ Tf[\s\S]*?<22> Tj/.test(streams), 'native PDF: an invisible box is drawn in the invisible rendering mode');
+    assert.ok(/<26> Tj/.test(streams) && /<24> Tj/.test(streams), 'native PDF: a bold box is drawn in its heavier glyph');
+    // Nothing to draw a box for: no font of them.
+    const plain: any = await OfficeGenerator.generate({ ...doc, attachments: [], content: [para([t('No boxes here.')])] }, 'pdf', { pdfConfig: { engine: 'native' } } as any);
+    assert.strictEqual(await type3Fonts(plain.value as Uint8Array), 0, 'native PDF: a document of no box has no font of them');
+    // Another character no font has is still reported.
+    const cjk: any = await OfficeGenerator.generate({ ...doc, attachments: [], content: [para([t(`${crossed} 日`)])] }, 'pdf', { pdfConfig: { engine: 'native' } } as any);
+    assert.deepStrictEqual((cjk.messages || []).filter((m: any) => m.code === 'CONTENT_NOT_REPRESENTABLE').map((m: any) => [m.details?.count, m.details?.sample]), [[1, '日']], 'native PDF: a character no font has is reported, the box beside it not');
+    // A font given that lacks them: the boxes drawn as boxes still, nothing reported.
+    const arial = systemFont('/System/Library/Fonts/Supplemental/Arial.ttf', '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf');
+    if (arial) {
+        const given: any = await OfficeGenerator.generate({ ...doc, attachments: [], content: [para([t(`${crossed} Agree ${empty} No`)])] }, 'pdf', { pdfConfig: { engine: 'native', fonts: { regular: arial } } } as any);
+        assert.deepStrictEqual((given.messages || []).map((m: any) => m.code), [], 'native PDF: a font given without the boxes: nothing lost');
+        assert.strictEqual(await type3Fonts(given.value as Uint8Array), 1, 'native PDF: a font given without the boxes: they are drawn in their own font');
+        assert.ok((await read(given.value as Uint8Array)).includes(`${crossed} Agree ${empty} No`), 'native PDF: a font given without the boxes: they read back');
+    }
+    // A font given that has them draws them.
+    const withBoxes = systemFont('/System/Library/Fonts/Menlo.ttc', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf');
+    if (withBoxes) {
+        const given: any = await OfficeGenerator.generate({ ...doc, attachments: [], content: [para([t(`${crossed} Agree ${empty} No ${ticked}`)])] }, 'pdf', { pdfConfig: { engine: 'native', fonts: { regular: withBoxes } } } as any);
+        assert.deepStrictEqual((given.messages || []).map((m: any) => m.code), [], 'native PDF: a font given with the boxes: nothing lost');
+        assert.strictEqual(await type3Fonts(given.value as Uint8Array), 0, 'native PDF: a font given with the boxes draws them');
+        assert.ok((await read(given.value as Uint8Array)).includes(`${crossed} Agree ${empty} No ${ticked}`), 'native PDF: a font given with the boxes: they read back');
+    }
 }
 
 /**
@@ -5970,6 +6150,108 @@ async function testPageNumberFormats(): Promise<void> {
     const twoBack = await OfficeParser.parseOffice(Buffer.from(twoPdf), { fileType: 'pdf', ocr: false, pdfParserConfig: { separateProcess: false, keepHeadersAndFootersInPages: true } } as any) as OfficeParserAST;
     const secondPage = collectAllNodes({ ...twoBack, content: [twoBack.content.filter(n => n.type === 'page')[1]] } as OfficeParserAST).filter(n => n.type === 'text').map(n => (n.text || '').trim()).filter(Boolean);
     assert.ok(secondPage.join(' ').endsWith('Page 2 2'), `a page field, a line break and another: each page's number twice; got ${JSON.stringify(secondPage.slice(-4))}`);
+}
+
+/**
+ * A section restarts its page numbers where the document says so (Word's `w:pgNumType w:start`, RTF's
+ * `\pgnrestart` at `\pgnstarts`, an ODF paragraph's `style:page-number` with the master page it starts):
+ * a front matter in roman then a body from 1 (test/files/page-numbers: the Word file, and LibreOffice's ODT
+ * and RTF of it) is read with the restart on the body's section, written so by every writer, and printed so.
+ * The first section's start of 1 is none (its pages start there anyway); a later one's is a restart. What
+ * goes on (`auto`, `\pgncont`, `\pgnstarts` without `\pgnrestart`, a page layout's `style:first-page-number`,
+ * which LibreOffice does not show) and what is no whole number restarts nothing.
+ */
+async function testPageNumberRestarts(): Promise<void> {
+    const starts = (ast: OfficeParserAST) => [ast.metadata.pageSetup?.pageNumberStart, ...(ast.content as any[]).filter(n => n.type === 'break' && typeof n.metadata?.section === 'number').map(n => n.metadata.pageSetup?.pageNumberStart)];
+    // Each page's footer number, from the native engine's PDF read back with its footers in their pages.
+    const printed = async (ast: OfficeParserAST) => {
+        const pdf = (await ast.to('pdf', { pdfConfig: { engine: 'native' } } as any)).value as Uint8Array;
+        const back = await OfficeParser.parseOffice(Buffer.from(pdf), { fileType: 'pdf', ocr: false, pdfParserConfig: { separateProcess: false, keepHeadersAndFootersInPages: true } } as any) as OfficeParserAST;
+        return back.content.filter(n => n.type === 'page').map(p => /Page\s+(\S+)/.exec(collectAllNodes({ ...back, content: [p] } as OfficeParserAST).filter(n => n.type === 'text').map(n => n.text).join(' '))?.[1]);
+    };
+    for (const ext of ['docx', 'odt', 'rtf'] as const) {
+        const ast = await OfficeParser.parseOffice(path.join(__dirname, `files/page-numbers/restart.${ext}`)) as OfficeParserAST;
+        const label = `${ext.toUpperCase()} restart`;
+        const body = (ast.content as any[]).filter(n => n.type === 'break' && typeof n.metadata?.section === 'number').map(n => n.metadata.pageSetup?.pageNumberFormat);
+        assert.ok(ast.metadata.pageSetup?.pageNumberFormat === 'lowerRoman' && body.length === 1 && body[0] === 'decimal', `${label}: a front matter in roman, a body in digits; got ${JSON.stringify([ast.metadata.pageSetup, body])}`);
+        assert.deepStrictEqual(starts(ast), [undefined, 1], `${label}: the body's section restarts at 1, the first section's 1 is none`);
+        // Written: the body's section restarts, the front matter's states no start.
+        const docx = strFromU8(unzipSync(new Uint8Array((await ast.to('docx')).value as any))['word/document.xml']);
+        assert.deepStrictEqual(docx.match(/<w:pgNumType[^>]*>/g), ['<w:pgNumType w:fmt="lowerRoman"/>', '<w:pgNumType w:start="1"/>'], `${label}: DOCX restarts the body`);
+        const odt = strFromU8(unzipSync(new Uint8Array((await ast.to('odt')).value as any))['content.xml']);
+        assert.deepStrictEqual(odt.match(/style:page-number="[^"]*"/g), ['style:page-number="1"'], `${label}: ODT restarts the body`);
+        const rtf = String((await ast.to('rtf')).value);
+        assert.deepStrictEqual(rtf.match(/\\pgnstarts\d+\\pgnrestart/g), ['\\pgnstarts1\\pgnrestart'], `${label}: RTF restarts the body`);
+        const tex = String((await ast.to('tex')).value);
+        assert.deepStrictEqual(tex.match(/\\setcounter\{page\}\{\d+\}/g), ['\\setcounter{page}{1}'], `${label}: LaTeX restarts the body`);
+        // Read again, each written file restarts where it did.
+        for (const [fileType, written] of [['docx', (await ast.to('docx')).value], ['odt', (await ast.to('odt')).value], ['rtf', Buffer.from(rtf)]] as const) {
+            const again = await OfficeParser.parseOffice(Buffer.from(written as any), { fileType } as any) as OfficeParserAST;
+            assert.deepStrictEqual(starts(again), [undefined, 1], `${label}: its ${fileType} read again restarts the body`);
+        }
+        // Printed: i, ii, ... then 1, 2, ... (the body went on from the front matter's last page).
+        const got = await printed(ast);
+        const front = got.findIndex(t => !/^[ivx]+$/.test(t ?? ''));
+        assert.ok(front >= 2 && got.length - front >= 2 && got.slice(0, front).every((t, i) => t === pageNumberText(i + 1, 'lowerRoman')) && got.slice(front).every((t, i) => t === String(i + 1)),
+            `${label}: the native PDF engine prints the front matter in roman and the body from 1; got ${JSON.stringify(got)}`);
+    }
+
+    // Word: `w:start` on the first section and a later one.
+    const W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+    const word = async (first: string, later: string) => starts(await OfficeParser.parseOffice(Buffer.from(zipSync({
+        '[Content_Types].xml': strToU8('<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'),
+        '_rels/.rels': strToU8('<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>'),
+        'word/document.xml': strToU8(`<?xml version="1.0"?><w:document ${W_NS}><w:body><w:p><w:pPr><w:sectPr>${first}</w:sectPr></w:pPr><w:r><w:t>Front</w:t></w:r></w:p><w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr>${later}</w:sectPr></w:body></w:document>`),
+    })), { fileType: 'docx' } as any) as OfficeParserAST);
+    const start = (value: string) => `<w:pgNumType w:start="${value}"/>`;
+    assert.deepStrictEqual(await word(start('1'), start('1')), [undefined, 1], 'Word: a start of 1 is none on the first section, a restart on a later one');
+    assert.deepStrictEqual(await word(start('5'), ''), [5, undefined], 'Word: the first section starting at 5 keeps it; a section of no w:pgNumType goes on');
+    assert.deepStrictEqual(await word(start('0'), `<w:pgNumType w:fmt="lowerRoman" w:start="0"/>`), [0, 0], 'Word: a start of 0 is one');
+    assert.deepStrictEqual(await word('<w:pgNumType w:fmt="lowerRoman"/>', start('2147483647')), [undefined, 2147483647], 'Word: the highest start');
+    for (const bad of ['2.5', '-1', '1e3', 'abc', '', '2147483648', '99999999999999999999999'])
+        assert.deepStrictEqual(await word(start(bad), start(bad)), [undefined, undefined], `Word: w:start="${bad}" restarts nothing`);
+
+    // RTF: `\pgnrestart` restarts, at `\pgnstarts` (1 where it gives none); `\pgnstarts` alone and `\pgncont` go on.
+    const rtf = async (...sections: string[]) => starts(await OfficeParser.parseOffice(Buffer.from(`{\\rtf1\\ansi ${sections.map((words, i) => `${words} Section ${i}.\\par `).join('\\sect ')}}`), { fileType: 'rtf' } as any) as OfficeParserAST);
+    assert.deepStrictEqual(await rtf('\\sectd\\pgnrestart', '\\sectd\\pgnrestart'), [undefined, 1], 'RTF: \\pgnrestart alone restarts at 1, none on the first section');
+    assert.deepStrictEqual(await rtf('\\sectd\\pgnrestart\\pgnstarts5', '\\sectd'), [5, undefined], 'RTF: the first section restarting at 5 keeps it; \\sectd goes on');
+    assert.deepStrictEqual(await rtf('\\sectd\\pgnstarts5', '\\sectd\\pgnstarts5'), [undefined, undefined], 'RTF: \\pgnstarts without \\pgnrestart restarts nothing');
+    assert.deepStrictEqual(await rtf('\\sectd', '\\sectd\\pgnstarts3\\pgnrestart\\pgncont'), [undefined, undefined], 'RTF: \\pgncont goes on');
+    assert.deepStrictEqual(await rtf('\\sectd', '\\sectd\\pgnstarts0\\pgnrestart'), [undefined, 0], 'RTF: a start of 0 is one');
+    for (const bad of ['-4', '99999999999', ''])
+        assert.deepStrictEqual(await rtf('\\sectd', `\\sectd\\pgnrestart\\pgnstarts${bad}`), [undefined, 1], `RTF: \\pgnstarts${bad} is no start, the restart at 1`);
+    // (A section takes the one before's properties until its \sectd, as the specification gives them, and LibreOffice shows them.)
+    assert.deepStrictEqual(await rtf('\\sectd', '\\sectd\\pgnrestart\\pgnstarts3', ''), [undefined, 3, 3], 'RTF: a section of no \\sectd restarts as the one before');
+    assert.deepStrictEqual(await rtf('\\sectd', '\\sectd\\pgnrestart\\pgnstarts3', '\\sectd'), [undefined, 3, undefined], 'RTF: \\sectd goes on');
+
+    // ODF: a paragraph's or a table's style naming a master page restarts at its `style:page-number`.
+    const ODF = 'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"';
+    const odfRead = async (styles: string, body: string, layouts: [string, string] = ['', '']) => await OfficeParser.parseOffice(Buffer.from(zipSync({
+        mimetype: strToU8('application/vnd.oasis.opendocument.text'),
+        'styles.xml': strToU8(`<?xml version="1.0"?><office:document-styles ${ODF}><office:automatic-styles><style:page-layout style:name="pm1"><style:page-layout-properties fo:page-width="8.5in" fo:page-height="11in" style:num-format="i"${layouts[0]}/></style:page-layout><style:page-layout style:name="pm2"><style:page-layout-properties fo:page-width="8.5in" fo:page-height="11in"${layouts[1]}/></style:page-layout></office:automatic-styles><office:master-styles><style:master-page style:name="Standard" style:page-layout-name="pm1"/><style:master-page style:name="Body" style:page-layout-name="pm2"/></office:master-styles></office:document-styles>`),
+        'content.xml': strToU8(`<?xml version="1.0"?><office:document-content ${ODF}><office:automatic-styles>${styles}</office:automatic-styles><office:body><office:text>${body}</office:text></office:body></office:document-content>`),
+    })), { fileType: 'odt' } as any) as OfficeParserAST;
+    const paraStyle = (name: string, master: string | undefined, number: string | undefined, more = '') => `<style:style style:name="${name}" style:family="paragraph"${master ? ` style:master-page-name="${master}"` : ''}><style:paragraph-properties${number !== undefined ? ` style:page-number="${number}"` : ''}${more}/></style:style>`;
+    const odf = async (first: string | undefined, later: string | undefined, laterMaster = 'Body') => starts(await odfRead(paraStyle('P1', 'Standard', first) + paraStyle('P2', laterMaster, later), '<text:p text:style-name="P1">Front</text:p><text:p text:style-name="P2">Body</text:p>'));
+    // (LibreOffice's own: the first paragraph's page restarting at 1, the body's too.)
+    const likeLibreOffice = await odfRead(paraStyle('P1', 'Standard', '1') + paraStyle('P2', 'Body', '1'), '<text:p text:style-name="P1">Front</text:p><text:p text:style-name="P2">Body</text:p>');
+    assert.deepStrictEqual(starts(likeLibreOffice), [undefined, 1], 'ODT: a start of 1 is none on the first page, a restart on a later master page');
+    assert.ok(!('P1' in (likeLibreOffice.metadata.styleMap ?? {})) && !('P2' in (likeLibreOffice.metadata.styleMap ?? {})), `ODT: a style naming only a master page and its number has nothing to show; got ${JSON.stringify(Object.keys(likeLibreOffice.metadata.styleMap ?? {}))}`);
+    assert.deepStrictEqual(await odf('5', '1'), [5, 1], 'ODT: the first page restarting at 5 keeps it');
+    assert.deepStrictEqual(await odf(undefined, '0'), [undefined, 0], 'ODT: a start of 0 is one');
+    for (const bad of ['auto', '2.5', '-1', 'abc', ''])
+        assert.deepStrictEqual(await odf(bad, bad), [undefined, undefined], `ODT: style:page-number="${bad}" restarts nothing (the master page still starts a section)`);
+    // The master page in force named again: a section of its own where it restarts, a page of the same where it does not.
+    assert.deepStrictEqual(await odf(undefined, '1', 'Standard'), [undefined, 1], 'ODT: the master page in force restarting is a section of its own');
+    assert.deepStrictEqual(await odf(undefined, 'auto', 'Standard'), [undefined], 'ODT: the master page in force going on is no section');
+    // No master page, no restart (LibreOffice restarts only where a master page starts).
+    assert.deepStrictEqual(starts(await odfRead(paraStyle('P1', 'Standard', undefined) + paraStyle('P2', undefined, '9', ' fo:break-before="page"'), '<text:p text:style-name="P1">Front</text:p><text:p text:style-name="P2">Body</text:p>')), [undefined], 'ODT: style:page-number without a master page restarts nothing');
+    // A page layout's style:first-page-number is no restart (LibreOffice shows a text document's pages going on).
+    for (const value of ['5', 'continue'])
+        assert.deepStrictEqual(starts(await odfRead(paraStyle('P2', 'Body', undefined), '<text:p>Front</text:p><text:p text:style-name="P2">Body</text:p>', [` style:first-page-number="${value}"`, ` style:first-page-number="${value}"`])), [undefined, undefined], `ODT: style:first-page-number="${value}" restarts nothing`);
+    // A table's style restarts its page as a paragraph's does.
+    const tableStyle = '<style:style style:name="T1" style:family="table" style:master-page-name="Body"><style:table-properties style:page-number="3"/></style:style>';
+    assert.deepStrictEqual(starts(await odfRead(tableStyle, '<text:p>Front</text:p><table:table table:style-name="T1"><table:table-column/><table:table-row><table:table-cell><text:p>Cell</text:p></table:table-cell></table:table-row></table:table>')), [undefined, 3], 'ODT: a table starting a master page restarts at its number');
 }
 
 /**
@@ -8099,6 +8381,26 @@ async function testPdfUnmappedFont(): Promise<void> {
     const walked = (forms: number) => pdfOf([drawn(garbage)], { resources: `/XObject << ${Array.from({ length: forms }, (_, i) => `/Fm${i} ${7 + i} 0 R`).join(' ')} >>`, extra: [table, ...Array.from({ length: forms }, () => `<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /Resources << /Font 6 0 R >> /Length 0 >>\nstream\n\nendstream`)] });
     assert.deepStrictEqual(await warned(walked(40)), [one], 'forty forms of a large font table are looked through');
     assert.deepStrictEqual(await warned(walked(60)), [], 'sixty are not');
+
+    // PDF_NO_TEXT_EXTRACTED says what was read. Fired on as few characters as before (a scanned page with
+    // a short stamp in a text layer is still one to OCR), it called a page of a few glyph ids, and a
+    // one-line Japanese page that was read, "very likely scanned".
+    const noText = (found: any[]) => found.filter(i => i.code === 'PDF_NO_TEXT_EXTRACTED');
+    const glyphIds = await read(pdfOf([`BT /F1 12 Tf 72 700 Td ${garbage} Tj ET`]));
+    const [ids] = noText(glyphIds.found);
+    assert.deepStrictEqual(ids?.details, { pages: 1, fonts: ['NoSuchFont'] }, `a page of glyph ids names the font in details; got ${JSON.stringify(ids?.details)}`);
+    assert.ok(/^Little text was extracted from this PDF \(3 characters from 1 page\)\./.test(ids.message) && /NoSuchFont/.test(ids.message) && /no map from codes to characters/.test(ids.message) && /PDF_FONT_UNMAPPED/.test(ids.message) && /OCR/.test(ids.message) && !/scanned/.test(ids.message), `and the message says the text is in it, not that the file is scanned; got ${ids.message}`);
+    assert.deepStrictEqual(glyphIds.unmapped.map(i => i.details), [one], 'beside the font\'s own warning');
+    const toUnicode = '/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /J def 1 begincodespacerange <0000> <FFFF> endcodespacerange 7 beginbfchar <0011> <65E5> <0012> <672C> <0013> <8A9E> <0014> <30C6> <0015> <30AD> <0016> <30B9> <0017> <30C8> endbfchar endcmap end end';
+    const japanese = await read(pdfOf(['BT /F1 12 Tf 72 700 Td <0011001200130014001500160017> Tj ET'], { type0: '/ToUnicode 6 0 R', extra: [stream(toUnicode)] }));
+    const [line] = noText(japanese.found);
+    assert.strictEqual(String((await japanese.ast.to('text')).value), '\u65E5\u672C\u8A9E\u30C6\u30AD\u30B9\u30C8', 'the Japanese line is read');
+    assert.strictEqual(line?.details, 1, `a short page of text still warns, with the pages read as details; got ${JSON.stringify(line?.details)}`);
+    assert.ok(/^Little text was extracted from this PDF \(7 characters from 1 page\)\./.test(line.message) && !/very likely/.test(line.message) && /'ocr: true'/.test(line.message), `saying how much was read, with OCR advice and no "very likely scanned"; got ${line.message}`);
+    const blankPage = await read(pdfOf(['']));
+    const [none] = noText(blankPage.found);
+    assert.strictEqual(none?.details, 1, `a page with no text warns, with the pages read; got ${JSON.stringify(none?.details)}`);
+    assert.ok(/^No text was extracted from this PDF \(1 page\)\. It is very likely a scanned/.test(none.message), `as no text, very likely scanned; got ${none.message}`);
 }
 
 /**
@@ -8775,6 +9077,91 @@ async function testPdfPicturesLeftOut(): Promise<void> {
             assert.ok(source.includes(words), `pdf.js's ${worker} still words its ${name} warning ${JSON.stringify(words)}`);
         }
     }
+
+    // A caller's own pdf.js worker keeps the warning level it was started at across a parse in this process,
+    // and the parse still reports the pictures pdf.js leaves out. pdf.js's worker module keeps one level for
+    // every document it reads: a parse raised it to hear its pictures and left it there, so a caller's
+    // worker at verbosity 0 printed "Warning: Indexing all PDF objects" for its next document; later set back
+    // to 0, a caller's worker at verbosity 1 printed nothing. The parse's worker is now a module of the
+    // library's own (see openOwnWorker), whose level no worker of the caller's shares.
+    const { pathToFileURL } = await import('url');
+    const pdfjs: any = await import(pathToFileURL(require.resolve('pdfjs-dist/legacy/build/pdf.mjs')).href);
+    pdfjs.GlobalWorkerOptions.workerSrc ||= pathToFileURL(require.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs')).href;
+    const textPdf = pdfFrom(['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>',
+        stream(Buffer.from('BT /F1 12 Tf 20 100 Td (Caller text) Tj ET')), '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>']);
+    // Its cross-reference offset is wrong, so pdf.js says it indexes all objects as it reads it.
+    const misindexed = new Uint8Array(Buffer.from(textPdf.toString('latin1').replace(/startxref\n\d+/, 'startxref\n1'), 'latin1'));
+    const printed: string[] = [];
+    const consoleMethods = ['warn', 'log', 'info'] as const;
+    const originals = consoleMethods.map(method => (console as any)[method]);
+    const openOwn = async (worker: any) => {
+        consoleMethods.forEach((method, i) => { (console as any)[method] = (...args: any[]) => { printed.push(String(args[0])); if (!String(args[0]).startsWith('Warning: ')) originals[i].apply(console, args); }; });
+        try {
+            const task = pdfjs.getDocument({ data: misindexed.slice(), worker, verbosity: 0 });
+            await (await task.promise).getPage(1);
+            await task.destroy();
+        } finally {
+            consoleMethods.forEach((method, i) => { (console as any)[method] = originals[i]; });
+        }
+    };
+    const indexing = () => printed.filter(line => /^Warning: Indexing all PDF objects/.test(line)).length;
+    // Verbosity 1 first: the level the last worker started sends is the module's, and the quiet one is left last.
+    const loudWorker = new pdfjs.PDFWorker({ verbosity: 1 });
+    try {
+        await openOwn(loudWorker);
+        const loudBefore = indexing();
+        const amid = await read({ pdfParserConfig: { separateProcess: false } });
+        assert.strictEqual(amid.lost.length, 2, `a parse in this process reports the pictures pdf.js leaves out beside a caller's loud worker; got ${JSON.stringify(amid.lost.map(i => String(i.details)))}`);
+        await openOwn(loudWorker);
+        assert.deepStrictEqual([loudBefore, indexing()], [1, 2], `a caller's pdf.js worker at verbosity 1 prints pdf.js's warnings for its documents, before a parse in this process and after it; got ${JSON.stringify(printed)}`);
+    } finally {
+        loudWorker.destroy();
+    }
+    printed.length = 0;
+    const callerWorker = new pdfjs.PDFWorker({ verbosity: 0 });
+    try {
+        await openOwn(callerWorker);
+        const quietBefore = printed.length;
+        const between = await read({ pdfParserConfig: { separateProcess: false } });
+        assert.strictEqual(between.lost.length, 2, `a parse in this process still reports the pictures pdf.js leaves out; got ${JSON.stringify(between.lost.map(i => String(i.details)))}`);
+        await openOwn(callerWorker);
+        assert.deepStrictEqual([quietBefore, printed], [0, []], 'a caller\'s pdf.js worker at verbosity 0 prints nothing for its documents, before a parse in this process or after it');
+    } finally {
+        callerWorker.destroy();
+    }
+
+    // While a parse in this process is reading, pdf.js's lines are taken from the console as they are written
+    // for the library's own worker module (see openOwnWorker), and a line pdf.js writes at that moment for a
+    // document of the caller's, from pdf.js's same file at its plain address, reaches the caller's console.
+    // By the file a stack names (as before), the two cannot be told apart where the runtime rewrites stacks,
+    // as this test's does: the caller's line was taken as the parse's, and left out of the console.
+    const { openOwnWorker } = await import('../src/parsers/pdf/pdfAssets');
+    const own = await openOwnWorker(pdfjs, pathToFileURL(require.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs')).href);
+    assert.ok(own, 'the library\'s own pdf.js worker module loads');
+    const callerLoud = new pdfjs.PDFWorker({ verbosity: 1 });
+    const taken: string[] = [];
+    const reachedConsole: string[] = [];
+    const consoleWarn = console.warn;
+    console.warn = (...args: any[]) => { reachedConsole.push(String(args[0])); };
+    const stopCapture = own!.captureWarnings(line => taken.push(line));
+    try {
+        const readWith = async (worker: any) => {
+            const task = pdfjs.getDocument({ data: misindexed.slice(), worker, verbosity: 0 });
+            await (await task.promise).getPage(1);
+            await task.destroy();
+        };
+        await Promise.all([readWith(own!.worker), readWith(callerLoud)]);
+    } finally {
+        stopCapture();
+        console.warn = consoleWarn;
+        // The caller's worker module is left quiet, as the tests after this one expect it.
+        callerLoud.messageHandler?.send('configure', { verbosity: 0 });
+        callerLoud.destroy();
+        own!.close();
+    }
+    const indexed = (lines: string[]) => lines.filter(line => /^Warning: Indexing all PDF objects/.test(line)).length;
+    assert.deepStrictEqual([indexed(taken), indexed(reachedConsole)], [1, 1], `pdf.js's line for the parse's document is taken and its line for the caller's reaches the console; taken ${JSON.stringify(taken)}, console ${JSON.stringify(reachedConsole)}`);
 
     // Two at once in a fresh process: the pictures' document opened first, a text one second and done first.
     const os = await import('os');
@@ -11201,6 +11588,270 @@ function ooxmlHelpers() {
 }
 
 /**
+ * Word's legacy form fields: a check box (FORMCHECKBOX) reads as ticked or not, U+2612 or U+2610 (as the
+ * PDF reader writes a form's, and a content control's box holds), from its `w:checked`, else its
+ * `w:default`, else not ticked; a drop-down (FORMDROPDOWN) as its entry at `w:result`, else at `w:default`,
+ * else its first. Word stores no result for either: each was lost ("[x] Agree" read " Agree"). A text
+ * field's result stays as Word stores it. Each shows once, wherever its field stands.
+ */
+async function testDocxLegacyFormFields(): Promise<void> {
+    const { r, p, relsOf, rel, part, docx, parse } = ooxmlHelpers();
+    const [ticked, unticked] = ['☒', '☐'];
+    const field = (data: string, instruction: string, result = '', separate = true) => `<w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="F"/><w:enabled/>${data}</w:ffData></w:fldChar></w:r>`
+        + `<w:r><w:instrText xml:space="preserve">${instruction}</w:instrText></w:r>${separate ? '<w:r><w:fldChar w:fldCharType="separate"/></w:r>' : ''}${result}<w:r><w:fldChar w:fldCharType="end"/></w:r>`;
+    const checkBox = (inner: string, result = '') => field(`<w:checkBox><w:sizeAuto/>${inner}</w:checkBox>`, ' FORMCHECKBOX ', result);
+    const dropDown = (inner: string, entries = ['Red', 'Green', 'Blue'], result = '') => field(`<w:ddList>${inner}${entries.map(e => `<w:listEntry w:val="${e}"/>`).join('')}</w:ddList>`, ' FORMDROPDOWN ', result);
+    const textOf = async (body: string, parts: Record<string, string> = {}) => (await parse(docx(body, parts))).ast.content.map(n => n.text).join('\n');
+
+    // The state, exactly: w:checked (on unless its w:val is false, 0 or off), else w:default, else not ticked.
+    const on = ['', ' w:val="true"', ' w:val="1"', ' w:val="on"'], off = [' w:val="false"', ' w:val="0"', ' w:val="off"'];
+    const table: [string, string][] = [['', unticked]];
+    for (const v of on) table.push([`<w:checked${v}/>`, ticked], [`<w:default${v}/>`, ticked], [`<w:default w:val="0"/><w:checked${v}/>`, ticked]);
+    for (const v of off) table.push([`<w:checked${v}/>`, unticked], [`<w:default${v}/>`, unticked], [`<w:default w:val="1"/><w:checked${v}/>`, unticked]);
+    for (const [inner, expected] of table)
+        assert.strictEqual(await textOf(`<w:p>${checkBox(inner)}${r(' Agree')}</w:p>`), `${expected} Agree`, `DOCX: a check box of ${inner || 'no state'} reads ${expected}`);
+    // Its size where it sets one (in half-points), else the text's.
+    const sized = (await parse(docx(`<w:p><w:r><w:rPr><w:sz w:val="28"/></w:rPr><w:fldChar w:fldCharType="begin"><w:ffData><w:checkBox><w:size w:val="40"/><w:checked/></w:checkBox></w:ffData></w:fldChar></w:r><w:r><w:instrText> FORMCHECKBOX </w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>`
+        + `<w:p><w:r><w:rPr><w:b/><w:sz w:val="28"/></w:rPr><w:fldChar w:fldCharType="begin"><w:ffData><w:checkBox><w:sizeAuto/></w:checkBox></w:ffData></w:fldChar></w:r><w:r><w:instrText> FORMCHECKBOX </w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>`))).ast;
+    assert.deepStrictEqual(sized.content.map(n => [n.children?.[0]?.text, n.children?.[0]?.formatting?.size, n.children?.[0]?.formatting?.bold]), [[ticked, '20pt', undefined], [unticked, '14pt', true]],
+        'DOCX: a check box is at its own size, or its text\'s, in its run\'s formatting');
+
+    // A drop-down: w:result, else w:default, else the first entry; an index no entry has passed over.
+    for (const [inner, expected] of [
+        ['<w:result w:val="2"/>', 'Blue'], ['<w:default w:val="1"/>', 'Green'], ['<w:default w:val="2"/><w:result w:val="0"/>', 'Red'], ['', 'Red'],
+        ['<w:default w:val="1"/><w:result w:val="3"/>', 'Green'], ['<w:default w:val="1"/><w:result w:val="-1"/>', 'Green'], ['<w:result w:val="x"/>', 'Red'],
+        ['<w:default w:val="9"/><w:result w:val="99999999999999999999"/>', 'Red'],
+    ] as const) assert.strictEqual(await textOf(`<w:p>${r('Pick: ')}${dropDown(inner)}</w:p>`), `Pick: ${expected}`, `DOCX: a drop-down of ${inner || 'no choice'} reads ${expected}`);
+    assert.strictEqual(await textOf(`<w:p>${r('Pick: ')}${dropDown('<w:result w:val="0"/>', [])}${r('|')}</w:p>`), 'Pick: |', 'DOCX: a drop-down of no entries shows nothing');
+    // Many entries: read in time that grows with them.
+    const many = Array.from({ length: 50_000 }, (_, i) => `E${i}`);
+    const timed = await withinTime(5000, () => textOf(`<w:p>${dropDown('<w:result w:val="49999"/>', many)}</w:p>`));
+    assert.ok(timed.result === 'E49999' && timed.within, `DOCX: a drop-down of 50,000 entries reads its last, in time (${timed.ms} ms)`);
+
+    // A text field's result stays as Word stores it, its placeholder of five en spaces too.
+    const placeholder = ' '.repeat(5);
+    assert.strictEqual(await textOf(`<w:p>${r('Name: ')}${field('<w:textInput/>', ' FORMTEXT ', r('John'))}</w:p><w:p>${r('Empty: ')}${field('<w:textInput/>', ' FORMTEXT ', r(placeholder))}${r('|')}</w:p>`),
+        `Name: John\nEmpty: ${placeholder}|`, 'DOCX: a text field reads its result');
+
+    // Nothing twice: a result a producer stored is the field's text; a result of white space alone is none.
+    assert.strictEqual(await textOf(`<w:p>${dropDown('<w:result w:val="2"/>', undefined, r('Blue'))}</w:p>`), 'Blue', 'DOCX: a drop-down whose result holds its entry reads it once');
+    assert.strictEqual(await textOf(`<w:p>${checkBox('<w:checked/>', r(ticked))}${r(' Agree')}</w:p>`), `${ticked} Agree`, 'DOCX: a check box whose result holds a box reads it once');
+    assert.strictEqual(await textOf(`<w:p>${checkBox('<w:checked/>', r(' '))}</w:p>`), ` ${ticked}`, 'DOCX: a check box whose result is a space shows its box');
+    // (Text before it separates is its instruction's, not its result.)
+    assert.strictEqual(await textOf(`<w:p><w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:checkBox><w:checked/></w:checkBox></w:ffData></w:fldChar></w:r>${r('x')}<w:r><w:instrText> FORMCHECKBOX </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>`), `x${ticked}`, 'DOCX: text before a check box separates is not its result');
+    // As the specification writes them: no separate.
+    assert.strictEqual(await textOf(`<w:p>${field('<w:checkBox><w:sizeAuto/><w:default w:val="true"/></w:checkBox>', ' FORMCHECKBOX ', '', false)}</w:p>`), ticked, 'DOCX: a check box of no separate shows');
+    // A field of another instruction shows no box (its properties are not its own, 17.16.7); a field of no ffData nothing more.
+    assert.strictEqual(await textOf(`<w:p>${field('<w:checkBox><w:checked/></w:checkBox>', ' MERGEFIELD Name ', r('«Name»'))}</w:p>`), '«Name»', 'DOCX: check box properties on another field show no box');
+    assert.strictEqual(await textOf(`<w:p>${field('<w:ddList><w:listEntry w:val="A"/></w:ddList>', ' FORMCHECKBOX ')}${field('<w:checkBox><w:checked/></w:checkBox>', ' FORMDROPDOWN ')}${r('|')}</w:p>`), '|', 'DOCX: properties of the other kind show nothing');
+    assert.strictEqual(await textOf(`<w:p>${r('a')}<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> FORMCHECKBOX </w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>${r('b')}</w:p>`), 'ab', 'DOCX: a check box of no properties shows nothing (Word shows none)');
+    // Malformed: left open (shown where its paragraph ends), ends and separates of no begin, an empty ffData.
+    assert.strictEqual(await textOf(`<w:p>${r('Open ')}<w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:checkBox><w:checked/></w:checkBox></w:ffData></w:fldChar></w:r><w:r><w:instrText> FORMCHECKBOX </w:instrText></w:r>${r('box')}</w:p>`), `Open box${ticked}`, 'DOCX: a check box left open shows where its paragraph ends');
+    assert.strictEqual(await textOf(`<w:p><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>${r('ok')}<w:r><w:fldChar w:fldCharType="begin"><w:ffData/></w:fldChar></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>`), 'ok', 'DOCX: stray field characters and an empty ffData read nothing and throw nothing');
+    // In another field's result (an IF showing a check box): once.
+    assert.strictEqual(await textOf(`<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> IF 1 = 1 x </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>${checkBox('<w:checked/>')}<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>`), ticked, 'DOCX: a check box in another field\'s result reads once');
+
+    // Every wrapper: a link, a content control in the line and around the paragraph, inserted text, alternate
+    // content, a table, a text box (and its fallback, read once), a header, a footer, a footnote. Deleted text shows none.
+    const box = checkBox('<w:checked/>');
+    const textBox = `<w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:inline><wp:docPr id="2" name="Text Box"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:txbx><w:txbxContent><w:p>${r('Boxed ')}${box}</w:p></w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing></mc:Choice><mc:Fallback><w:pict><v:shape><v:textbox><w:txbxContent><w:p>${r('Boxed ')}${box}</w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r>`;
+    const wrapped = await parse(docx(
+        `<w:p><w:hyperlink r:id="L1">${r('Link ')}${box}</w:hyperlink></w:p>`
+        + `<w:p>${r('Control ')}<w:sdt><w:sdtPr><w:alias w:val="A"/></w:sdtPr><w:sdtContent>${box}</w:sdtContent></w:sdt></w:p>`
+        + `<w:sdt><w:sdtContent><w:p>${r('Block ')}${box}</w:p></w:sdtContent></w:sdt>`
+        + `<w:p>${r('Inserted ')}<w:ins w:id="1" w:author="A">${box}</w:ins><w:del w:id="2" w:author="A">${checkBox('<w:default/>')}</w:del></w:p>`
+        + `<w:p>${r('Alternate ')}<mc:AlternateContent><mc:Choice Requires="w14">${box}</mc:Choice><mc:Fallback>${box}</mc:Fallback></mc:AlternateContent></w:p>`
+        + `<w:tbl><w:tr><w:tc><w:p>${r('Cell ')}${box}</w:p></w:tc></w:tr></w:tbl>`
+        + `<w:p>${textBox}</w:p>`
+        + `<w:p>${r('Noted')}<w:r><w:footnoteReference w:id="1"/></w:r></w:p>`
+        + '<w:sectPr><w:headerReference w:type="default" r:id="H1"/><w:footerReference w:type="default" r:id="F1"/></w:sectPr>', {
+            'word/_rels/document.xml.rels': relsOf(rel('L1', 'hyperlink', 'https://example.com/" TargetMode="External') + rel('H1', 'header', 'header1.xml') + rel('F1', 'footer', 'footer1.xml')),
+            'word/header1.xml': part('hdr', `<w:p>${r('Header ')}${box}</w:p>`),
+            'word/footer1.xml': part('ftr', `<w:p>${r('Footer ')}${dropDown('<w:result w:val="1"/>')}</w:p>`),
+            'word/footnotes.xml': part('footnotes', `<w:footnote w:id="1"><w:p>${r('Note ')}${box}</w:p></w:footnote>`),
+        }));
+    const all = collectAllNodes(wrapped.ast);
+    // (Every paragraph's, a cell's and a note's among them.)
+    const bodyText = all.filter(n => n.type === 'paragraph').map(n => n.text).join('\n');
+    for (const label of ['Link', 'Control', 'Block', 'Inserted', 'Alternate', 'Cell', 'Boxed', 'Note'])
+        assert.ok(bodyText.split(`${label} ${ticked}`).length === 2, `DOCX: a check box in a ${label.toLowerCase()} reads once; got ${JSON.stringify(bodyText)}`);
+    assert.strictEqual([...bodyText].filter(c => c === ticked || c === unticked).length, 8, `DOCX: no box twice, none deleted; got ${JSON.stringify(bodyText)}`);
+    assert.strictEqual((all.find(n => n.type === 'text' && n.text === ticked)?.metadata as any)?.link, 'https://example.com/', 'DOCX: a check box in a link links');
+    assert.ok(all.some(n => n.type === 'note' && n.text === `Note ${ticked}`), 'DOCX: a check box in a footnote reads');
+    assert.deepStrictEqual([wrapped.ast.auxiliary?.headers?.map(h => h.text), wrapped.ast.auxiliary?.footers?.map(f => f.text)], [[`Header ${ticked}`], ['Footer Green']], 'DOCX: a check box in a header, a drop-down in a footer, read');
+
+    // A Word form (its fields in a table and a header), and the outputs: text, Markdown, HTML, and a PDF of the
+    // native engine, which draws the boxes (no font it has holds them) as boxes, losing none.
+    const form = await OfficeParser.parseOffice(path.join(__dirname, 'files/forms/legacy-fields.docx')) as OfficeParserAST;
+    const expected = `Ticked: ${ticked} Agree\nUnticked: ${unticked} Disagree\nBy default: ${ticked} Subscribe\nColour: Blue (chosen)\nDefault colour: Green\nName: Jane Doe\nEmpty: ${placeholder}|`;
+    assert.strictEqual(form.content.slice(0, 7).map(n => n.text).join('\n'), expected, 'DOCX form: each field reads as it shows');
+    assert.strictEqual(form.auxiliary?.headers?.[0]?.text, `Header ${ticked} approved`, 'DOCX form: the header\'s check box');
+    const md = String((await form.to('md')).value), html = String((await form.to('html')).value);
+    assert.ok(md.includes(`Ticked: ${ticked} Agree`) && md.includes(`Unticked: ${unticked} Disagree`) && md.includes(`| ${ticked} |`), `DOCX form: Markdown shows the boxes; got ${JSON.stringify(md)}`);
+    assert.ok(html.includes(`Ticked: ${ticked} Agree`) && html.includes(`Colour: Blue (chosen)`), 'DOCX form: HTML shows the boxes and the choice');
+    // With a content control's box beside them (w14:checkbox), as PDF Stitch converts a form, through the native engine.
+    const both = await parse(docx(`<w:p>${checkBox('<w:checked/>')}${r(' Legacy ')}<w:sdt><w:sdtPr><w14:checkbox xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w14:checked w14:val="0"/></w14:checkbox></w:sdtPr><w:sdtContent>${r(unticked)}</w:sdtContent></w:sdt>${r(' Modern')}</w:p>`));
+    for (const ast of [form, both.ast]) {
+        const result: any = await ast.to('pdf', { pdfConfig: { engine: 'native' } } as any);
+        assert.ok(!(result.messages || []).some((m: any) => m.code === 'CONTENT_NOT_REPRESENTABLE'), `DOCX form: the native PDF loses nothing; got ${JSON.stringify(result.messages)}`);
+        const back = await OfficeParser.parseOffice(Buffer.from(result.value as Uint8Array), { fileType: 'pdf', ocr: false, pdfParserConfig: { separateProcess: false } } as any) as OfficeParserAST;
+        const read = back.content.map(n => n.text).join('\n');
+        for (const line of ast === form ? [`Ticked: ${ticked} Agree`, `Unticked: ${unticked} Disagree`, 'Colour: Blue (chosen)'] : [`${ticked} Legacy ${unticked} Modern`])
+            assert.ok(read.includes(line), `DOCX form: the native PDF reads "${line}"; got ${JSON.stringify(read)}`);
+    }
+}
+
+/**
+ * ODF form controls: a `draw:control` shows the control of `office:forms` it names, read as the PDF reader
+ * reads a filled form (a check box or radio button as ticked or not, U+2612 or U+2610, and its label; a
+ * field its value; a list its selected items), in its state now as LibreOffice shows it; each was left out
+ * ("Before [x] Agree after" read "Before  after"). LibreOffice's field marks of Word's legacy check boxes
+ * and drop-downs read as Word's do.
+ */
+async function testOdtFormControls(): Promise<void> {
+    const [ticked, unticked] = ['☒', '☐'];
+    const NS = 'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:form="urn:oasis:names:tc:opendocument:xmlns:form:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0" xmlns:field="urn:openoffice:names:experimental:ooo-ms-interop:xmlns:field:1.0" office:version="1.3"';
+    const odf = (body: string, { styles = '', automatic = '', kind = 'text' }: { styles?: string; automatic?: string; kind?: string } = {}) => Buffer.from(zipSync({
+        mimetype: strToU8(`application/vnd.oasis.opendocument.${kind}`),
+        'content.xml': strToU8(`<?xml version="1.0"?><office:document-content ${NS}><office:automatic-styles>${automatic}</office:automatic-styles><office:body><office:${kind}>${body}</office:${kind}></office:body></office:document-content>`),
+        ...(styles ? { 'styles.xml': strToU8(`<?xml version="1.0"?><office:document-styles ${NS}>${styles}</office:document-styles>`) } : {}),
+    }));
+    const read = async (bytes: Buffer, fileType = 'odt') => await OfficeParser.parseOffice(bytes, { fileType } as any) as OfficeParserAST;
+    const forms = (controls: string) => `<office:forms><form:form form:name="Standard">${controls}</form:form></office:forms>`;
+    const control = (id: string) => `<draw:control draw:control="${id}" text:anchor-type="as-char" svg:width="1in" svg:height="0.2in"/>`;
+    /** Each control's text, one paragraph each: `[element, attributes, children]`. */
+    const shown = async (controls: [string, string, string?][]) => {
+        const ast = await read(odf(forms(controls.map(([tag, attrs, inner], i) => `<form:${tag} form:id="c${i}" xml:id="c${i}" ${attrs}${inner ? `>${inner}</form:${tag}>` : '/>'}`).join(''))
+            + controls.map((_, i) => `<text:p>[${control(`c${i}`)}]</text:p>`).join('')));
+        return ast.content.map(n => n.text);
+    };
+
+    // Check boxes and radio buttons, in their state now (LibreOffice leaves it out where it is unticked).
+    assert.deepStrictEqual(await shown([
+        ['checkbox', 'form:label="Agree" form:current-state="checked"'], ['checkbox', 'form:label="News" form:current-state="unchecked" form:state="checked"'],
+        ['checkbox', 'form:label="Started" form:state="checked"'], ['checkbox', 'form:current-state="unknown"'], ['checkbox', 'form:label="  " form:current-state="checked"'],
+        ['radio', 'form:label="Large" form:current-selected="true"'], ['radio', 'form:label="Small" form:selected="true"'], ['radio', 'form:current-selected="false"'],
+    ]), [`[${ticked} Agree]`, `[${unticked} News]`, `[${unticked} Started]`, `[${unticked}]`, `[${ticked}]`, `[${ticked} Large]`, `[${unticked} Small]`, `[${unticked}]`], 'ODT: check boxes and radio buttons read as ticked or not, with their labels');
+    // Fields their value now; a password a bullet a character; a list its selected labels; a caption its text; a button nothing.
+    assert.deepStrictEqual(await shown([
+        ['text', 'form:current-value="Jane" form:value="Default"'], ['text', 'form:value="Default"'], ['formatted-text', 'form:current-value="1,234.50"'], ['number', 'form:current-value="42"'],
+        ['combobox', 'form:current-value="Berlin"', '<form:item form:label="Paris"/>'], ['file', 'form:current-value="report.pdf"'],
+        ['date', 'form:current-value="2024-01-31"'], ['date', 'form:current-value="20240131"'], ['time', 'form:current-value="PT15H30M05S"'], ['time', 'form:current-value="09051200"'], ['time', 'form:current-value="noon"'],
+        ['password', 'form:value="hunter2"'],
+        ['listbox', 'form:multiple="true"', '<form:option form:label="Apple" form:current-selected="true"/><form:option form:label="Banana" form:selected="true"/><form:option form:value="c" form:current-selected="true"/>'],
+        ['listbox', '', '<form:option form:label="Only default" form:selected="true"/>'],
+        ['fixed-text', 'form:label="Fill in every field"'], ['frame', 'form:label="Delivery"'], ['button', 'form:label="Send"'], ['hidden', 'form:value="secret"'], ['image', ''], ['value-range', 'form:value="5"'],
+    ]), ['[Jane]', '[]', '[1,234.50]', '[42]', '[Berlin]', '[report.pdf]', '[2024-01-31]', '[2024-01-31]', '[15:30:05]', '[09:05:12]', '[noon]', '[•••••••]',
+        '[Apple, c]', '[]', '[Fill in every field]', '[Delivery]', '[]', '[]', '[]', '[]'], 'ODT: each kind of control reads as it shows');
+    // A text area: its lines as lines (a line break between them), or its paragraphs where it has no value.
+    const area = await read(odf(forms('<form:textarea form:id="a" form:current-value="One&#10;Two"/><form:textarea form:id="b"><text:p>Para one</text:p><text:p>Para two</text:p></form:textarea>') + `<text:p>${control('a')}</text:p><text:p>${control('b')}</text:p>`));
+    assert.deepStrictEqual(area.content.map(n => [n.text, n.children?.map(c => c.type)]), [['One\nTwo', ['text', 'break', 'text']], ['Para one\nPara two', ['text', 'break', 'text']]], 'ODT: a text area\'s lines are lines');
+    assert.strictEqual(area.content.length, 2, 'ODT: a text area\'s paragraphs are not read where the forms are too');
+
+    // Where a control stands: a span (its formatting), a link, a table, a frame's text box, a header, the page itself,
+    // and its own text style; forms nested in forms; ids of either kind.
+    const placed = await read(odf(forms('<form:checkbox form:id="s" form:label="Span" form:current-state="checked"/><form:form form:name="Inner"><form:text xml:id="x" form:current-value="Nested"/></form:form>'
+        + '<form:checkbox form:id="t" form:label="Cell" form:current-state="checked"/><form:checkbox form:id="f" form:label="Framed" form:current-state="checked"/><form:checkbox form:id="h" form:label="Header" form:current-state="checked"/>'
+        + '<form:text form:id="pg" form:current-value="On the page"/><form:text form:id="own" form:current-value="Own style"/><form:checkbox form:id="ln" form:label="Linked" form:current-state="checked"/>')
+        + `<text:p><text:span text:style-name="B">${control('s')}</text:span> ${control('x')} <text:a xlink:href="https://example.com/">${control('ln')}</text:a> ${control('own').replace('/>', ' draw:text-style-name="I"/>')}</text:p>`
+        + `<table:table><table:table-column/><table:table-row><table:table-cell><text:p>${control('t')}</text:p></table:table-cell></table:table-row></table:table>`
+        + `<text:p>Frame: <draw:frame text:anchor-type="as-char" svg:width="2in" svg:height="0.5in"><draw:text-box><text:p>${control('f')}</text:p></draw:text-box></draw:frame></text:p>`
+        + `<draw:control draw:control="pg" text:anchor-type="page" svg:width="1in" svg:height="0.2in"/>`, {
+        automatic: '<style:style style:name="B" style:family="text"><style:text-properties fo:font-weight="bold"/></style:style><style:style style:name="I" style:family="paragraph"><style:text-properties fo:font-style="italic"/></style:style>',
+        styles: `<office:automatic-styles><style:page-layout style:name="pm1"><style:page-layout-properties fo:page-width="8.5in" fo:page-height="11in"/></style:page-layout></office:automatic-styles><office:master-styles><style:master-page style:name="Standard" style:page-layout-name="pm1"><style:header><text:p>${control('h')} ${control('mine')}</text:p>${forms('<form:checkbox form:id="mine" form:label="Its own" form:current-state="checked"/><form:checkbox form:id="h" form:label="Shadowed" form:current-state="unchecked"/>')}</style:header></style:master-page></office:master-styles>`,
+    }));
+    const nodes = collectAllNodes(placed);
+    const run = (text: string) => nodes.find(n => n.type === 'text' && n.text === text);
+    assert.strictEqual(placed.content[0].text, `${ticked} Span Nested ${ticked} Linked Own style`, 'ODT: controls in a span, a link and nested forms read');
+    assert.deepStrictEqual([run(`${ticked} Span`)?.formatting?.bold, (run(`${ticked} Linked`)?.metadata as any)?.link, run('Own style')?.formatting?.italic], [true, 'https://example.com/', true], 'ODT: a control takes its span\'s formatting, its link, and its own text style');
+    assert.ok(nodes.some(n => n.type === 'paragraph' && n.text === `${ticked} Cell`) && nodes.some(n => n.type === 'paragraph' && n.text === `${ticked} Framed`), 'ODT: controls in a cell and a frame read');
+    assert.ok(placed.content.some(n => n.type === 'paragraph' && n.text === 'On the page'), 'ODT: a control on the page is a paragraph of its own');
+    assert.deepStrictEqual(placed.auxiliary?.headers?.map(h => h.text), [`${ticked} Header ${ticked} Its own`], 'ODT: controls in a header read, the body\'s forms naming an id first');
+
+    // Malformed: an id no control has, no forms at all, no id, ids of an object's own keys: as before, nothing thrown.
+    for (const [label, body] of [
+        ['an id no control has', forms('<form:checkbox form:id="a" form:current-state="checked"/>') + `<text:p>Before ${control('missing')} after</text:p>`],
+        ['no forms', `<text:p>Before ${control('a')} after</text:p>`],
+        ['no id', forms('<form:checkbox form:current-state="checked"/>') + '<text:p>Before <draw:control/> after</text:p>'],
+        ['an object\'s own key', forms('<form:checkbox form:id="a"/>') + `<text:p>Before ${control('__proto__')}${control('constructor')} after</text:p>`],
+    ] as const) assert.strictEqual((await read(odf(body))).content.map(n => n.text).join('|'), 'Before  after', `ODT: a control with ${label} shows nothing`);
+    // Many options and controls: read in time that grows with them.
+    const options = Array.from({ length: 50_000 }, (_, i) => `<form:option form:label="O${i}"${i % 10_000 === 0 ? ' form:current-selected="true"' : ''}/>`).join('');
+    const timed = await withinTime(5000, async () => (await read(odf(forms(`<form:listbox form:id="l">${options}</form:listbox>`) + `<text:p>${control('l').repeat(20)}</text:p>`))).content[0].text);
+    assert.ok(timed.within && timed.result === 'O0, O10000, O20000, O30000, O40000'.repeat(20), `ODT: a list of 50,000 options shown 20 times reads its selected options, in time (${timed.ms} ms)`);
+    const named = await withinTime(5000, async () => (await read(odf(forms(`<form:listbox form:id="l">${options}</form:listbox>`) + `<text:p>${control('l').repeat(2000)}</text:p>`))).content[0].text);
+    assert.ok(named.within && named.result === 'O0, O10000, O20000, O30000, O40000'.repeat(2000), `ODT: a list of 50,000 options named 2,000 times is read once, in time (${named.ms} ms)`);
+    // A control named again is a repeat (decompressionLimits.maxRepeatedContent): its first showing whole,
+    // the others charged, past the budget the start of its text; a short value repeats freely.
+    const big = 'A'.repeat(100_000), preview = `${'A'.repeat(64)}\u2026`;
+    const budgeted = async (bytes: Buffer, fileType = 'odt') => {
+        const codes: string[] = [];
+        const ast = await OfficeParser.parseOffice(bytes, { fileType, decompressionLimits: { maxRepeatedContent: 1 }, onWarning: (issue: any) => codes.push(issue.code) } as any) as OfficeParserAST;
+        const texts: string[] = [];
+        const walk = (nodes: OfficeContentNode[] | undefined) => nodes?.forEach(n => { if (n.type === 'text' && n.text) texts.push(n.text); walk(n.children); });
+        walk(ast.content);
+        for (const part of ast.auxiliary?.headers ?? []) walk(part.children);
+        return { texts, codes };
+    };
+    const bigForm = forms(`<form:textarea form:id="big" form:current-value="${big}"/>`);
+    const blockControl = `<draw:control draw:control="big" text:anchor-type="page" svg:width="1in" svg:height="0.2in"/>`;
+    for (const [label, bytes, fileType] of [
+        ['inline in a paragraph', odf(`${bigForm}<text:p>${control('big')} and ${control('big')}</text:p>`), 'odt'],
+        ['on the page', odf(`${bigForm}${blockControl}${blockControl}`), 'odt'],
+        ['in table cells', odf(`${bigForm}<table:table><table:table-column/><table:table-row><table:table-cell><text:p>${control('big')}</text:p></table:table-cell></table:table-row><table:table-row><table:table-cell><text:p>${control('big')}</text:p></table:table-cell></table:table-row></table:table>`), 'odt'],
+        ['in a header', odf(`${bigForm}<text:p>Body</text:p>`, { styles: `<office:master-styles><style:master-page style:name="Standard"><style:header><text:p>${control('big')}</text:p><text:p>${control('big')}</text:p></style:header></style:master-page></office:master-styles>` }), 'odt'],
+        ['on a slide', odf(`<draw:page draw:name="S1">${bigForm}<draw:control draw:control="big" svg:x="1in" svg:y="1in" svg:width="2in" svg:height="0.3in"/><draw:control draw:control="big" svg:x="1in" svg:y="2in" svg:width="2in" svg:height="0.3in"/></draw:page>`, { kind: 'presentation' }), 'odp'],
+    ] as const) {
+        const { texts, codes } = await budgeted(bytes, fileType);
+        const copies = texts.filter(t => t.startsWith('AAAA'));
+        assert.deepStrictEqual(copies.map(t => t.length), [100_000, 65], `ODF: a 100,000-character control named twice ${label} shows whole, then its start; got ${copies.map(t => t.length)}`);
+        assert.ok(copies[0] === big && copies[1] === preview && codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED'), `ODF: a control named twice ${label}: its second copy is its start, with REPEATED_CONTENT_LIMIT_EXCEEDED; got ${codes}`);
+    }
+    const short = await budgeted(odf(`${forms('<form:text form:id="s" form:current-value="Jane"/>')}<text:p>${control('s')} ${control('s')}</text:p>`));
+    assert.ok(JSON.stringify(short.texts) === JSON.stringify(['Jane', ' ', 'Jane']) && !short.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED'), `ODT: a short control named twice is whole both times, unwarned; got ${JSON.stringify(short.texts)} ${short.codes}`);
+    // Lines: the first showing keeps its runs and breaks; every later copy is one run, its text on one line
+    // with its line breaks as spaces, and past the budget the start of that.
+    const shapeOf = (nodes: OfficeContentNode[]) => nodes.map(n => n.type === 'break' ? '|' : n.text).join('');
+    const manyLines = Array.from({ length: 30_000 }, () => 'Line').join('&#10;');
+    const linedCodes: string[] = [];
+    const linedAst = await OfficeParser.parseOffice(odf(`${forms(`<form:textarea form:id="t" form:current-value="${manyLines}"/>`)}<text:p>${control('t')}</text:p><text:p>${control('t')}</text:p>`), { fileType: 'odt', decompressionLimits: { maxRepeatedContent: 1 }, onWarning: (issue: any) => linedCodes.push(issue.code) } as any) as OfficeParserAST;
+    const [firstLined, secondLined] = linedAst.content.map(p => p.children ?? []);
+    assert.ok(firstLined.filter(n => n.type === 'text').length === 30_000 && firstLined.filter(n => n.type === 'break').length === 29_999, 'ODT: a 30,000-line control\'s first copy keeps its lines and breaks');
+    assert.ok(secondLined.length === 1 && secondLined[0].type === 'text' && secondLined[0].text === `${Array(30_000).fill('Line').join(' ').slice(0, 64)}…` && linedCodes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED'), `ODT: a 30,000-line control's copy past the budget is one run, its start with spaces for breaks; got ${secondLined.length} nodes`);
+    const threeLines = await OfficeParser.parseOffice(odf(`${forms('<form:textarea form:id="t" form:current-value="First line&#10;Second line&#10;Third"/>')}<text:p>${control('t')}</text:p><text:p>${control('t')}</text:p>`), { fileType: 'odt' } as any) as OfficeParserAST;
+    assert.deepStrictEqual(threeLines.content.map(p => shapeOf(p.children ?? [])), ['First line|Second line|Third', 'First line Second line Third'], 'ODT: a three-line control named twice keeps its lines the first time, and is one run, its breaks as spaces, the second');
+    const twoLines = await budgeted(odf(`${forms('<form:textarea form:id="t" form:current-value="a&#10;b"/>')}${`<text:p>${control('t')}</text:p>`.repeat(50)}`));
+    assert.ok(JSON.stringify(twoLines.texts) === JSON.stringify(['a', 'b', ...Array(49).fill('a b')]) && !twoLines.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED'), `ODT: a short two-line control named 50 times is whole every time, one run after the first, unwarned; got ${JSON.stringify(twoLines.texts.slice(0, 4))} ${twoLines.codes}`);
+
+    // A slide's control: a paragraph where it stands.
+    const slide = await read(odf(`<draw:page draw:name="S1">${forms('<form:checkbox form:id="k" form:label="On a slide" form:current-state="checked"/>')}<draw:control draw:control="k" svg:x="1in" svg:y="1in" svg:width="2in" svg:height="0.3in"/></draw:page>`, { kind: 'presentation' }), 'odp');
+    assert.ok(collectAllNodes(slide).some(n => n.type === 'paragraph' && n.text === `${ticked} On a slide` && !!n.bounds), 'ODP: a slide\'s control is a paragraph in its place');
+
+    // LibreOffice's own: a form's controls saved, and a Word form's legacy fields as its field marks.
+    const saved = await OfficeParser.parseOffice(path.join(__dirname, 'files/forms/controls.odt')) as OfficeParserAST;
+    assert.strictEqual(saved.content.map(n => n.text).filter(Boolean).slice(0, 5).join('\n'),
+        `Terms: ${ticked} I agree and ${unticked} Send news then ${unticked}.\nSize: ${unticked} Small ${ticked} Large\nName: Jane Doe.\nNotes: Line one\nLine two\nFruit: Apple, Cherry; City: Berlin; When: 2024-01-31; Count: ; Secret: ; Button: .`, 'ODT (LibreOffice): a form reads as LibreOffice shows it');
+    assert.ok(collectAllNodes(saved).some(n => n.type === 'paragraph' && n.text === `${ticked} In a cell`) && collectAllNodes(saved).some(n => n.type === 'paragraph' && n.text === `${ticked} In a frame`), 'ODT (LibreOffice): a cell\'s and a frame\'s controls read');
+    const marks = await OfficeParser.parseOffice(path.join(__dirname, 'files/forms/legacy-fields.odt')) as OfficeParserAST;
+    assert.strictEqual(marks.content.slice(0, 7).map(n => n.text).join('\n'), `Ticked: ${ticked} Agree\nUnticked: ${unticked} Disagree\nBy default: ${ticked} Subscribe\nColour: Blue (chosen)\nDefault colour: Red\nName: Jane Doe\nEmpty: ${' '.repeat(5)}|`, 'ODT (LibreOffice): a Word form\'s field marks read as Word\'s fields');
+    assert.strictEqual(marks.auxiliary?.headers?.[0]?.text, `Header ${ticked} approved`, 'ODT (LibreOffice): a header\'s field mark');
+    for (const [mark, expected] of [
+        ['<field:fieldmark field:type="vnd.oasis.opendocument.field.FORMCHECKBOX"/>', unticked],
+        ['<field:fieldmark field:type="vnd.oasis.opendocument.field.FORMCHECKBOX"><field:param field:name="Checkbox_Checked" field:value="false"/></field:fieldmark>', unticked],
+        ['<field:fieldmark-start field:type="vnd.oasis.opendocument.field.FORMCHECKBOX"><field:param field:name="Checkbox_Checked" field:value="true"/></field:fieldmark-start><field:fieldmark-end/>', ticked],
+        ['<field:fieldmark field:type="vnd.oasis.opendocument.field.FORMDROPDOWN"><field:param field:name="Dropdown_ListEntry" field:value="A"/><field:param field:name="Dropdown_ListEntry" field:value="B"/><field:param field:name="Dropdown_Selected" field:value="7"/></field:fieldmark>', 'A'],
+        ['<field:fieldmark field:type="vnd.oasis.opendocument.field.FORMDROPDOWN"/>', ''],
+        ['<field:fieldmark-start field:type="vnd.oasis.opendocument.field.FORMTEXT"/>typed<field:fieldmark-end/>', 'typed'],
+    ] as const) assert.strictEqual((await read(odf(`<text:p>[${mark}]</text:p>`))).content[0].text, `[${expected}]`, `ODT: the field mark ${mark.slice(0, 80)} reads ${expected}`);
+
+    // Through the native PDF engine: the boxes drawn, nothing lost.
+    const pdf: any = await saved.to('pdf', { pdfConfig: { engine: 'native' } } as any);
+    assert.ok(!(pdf.messages || []).some((m: any) => m.code === 'CONTENT_NOT_REPRESENTABLE'), `ODT (LibreOffice): the native PDF loses nothing; got ${JSON.stringify(pdf.messages)}`);
+    const back = await OfficeParser.parseOffice(Buffer.from(pdf.value as Uint8Array), { fileType: 'pdf', ocr: false, pdfParserConfig: { separateProcess: false } } as any) as OfficeParserAST;
+    assert.ok(back.content.map(n => n.text).join('\n').includes(`Terms: ${ticked} I agree and ${unticked} Send news`), 'ODT (LibreOffice): the native PDF reads the boxes');
+}
+
+/**
  * DOCX reading, from the OOXML review before 8.1.0: chunks that cannot be read, chunks in notes, comments
  * and headers (each part's ids its own relationships), text boxes and SmartArt read as blocks of their own,
  * and alternate content read from the branch the reader understands.
@@ -11677,6 +12328,8 @@ async function runTests(): Promise<void> {
         ['Second review', testSecondReview],
         ['Image links', testImageLinks],
         ['DOCX reading review', testDocxReadingReview],
+        ['DOCX legacy form fields', testDocxLegacyFormFields],
+        ['ODT form controls', testOdtFormControls],
         ['HTML', testHtml],
         ['HTML browser reading', testHtmlBrowserReading],
         ['SourceComments', testSourceComments],
@@ -11704,6 +12357,7 @@ async function runTests(): Promise<void> {
         ['NativePdfEngine', testNativePdfEngine],
         ['Template', testTemplate],
         ['Template blocks', testTemplateBlocks],
+        ['Template tags and check', testTemplateTagsAndCheck],
         ['Chart scripts', testChartScripts],
         ['Markdown header rows', testMarkdownHeaderRows],
         ['RTF header rows', testRtfHeaderRows],
@@ -11720,6 +12374,7 @@ async function runTests(): Promise<void> {
         ['Paragraph layout', testParagraphLayout],
         ['Paragraph spacing', testParagraphSpacing],
         ['Native PDF font kinds', testNativePdfFontKinds],
+        ['Native PDF ballot boxes', testNativePdfBallotBoxes],
         ['List markers', testListMarkers],
         ['HTML stylesheet and shading', testHtmlStylesheetAndShading],
         ['Native PDF footnotes', testNativePdfFootnotes],
@@ -11738,6 +12393,7 @@ async function runTests(): Promise<void> {
         ['Native PDF shaped text', testNativePdfShapedText],
         ['Page number formats', testPageNumberFormats],
         ['Sections saved again', testSectionRoundTrips],
+        ['Page number restarts', testPageNumberRestarts],
         ['PDF lists read whole', testPdfListsReadWhole],
         ['PDF headings by size and weight', testPdfHeadingsBySizeAndWeight],
         ['PDF ruled tables', testPdfRuledTables],

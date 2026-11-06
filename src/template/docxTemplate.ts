@@ -29,7 +29,7 @@
  */
 
 import { zipSync, Zippable } from 'fflate';
-import { DecompressionLimits, OfficeErrorType, OfficeParserConfig, TemplateData, TemplateDataDetails, TemplateFormatter, TemplateSyntaxDetails, TemplateValue } from '../types.js';
+import { DecompressionLimits, OfficeErrorType, OfficeParserConfig, TemplateData, TemplateDataDetails, TemplateFormatter, TemplateLoopPlace, TemplateSyntaxDetails, TemplateTagInfo, TemplateValue } from '../types.js';
 import { escapeXml, stripInvalidXmlChars } from '../utils/sanitize.js';
 import { extractFiles } from '../utils/zipUtils.js';
 import { dateOf, formatDate, formatNumber, numberOf, Picture, PictureSettings, readPicture } from './templateFormat.js';
@@ -187,12 +187,14 @@ export interface DocxTemplateOptions {
     end: string;
     onMissing: 'keep' | 'empty' | 'error';
     mtime: Date;
-    onFieldMissing: (key: string) => never;
+    /** A field the data does not have, with the loops it was read in (a render throws; a check notes it and goes on). */
+    onFieldMissing: (key: string, place: TemplatePlace) => void;
     /** What the document's loops and values may add by repetition (see render), and what to throw past it. */
     maxRepeatedContent: number;
     onRepeatLimit: () => never;
     onSyntax: (details: TemplateSyntaxDetails) => never;
-    onDataInvalid: (details: TemplateDataDetails) => never;
+    /** A value that does not fit its tag, with the loops it was read in. Never returns: a check throws {@link TAG_SKIPPED}, and the tag is passed over. */
+    onDataInvalid: (details: TemplateDataDetails, place: TemplatePlace) => never;
     /** Blocks nest deeper than {@link MAX_BLOCK_DEPTH}. */
     onNestingLimit: () => never;
     /** A part would grow past what one string can hold (with data that large, not by repetition). */
@@ -202,6 +204,11 @@ export interface DocxTemplateOptions {
     onElementLimit: () => never;
     /** What a picture writes: separators, month and day names, the UTC offset. */
     pictures: PictureSettings;
+    /**
+     * A check, not a render: a block whose condition or list is missing is not written as typed (nothing
+     * inside it is read until the data gives it, and writing it would only spend the budget a check needs).
+     */
+    checking?: boolean;
     /** The caller's own filters, by name. */
     formatters: Record<string, TemplateFormatter>;
 }
@@ -280,6 +287,8 @@ export interface CompiledDocxTemplate {
      * a loop's edge: written once, under their own ids (see {@link rangesAcrossLoops}).
      */
     rangesAcrossLoops: Set<string>;
+    /** The ids of the notes cut out of each notes part, in the part's order (see notesPartXml). */
+    loopNotes: Map<string, string[]>;
 }
 
 // ─── Phase 1: tags in text ──────────────────────────────────────────────────
@@ -1791,6 +1800,63 @@ function compilePart(name: string, xml: string, opts: DocxTemplateOptions, liter
     return { part: { name, nodes, hasBlocks: true }, literals: builder.count };
 }
 
+/** The paths a condition reads, each as typed, in order, once each. */
+function conditionFields(expression: TemplateExpression, out: string[]): void {
+    const seen = new Set(out);
+    const todo: TemplateExpression[] = [expression];
+    while (todo.length) {
+        const e = todo.pop()!;
+        switch (e.kind) {
+            case 'path': if (!seen.has(e.text)) { seen.add(e.text); out.push(e.text); } break;
+            case 'literal': break;
+            case 'not': todo.push(e.operand); break;
+            case 'and': case 'or': for (let i = e.operands.length - 1; i >= 0; i--) todo.push(e.operands[i]); break;
+            case 'compare': todo.push(e.right, e.left); break;
+        }
+    }
+}
+
+/**
+ * Every tag of a compiled template, part by part in the order each holds them: fields, and the tags
+ * that open a block or a branch of one. A note that only loops refer to is compiled on its own, and its
+ * tags follow its part's own.
+ */
+export function templateTags(compiled: CompiledDocxTemplate, opts: DocxTemplateOptions): TemplateTagInfo[] {
+    const out: TemplateTagInfo[] = [];
+    const walk = (nodes: TemplateNode[], part: string, loops: { item: string; list: string }[]): void => {
+        // Blocks nest at most MAX_BLOCK_DEPTH deep, so this recursion is bounded.
+        for (const node of nodes) {
+            if (node.kind === 'field') {
+                if (node.piece !== 0) continue;
+                const tag: TemplateTagInfo = { kind: 'field', tag: typedOf(node.record, opts), part, fields: [node.text], loops };
+                const filters = node.record.tag.kind === 'field' ? node.record.tag.filters : undefined;
+                if (filters?.length) tag.filters = filters.map(filter => filter.name);
+                out.push(tag);
+            } else if (node.kind === 'if') {
+                node.branches.forEach((branch, index) => {
+                    const fields: string[] = [];
+                    if (branch.condition) conditionFields(branch.condition, fields);
+                    const kind = branch.condition === null ? 'else' : index === 0 ? 'if' : 'elseif';
+                    out.push({ kind, tag: typedOf(branch.record, opts), part, fields, loops });
+                    walk(node.sections[index], part, loops);
+                });
+            } else if (node.kind === 'for') {
+                out.push({ kind: 'for', tag: typedOf(node.record, opts), part, fields: [node.listText], item: node.name, loops });
+                walk(node.body, part, [...loops, { item: node.name, list: node.listText }]);
+            }
+        }
+    };
+    for (const [name, part] of compiled.parts) {
+        if (part.nodes) walk(part.nodes, name, []);
+        // The notes cut out of the part (only loops refer to them) are compiled on their own: after the part's own.
+        for (const id of compiled.loopNotes.get(name) ?? []) {
+            const nodes = compiled.noteTemplates.get(name)?.get(id)?.nodes;
+            if (nodes) walk(nodes, name, []);
+        }
+    }
+    return out;
+}
+
 /** Compiles a template's parts once, for every data entry of a batch. Raises the tag errors up front. */
 export function compileDocxTemplate(entries: Record<string, Uint8Array>, opts: DocxTemplateOptions): CompiledDocxTemplate {
     const parts = new Map<string, CompiledPart>();
@@ -1815,6 +1881,7 @@ export function compileDocxTemplate(entries: Record<string, Uint8Array>, opts: D
     };
     const noteTemplates = new Map<string, Map<string, NoteTemplate>>();
     const notesPartXml = new Map<string, string>();
+    const loopNotes = new Map<string, string[]>();
     const noteElements: ElementBudget = { left: opts.maxXmlElements, textRuns: opts.maxXmlElements };
     if (repeatsIds) {
         // Each note on its own, to be rendered in the scope of a reference to it inside a loop. Its
@@ -1884,8 +1951,10 @@ export function compileDocxTemplate(entries: Record<string, Uint8Array>, opts: D
         for (const { part, element } of Object.values(NOTE_PARTS)) {
             if (!entries[part]) continue;
             const xml = Buffer.from(entries[part]).toString('utf8');
-            const cut = [...noteSpans(xml, element)].filter(([id]) => inLoops.has(`${part}:${id}`) && !outside.has(`${part}:${id}`)).map(([, span]) => span).sort((a, b) => a[0] - b[0]);
+            const cutNotes = [...noteSpans(xml, element)].filter(([id]) => inLoops.has(`${part}:${id}`) && !outside.has(`${part}:${id}`)).sort((a, b) => a[1][0] - b[1][0]);
+            const cut = cutNotes.map(([, span]) => span);
             if (!cut.length) continue;
+            loopNotes.set(part, cutNotes.map(([id]) => id));
             const kept: string[] = [];
             let at = 0;
             for (const [start, end] of cut) { kept.push(xml.slice(at, start)); at = end; }
@@ -1900,7 +1969,7 @@ export function compileDocxTemplate(entries: Record<string, Uint8Array>, opts: D
     }
     const rangesAcross = new Set<string>();
     if (repeatsIds) for (const part of parts.values()) if (part.nodes) for (const key of rangesAcrossLoops(part.nodes)) rangesAcross.add(key);
-    return { entries, parts, ids: repeatsIds ? seedIds(entries, unreadScan()) : null, literalCount, noteTemplates, notesPartXml, rangesAcrossLoops: rangesAcross };
+    return { entries, parts, ids: repeatsIds ? seedIds(entries, unreadScan()) : null, literalCount, noteTemplates, notesPartXml, rangesAcrossLoops: rangesAcross, loopNotes };
 }
 
 /** The range a slot is an end of (a bookmark's or a comment's), as `bookmark:<id>` or `comment:<id>`, or null. */
@@ -2006,7 +2075,59 @@ function forEachLoopSlots(nodes: TemplateNode[], visit: (slots: IdSlot[]) => voi
 interface LoopDetails { index: number; number: number; first: boolean; last: boolean; length: number }
 
 /** The names in scope: a loop's item and details, innermost first. */
-interface Scope { name: string; item: TemplateValue; list: readonly TemplateValue[]; index: number; loop: LoopDetails; parent: Scope | null }
+interface Scope { name: string; item: TemplateValue; list: readonly TemplateValue[]; listText: string; listNumber: number; index: number; loop: LoopDetails; parent: Scope | null; loops?: TemplateLoopPlace[]; place?: PlaceNode }
+
+/**
+ * Where a tag is read: one object for each pass of each set of loops, as `loops` tells them apart (loops
+ * over the same list at the same pass are one place), so a place can be told from another by identity.
+ * `loops` lists them, made only when asked for.
+ */
+export interface TemplatePlace { loops(): TemplateLoopPlace[] }
+
+/** A place, with the places inside it by list number and pass. */
+interface PlaceNode extends TemplatePlace { inside: Map<string, PlaceNode> }
+
+/** The loops a scope is in, outermost first, each one's list as typed and the pass: made once per scope, its parent's shared. */
+function loopsOf(scope: Scope | null): TemplateLoopPlace[] {
+    if (!scope) return [];
+    if (!scope.loops) {
+        // (Iterative: a scope's parents are made first, so each is made once, from its own parent's.)
+        const chain: Scope[] = [];
+        for (let s: Scope | null = scope; s && !s.loops; s = s.parent) chain.push(s);
+        for (let i = chain.length - 1; i >= 0; i--) {
+            const s = chain[i];
+            // Frozen: problems of one pass share it.
+            s.loops = Object.freeze([...(s.parent?.loops ?? []), Object.freeze({ list: s.listText, index: s.index })]) as TemplateLoopPlace[];
+        }
+    }
+    return scope.loops!;
+}
+
+/**
+ * A tag's place (see {@link TemplatePlace}): looked up once per scope, from its parent's, among the places
+ * the render has met. A place is made only where a tag is noted at it, so a check's notes bound them.
+ */
+function placeOf(scope: Scope | null, state: RenderState): TemplatePlace {
+    if (!scope) return state.topPlace;
+    if (scope.place) return scope.place;
+    const parent = placeOf(scope.parent, state) as PlaceNode;
+    const key = `${scope.listNumber}:${scope.index}`;
+    let place = parent.inside.get(key);
+    if (!place) parent.inside.set(key, place = { inside: new Map(), loops: () => loopsOf(scope) });
+    return scope.place = place;
+}
+
+/**
+ * Thrown by a check's `onDataInvalid` once it has noted the problem: the tag is passed over (a field
+ * writes nothing, a branch or a loop renders nothing) and the check goes on to the next.
+ */
+export const TAG_SKIPPED: unique symbol = Symbol('tag skipped');
+
+/** Runs `work`, passing over a tag a check has noted (see {@link TAG_SKIPPED}). Returns false when it did. */
+function unlessSkipped(work: () => void): boolean {
+    try { work(); return true; }
+    catch (e) { if (e === TAG_SKIPPED) return false; throw e; }
+}
 
 /** A value found in the data, with the object and key it was read from (for what a repeat adds). */
 interface Found { value: TemplateValue; container: object; key: string }
@@ -2017,6 +2138,15 @@ class RenderState {
     readonly written: Uint8Array;
     readonly valueXml = new WeakMap<object, Map<string, string>>();
     readonly valueUsed = new WeakMap<object, Set<string>>();
+    /** A number for each loop's list as typed, in the order the render meets them (see {@link TemplatePlace}). */
+    private readonly listNumbers = new Map<string, number>();
+    /** The place of a tag read in no loop, and through it every place the render has met (see placeOf). */
+    readonly topPlace: PlaceNode = { inside: new Map(), loops: () => [] };
+    listNumber(listText: string): number {
+        let n = this.listNumbers.get(listText);
+        if (n === undefined) this.listNumbers.set(listText, n = this.listNumbers.size);
+        return n;
+    }
     readonly ids: IdState | null;
     part = '';
     constructor(readonly data: TemplateData, readonly opts: DocxTemplateOptions, compiled: CompiledDocxTemplate) {
@@ -2109,7 +2239,8 @@ function renderField(node: FieldNode, scope: Scope | null, state: RenderState, o
     state.charge(node.cost);
     const found = lookup(node.path, node.text, scope, state.data);
     if (found === MISSING) {
-        if (state.opts.onMissing === 'error') state.opts.onFieldMissing(node.text);
+        // (A tag split across runs is one field: the run it began in stands for it.)
+        if (state.opts.onMissing === 'error' && node.piece === 0) state.opts.onFieldMissing(node.text, placeOf(scope, state));
         // 'keep': each piece of the tag stays in its own run, so a tag split across runs keeps each
         // run's formatting (written again, as in a loop, it is a repeat); 'empty': nothing.
         if (state.opts.onMissing === 'keep') {
@@ -2131,13 +2262,13 @@ function renderField(node: FieldNode, scope: Scope | null, state: RenderState, o
     let cache = custom ? undefined : state.valueXml.get(container);
     if (!custom && !cache) state.valueXml.set(container, cache = new Map());
     let xml = cache?.get(key);
-    if (xml === undefined) {
-        if (node.record.filters) value = applyFilters(value, node.record.filters, node, state);
+    if (xml === undefined && !unlessSkipped(() => {
+        if (node.record.filters) value = applyFilters(value, node.record.filters, node, scope, state);
         // A list, an object, a function or a symbol has no text of its own (a function's would be its source).
         if (isContainer(value) || typeof value === 'function' || typeof value === 'symbol') {
-            state.opts.onDataInvalid({ reason: 'not-text', tag: typedOf(node.record, state.opts), part: state.part, kind: kindOfValue(value) });
+            state.opts.onDataInvalid({ reason: 'not-text', tag: typedOf(node.record, state.opts), part: state.part, kind: kindOfValue(value) }, placeOf(scope, state));
         }
-    }
+    })) return;
     // Each value's run-XML, made once; a value's first use is the caller's own data, and each later
     // use adds what it outgrows its placeholder by, within `maxRepeatedContent`, as a parse repeats a
     // document's shared content: 1,000,000 placeholders of one 100-character value (9.6 KB of template)
@@ -2166,10 +2297,10 @@ function renderField(node: FieldNode, scope: Scope | null, state: RenderState, o
  * them); `upper` and `lower` change case; the caller's own get the value as the data holds it. An empty
  * value (null or undefined) stays empty through the built-in filters.
  */
-function applyFilters(value: TemplateValue, filters: CompiledFilter[], node: FieldNode, state: RenderState): TemplateValue {
+function applyFilters(value: TemplateValue, filters: CompiledFilter[], node: FieldNode, scope: Scope | null, state: RenderState): TemplateValue {
     const unformattable = (filter: string, takes: string, v: TemplateValue): never => state.opts.onDataInvalid({
         reason: 'unformattable', tag: typedOf(node.record, state.opts), part: state.part, kind: kindOfValue(v), filter, takes,
-    });
+    }, placeOf(scope, state));
     let current = value;
     for (const filter of filters) {
         if (filter.kind === 'custom') { current = filter.run(current, ...filter.args); continue; }
@@ -2206,7 +2337,7 @@ function applyFilters(value: TemplateValue, filters: CompiledFilter[], node: Fie
 function blockValue(path: TemplatePath, text: string, scope: Scope | null, state: RenderState): ConditionValue {
     const found = lookup(path, text, scope, state.data);
     if (found !== MISSING) return found.value;
-    if (state.opts.onMissing === 'error') state.opts.onFieldMissing(text);
+    if (state.opts.onMissing === 'error') state.opts.onFieldMissing(text, placeOf(scope, state));
     return state.opts.onMissing === 'empty' ? null : MISSING;
 }
 
@@ -2215,12 +2346,14 @@ function renderIf(node: IfNode, scope: Scope | null, state: RenderState, out: st
     const read = (path: TemplatePath, text: string): ConditionValue => blockValue(path, text, scope, state);
     // Comparing two strings reads them: as long as the shorter one.
     const compared = (length: number): void => state.charge(length);
-    const incomparable = (why: Incomparable): never => state.opts.onDataInvalid({ reason: 'incomparable', tag: typedOf(node.branches[branch].record, state.opts), part: state.part, kind: why.left, otherKind: why.right });
+    const incomparable = (why: Incomparable): never => state.opts.onDataInvalid({ reason: 'incomparable', tag: typedOf(node.branches[branch].record, state.opts), part: state.part, kind: why.left, otherKind: why.right }, placeOf(scope, state));
     for (; branch < node.branches.length; branch++) {
         const { condition, cost } = node.branches[branch];
         state.charge(cost);
-        const holds = condition === null ? true : evaluateCondition(condition, read, incomparable, compared);
-        if (holds === MISSING) { renderKept(node.kept, scope, state, out); return; }
+        let holds: boolean | typeof MISSING;
+        try { holds = condition === null ? true : evaluateCondition(condition, read, incomparable, compared); }
+        catch (e) { if (e === TAG_SKIPPED) return; throw e; }
+        if (holds === MISSING) { if (!state.opts.checking) renderKept(node.kept, scope, state, out); return; }
         if (holds) { renderNodes(node.sections[branch], scope, state, out); return; }
     }
 }
@@ -2228,15 +2361,15 @@ function renderIf(node: IfNode, scope: Scope | null, state: RenderState, out: st
 function renderFor(node: ForNode, scope: Scope | null, state: RenderState, out: string[]): void {
     state.charge(node.cost);
     const list = blockValue(node.list, node.listText, scope, state);
-    if (list === MISSING) { renderKept(node.kept, scope, state, out); return; }
+    if (list === MISSING) { if (!state.opts.checking) renderKept(node.kept, scope, state, out); return; }
     if (list === null || list === undefined) return;
-    if (!Array.isArray(list)) state.opts.onDataInvalid({ reason: 'not-a-list', tag: typedOf(node.record, state.opts), part: state.part, kind: kindOfValue(list) });
+    if (!Array.isArray(list) && !unlessSkipped(() => state.opts.onDataInvalid({ reason: 'not-a-list', tag: typedOf(node.record, state.opts), part: state.part, kind: kindOfValue(list) }, placeOf(scope, state)))) return;
     const items = list as readonly TemplateValue[];
     for (let index = 0; index < items.length; index++) {
         // Each pass costs at least one, so nested loops over long lists stay bounded even with nothing to write.
         state.charge(1);
         const loop: LoopDetails = { index, number: index + 1, first: index === 0, last: index === items.length - 1, length: items.length };
-        renderNodes(node.body, { name: node.name, item: items[index], list: items, index, loop, parent: scope }, state, out);
+        renderNodes(node.body, { name: node.name, item: items[index], list: items, listText: node.listText, listNumber: state.listNumber(node.listText), index, loop, parent: scope }, state, out);
     }
 }
 
@@ -2358,8 +2491,12 @@ const BLOCK_HOLDERS = new Set(['w:body', 'w:tc', 'w:txbxContent', 'w:footnote', 
 
 // ─── Render a document ──────────────────────────────────────────────────────
 
-/** Renders one `.docx` from a compiled template and a single data map. */
-export function renderDocxTemplate(compiled: CompiledDocxTemplate, data: TemplateData, opts: DocxTemplateOptions): Uint8Array {
+/**
+ * Renders a template's parts for one data entry: each part's XML by name (a part holding no tag is
+ * not among them, save a notes part with notes cut out of it). A check renders with nothing more, told
+ * each part it moves to (`onPart`).
+ */
+export function renderParts(compiled: CompiledDocxTemplate, data: TemplateData, opts: DocxTemplateOptions, onPart?: (part: string) => void): Map<string, string> {
     const state = new RenderState(data, opts, compiled);
     const rendered = new Map<string, string>();
     const renderPart = (name: string): void => {
@@ -2370,6 +2507,7 @@ export function renderDocxTemplate(compiled: CompiledDocxTemplate, data: Templat
             return;
         }
         state.part = name;
+        onPart?.(name);
         state.partLength = 0;
         const pieces: string[] = [];
         renderNodes(part.nodes, null, state, pieces);
@@ -2386,8 +2524,15 @@ export function renderDocxTemplate(compiled: CompiledDocxTemplate, data: Templat
         const copies = state.ids?.copies.filter(c => c.part === part) ?? [];
         if (!copies.length || !compiled.entries[part]) continue;
         state.part = part;
+        onPart?.(part);
         rendered.set(part, copyNotes(rendered.get(part) ?? Buffer.from(compiled.entries[part]).toString('utf8'), part, element, copies, compiled, state));
     }
+    return rendered;
+}
+
+/** Renders one `.docx` from a compiled template and a single data map. */
+export function renderDocxTemplate(compiled: CompiledDocxTemplate, data: TemplateData, opts: DocxTemplateOptions): Uint8Array {
+    const rendered = renderParts(compiled, data, opts);
     const out: Zippable = {};
     for (const [name, bytes] of Object.entries(compiled.entries)) {
         const xml = rendered.get(name);

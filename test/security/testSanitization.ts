@@ -304,6 +304,27 @@ async function htmlTests() {
     ]);
     const html3 = (await OfficeGenerator.generate(linkAst, 'html')).value as string;
     check('html: javascript link neutralized', !html3.includes('href="javascript:'), 'javascript href survived');
+
+    // The sheet tabs that work without the script are CSS naming each sheet's id. The ids are the
+    // sheets' places, never their names or anchors, so a hostile name or anchor reaches neither that
+    // CSS nor the markers it uses.
+    const HOSTILE_SHEET = 'x"]{}</style><script>alert(5)</script>';
+    const hostileSheets = astWith([0, 1].map(i => ({
+        type: 'sheet', metadata: { sheetName: `${HOSTILE_SHEET}${i}`, anchorIds: [`${HOSTILE_SHEET}a${i}`] },
+        children: [{ type: 'row', children: [{ type: 'cell', metadata: { row: 0, col: 0 }, children: [{ type: 'text', text: 'v' }] }] }],
+    })) as any);
+    for (const styles of ['full', 'scoped'] as const) {
+        const out = (await OfficeGenerator.generate(hostileSheets, 'html', { htmlConfig: { standalone: { styles } } } as any)).value as string;
+        const css = out.match(/<style data-default-styles>([\s\S]*?)<\/style>/)?.[1] || '';
+        const start = css.indexOf('/* Sheet tabs without the script */');
+        const noScript = start < 0 ? '' : css.slice(start, css.indexOf('}', css.lastIndexOf(':target')) + 1);
+        check(`html (${styles}): the no-script sheet tab rules are written`, noScript.includes(':target'), 'no :target rules, so the checks below would be vacuous');
+        check(`html (${styles}): a sheet's name or anchor never reaches the stylesheet`, !css.includes('alert(5)') && !css.includes('x"]'), 'sheet text in the CSS');
+        // The rule's declarations (a colour such as #fff) are not ids: only the selectors are read.
+        const ids = noScript.split('{').filter((_, i, all) => i < all.length - 1).map(part => part.slice(part.lastIndexOf('}') + 1)).join(' ').match(/#[^\s:"\])]+/g) || [];
+        check(`html (${styles}): the no-script rules name only sheet-N ids`, ids.length > 0 && ids.every(id => /^#sheet-\d+$/.test(id)), JSON.stringify(ids));
+        check(`html (${styles}): the hostile sheet name stays escaped in its tab`, !out.includes('<script>alert(5)') && out.includes('&lt;script&gt;alert(5)'), 'tab text not escaped');
+    }
 }
 
 async function htmlSourceAttributesTests() {
@@ -3005,7 +3026,7 @@ async function parserHardeningTests() {
     // many times, list-style lookups, chart ranges and runs of spaces are all bounded (each took
     // minutes or gigabytes, or crashed the process, from a few KB).
     const odfNs = 'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:chart="urn:oasis:names:tc:opendocument:xmlns:chart:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"';
-    const odfOf = (kind: 'text' | 'spreadsheet', body: string, extra: Record<string, string> = {}, automatic = '') => {
+    const odfOf = (kind: 'text' | 'spreadsheet' | 'presentation', body: string, extra: Record<string, string> = {}, automatic = '') => {
         const mime = `application/vnd.oasis.opendocument.${kind}`;
         const files: Record<string, Uint8Array> = {
             mimetype: enc(mime),
@@ -3292,6 +3313,89 @@ async function parserHardeningTests() {
         }
         check(`${label} repeats within maxRepeatedContent, with REPEATED_CONTENT_LIMIT_EXCEEDED`, !result.error && longest > 0 && longest < 40_000_000 && result.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED'), `${longest} ${result.codes} ${result.error}`);
     }
+    // A form control's text at each draw:control naming it: one 100,000-character text area named 2,000
+    // times (1.2 KB of ODT) made 200 million characters, and 10,000 times failed with "Invalid string length".
+    const formNs = 'xmlns:form="urn:oasis:names:tc:opendocument:xmlns:form:1.0"';
+    const bigArea = `<office:forms ${formNs}><form:form form:name="F"><form:textarea form:id="c1" form:current-value="${'A'.repeat(100_000)}"/></form:form></office:forms>`;
+    for (const [label, doc, fileType] of [
+        ['odt: a 100,000-character text area named by 2,000 controls', odfOf('text', `${bigArea}<text:p>${'<draw:control draw:control="c1"/>'.repeat(2000)}</text:p>`), 'odt'],
+        ['odt: a 100,000-character text area named by 10,000 controls', odfOf('text', `${bigArea}<text:p>${'<draw:control draw:control="c1"/>'.repeat(10000)}</text:p>`), 'odt'],
+        ['odp: a 100,000-character text area named by 2,000 controls on a slide', odfOf('presentation', `<draw:page draw:name="S1">${bigArea}${'<draw:control draw:control="c1"/>'.repeat(2000)}</draw:page>`), 'odp'],
+    ] as const) {
+        const started = Date.now();
+        const named = await warned(doc, fileType);
+        const texts: string[] = [];
+        const walk = (nodes: any[] | undefined) => nodes?.forEach((node: any) => { if (node.type === 'text' && typeof node.text === 'string') texts.push(node.text); walk(node.children); });
+        walk(named.ast?.content);
+        const total = texts.reduce((sum, text) => sum + text.length, 0);
+        const last = texts.filter(text => text.startsWith('AAAA')).pop() ?? '';
+        check(`${label} repeats within maxRepeatedContent, with REPEATED_CONTENT_LIMIT_EXCEEDED`, !named.error && total < 20_000_000 && named.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED') && last.length === 65 && last.endsWith('\u2026'), `${total} ${last.length} ${Date.now() - started}ms ${named.codes} ${named.error}`);
+    }
+    // A text area of 64 empty lines named by 30,000 controls (3.9 KB of ODT) wrote 64 breaks at each naming,
+    // up to 1.9 million nodes: a control named again is one run, so about one node a naming either way.
+    const breaksArea = `<office:forms ${formNs}><form:form form:name="F"><form:textarea form:id="c1" form:current-value="${'&#10;'.repeat(64)}"/></form:form></office:forms>`;
+    const nodesOf = (nodes: any[] | undefined): number => (nodes ?? []).reduce((sum: number, node: any) => sum + 1 + nodesOf(node.children), 0);
+    for (const [label, limits, warns] of [
+        ['with the default budget', undefined, false],
+        ['past a budget of 1', { maxRepeatedContent: 1 }, true],
+    ] as const) {
+        const started = Date.now();
+        const lined = await warned(odfOf('text', `${breaksArea}<text:p>${'<draw:control draw:control="c1"/>'.repeat(30_000)}</text:p>`), 'odt', limits ? { decompressionLimits: limits } : {});
+        const count = nodesOf(lined.ast?.content);
+        let written = false;
+        try { written = !!lined.ast && (await lined.ast.to('html')).value.length > 0; } catch { written = false; }
+        check(`odt: a text area of 64 empty lines named by 30,000 controls ${label} makes about one node a naming, and writes${warns ? ', with REPEATED_CONTENT_LIMIT_EXCEEDED' : ''}`, !lined.error && count < 2 * 30_000 + 1_000 && (!warns || lined.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED')) && written, `${count} nodes, written ${written}, ${Date.now() - started}ms ${lined.codes} ${lined.error}`);
+    }
+    // A text area's line breaks are nodes, counted with the document's elements: 2.5 million `&#10;` in
+    // one (19 KB of ODT) made 2.5 million breaks past decompressionLimits.maxXmlElements.
+    const breaksOf = (count: number) => `<office:forms ${formNs}><form:form form:name="F"><form:textarea form:id="c1" form:current-value="${'&#10;'.repeat(count)}"/></form:form></office:forms><text:p><draw:control draw:control="c1"/></text:p>`;
+    const overBreaks = await parseQuiet(odfOf('text', breaksOf(100_000)), 'odt', { decompressionLimits: { maxXmlElements: 50_000 } });
+    const underBreaks = await parseQuiet(odfOf('text', breaksOf(100_000)), 'odt', { decompressionLimits: { maxXmlElements: 200_000 } });
+    check('odt: a text area of 100,000 line breaks counts against maxXmlElements', /XML element limit exceeded/.test(overBreaks.error) && !underBreaks.error, `${overBreaks.error.slice(0, 120)} | ${underBreaks.error}`);
+    // A 32-line control named 20,000 times in a 64-character link or font writes about what 20,000 spans of
+    // its text on one line write with the same link or font: a control named again is one run, as a span is
+    // (a copy in lines wrote a break, the link and the font for each line).
+    const linesArea = `<office:forms ${formNs}><form:form form:name="F"><form:textarea form:id="c1" form:current-value="${Array(32).fill('a').join('&#10;')}"/></form:form></office:forms>`;
+    const joinedLines = Array(32).fill('a').join(' ');
+    const href64 = `https://example.com/${'p'.repeat(64 - 20)}`;
+    for (const [label, controls, spans, automatic] of [
+        ['in a 64-character link', `<text:p><text:a xlink:type="simple" xlink:href="${href64}">${'<draw:control draw:control="c1"/>'.repeat(20_000)}</text:a></text:p>`, `<text:p><text:a xlink:type="simple" xlink:href="${href64}">${`<text:span>${joinedLines}</text:span>`.repeat(20_000)}</text:a></text:p>`, ''],
+        ['in a 64-character font', `<text:p>${'<draw:control draw:control="c1" draw:text-style-name="T1"/>'.repeat(20_000)}</text:p>`, `<text:p>${`<text:span text:style-name="T1">${joinedLines}</text:span>`.repeat(20_000)}</text:p>`, `<style:style style:name="T1" style:family="text"><style:text-properties style:font-name="${'F'.repeat(64)}"/></style:style>`],
+    ] as const) {
+        const limits = { decompressionLimits: { maxRepeatedContent: 2_000_000 } };
+        const valued = await warned(odfOf('text', `${linesArea}${controls}`, {}, automatic), 'odt', limits);
+        const ordinary = await parseQuiet(odfOf('text', spans, {}, automatic), 'odt', limits);
+        const htmlOf = async (ast: any) => { try { return ast ? (await ast.to('html')).value.length as number : -1; } catch { return -1; } };
+        const html = await htmlOf(valued.ast), spanHtml = await htmlOf(ordinary.ast);
+        check(`odt: a 32-line control named 20,000 times ${label} writes what as many spans write, unwarned`, !valued.error && html > 0 && spanHtml > 0 && Math.abs(html - spanHtml) < spanHtml * 0.05 && !valued.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED'), `${html} against ${spanHtml} ${valued.codes} ${valued.error} ${ordinary.error}`);
+    }
+    // Values just past 64 characters on a control named 1,250 times: a copy's values are charged after
+    // parsing as any run's are, so every run, copies included, keeps them within a 2 MB budget.
+    const v65 = `<style:style style:name="T1" style:family="text"><style:text-properties xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" style:font-name="${'F'.repeat(65)}" fo:color="#${'1'.repeat(64)}" fo:font-size="${'1'.repeat(63)}pt" fo:background-color="#${'2'.repeat(64)}"/></style:style>`;
+    const at65 = await warned(odfOf('text', `${linesArea}<text:p><text:a xlink:type="simple" xlink:href="https://example.com/${'p'.repeat(65 - 20)}">${'<draw:control draw:control="c1" draw:text-style-name="T1"/>'.repeat(1_250)}</text:a></text:p>`, {}, v65), 'odt', { decompressionLimits: { maxRepeatedContent: 2_000_000 } });
+    const runs65: any[] = [];
+    const walk65 = (nodes: any[] | undefined) => nodes?.forEach((node: any) => { if (node.type === 'text') runs65.push(node); walk65(node.children); });
+    walk65(at65.ast?.content);
+    let html65 = -1;
+    try { html65 = at65.ast ? (await at65.ast.to('html')).value.length : -1; } catch { html65 = -1; }
+    const keeps65 = runs65.filter(run => run.formatting?.font?.length === 65 && run.metadata?.link?.length === 65).length;
+    check('odt: a control named 1,250 times with 65-character values keeps them on every run, unwarned, its HTML under 2 MB', !at65.error && !at65.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED') && html65 > 0 && html65 < 2_000_000 && runs65.length === 32 + 1_249 && keeps65 === runs65.length, `${html65} html, ${keeps65}/${runs65.length} runs keep values, ${at65.codes} ${at65.error}`);
+    // A value longer than 64 characters is charged once on each copy, after parsing: a 100-character link
+    // on a control named 2,000 times keeps every link, unwarned.
+    const longLinked = await warned(odfOf('text', `${linesArea}<text:p><text:a xlink:type="simple" xlink:href="https://example.com/${'p'.repeat(100 - 20)}">${'<draw:control draw:control="c1"/>'.repeat(2_000)}</text:a></text:p>`), 'odt');
+    const longLinkRuns: any[] = [];
+    const walkRuns = (nodes: any[] | undefined) => nodes?.forEach((node: any) => { if (node.type === 'text') longLinkRuns.push(node); walkRuns(node.children); });
+    walkRuns(longLinked.ast?.content);
+    check('odt: a control named 2,000 times in a 100-character link keeps every link, unwarned, within the budget', !longLinked.error && longLinkRuns.length === 2_031 && longLinkRuns.every(run => run.metadata?.link?.length === 100) && !longLinked.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED'), `${longLinkRuns.length} runs, ${longLinkRuns.filter(run => run.metadata?.link).length} linked, ${longLinked.codes} ${longLinked.error}`);
+    // The paragraph style a copy takes from its paragraph is charged as any run's is: a 10,000-character
+    // style on a paragraph of 20,000 draw:controls made a JSON AST too long to write. The bound is the
+    // 16 MiB default budget past the same paragraph unstyled, with room for the document's own allowance.
+    const longStyle = 'P'.repeat(10_000);
+    const styledControls = await warned(odfOf('text', `${linesArea}<text:p text:style-name="${longStyle}">${'<draw:control draw:control="c1"/>'.repeat(20_000)}</text:p>`, {}, `<style:style style:name="${longStyle}" style:family="paragraph"/>`), 'odt');
+    const unstyledControls = await parseQuiet(odfOf('text', `${linesArea}<text:p>${'<draw:control draw:control="c1"/>'.repeat(20_000)}</text:p>`), 'odt');
+    const jsonOf = (ast: any) => { try { return ast ? JSON.stringify(ast).length : -1; } catch { return -1; } };
+    const styledJson = jsonOf(styledControls.ast), unstyledJson = jsonOf(unstyledControls.ast);
+    check('odt: a control named 20,000 times in a 10,000-character paragraph style keeps its JSON near maxRepeatedContent, with REPEATED_CONTENT_LIMIT_EXCEEDED', !styledControls.error && styledJson > 0 && unstyledJson > 0 && styledJson < unstyledJson + 18_000_000 && styledControls.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED'), `${styledJson} against ${unstyledJson} unstyled, ${styledControls.codes} ${styledControls.error}`);
 
     // PDF: a form XObject drawing another many times is read within a budget of text items and
     // operators (seven forms deep, 2.5 KB, ended the process out of memory).
@@ -4656,6 +4760,139 @@ async function pdfProcessTests(h: {
     const afterHereRun = await withinTime(4000, () => read(drawnOften, { pdfParserConfig: { maxTimeMs: 200 } }));
     const afterHere = afterHereRun.result;
     check('pdf: after pdf.js ran in this process, the next parse still runs it in a separate one', !afterHere.error && afterHereRun.within && named(afterHere.warnings, 'maxTimeMs'), `${afterHereRun.ms}ms ${afterHere.codes} ${afterHere.error}`);
+
+    // A caller's own pdf.js, opening a document in a fresh host before any parse, loads pdf.js's worker
+    // module, which sets `globalThis.pdfjsWorker`: taken for a worker the caller preloaded, every parse
+    // after it ran pdf.js in the host, without its memory limit and with no warning.
+    const spawnCounter = [
+        `const childProcess = require('child_process');`,
+        `const spawn = childProcess.spawn;`,
+        `let spawned = 0;`,
+        `childProcess.spawn = (...args: any[]) => { spawned++; return spawn.apply(childProcess, args); };`,
+        `require('module').syncBuiltinESMExports();`,
+    ];
+    const callerOwn = runChildScript([
+        ...spawnCounter,
+        `(async () => {`,
+        `    const pdfjs = await import(pathToFileURL(repoRequire.resolve('pdfjs-dist/legacy/build/pdf.mjs')).href);`,
+        `    pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(repoRequire.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs')).href;`,
+        `    const own = await pdfjs.getDocument({ data: new Uint8Array(fs.readFileSync(testPdf)), verbosity: 0 }).promise;`,
+        `    const ownPages = own.numPages;`,
+        `    await own.loadingTask.destroy();`,
+        `    const loaded = !!(globalThis as any).pdfjsWorker;`,
+        `    const codes: string[] = [];`,
+        `    const ast = await OfficeParser.parseOffice(fs.readFileSync(testPdf), { fileType: 'pdf', ocr: false, onWarning: (w: any) => codes.push(w.code) });`,
+        `    console.log(JSON.stringify({ ownPages, loaded, spawned, pages: ast.content.length, codes }));`,
+        `    process.exit(0);`,
+        `})();`,
+    ]);
+    check('pdf: a caller\'s own pdf.js document leaves the next parse in a separate process', callerOwn.ownPages === 8 && callerOwn.loaded === true && callerOwn.spawned === 1 && callerOwn.pages === 8 && callerOwn.codes?.length === 0, JSON.stringify(callerOwn));
+    // A worker preloaded where pdf.js's worker file cannot be found (a bundle that inlines it) is still
+    // used: pdf.js runs in the host, as asked, with no warning.
+    const bundled = runChildScript([
+        ...spawnCounter,
+        `const Module = require('module');`,
+        `const resolveFilename = Module._resolveFilename;`,
+        `Module._resolveFilename = function (request: string, ...rest: any[]) { if (request === 'pdfjs-dist/legacy/build/pdf.worker.mjs') throw new Error('not in the bundle'); return resolveFilename.call(this, request, ...rest); };`,
+        `(async () => {`,
+        `    (globalThis as any).pdfjsWorker = await import(pathToFileURL(path.join(path.dirname(repoRequire.resolve('pdfjs-dist/legacy/build/pdf.mjs')), 'pdf.worker.mjs')).href);`,
+        `    const codes: string[] = [];`,
+        `    const ast = await OfficeParser.parseOffice(fs.readFileSync(testPdf), { fileType: 'pdf', ocr: false, onWarning: (w: any) => codes.push(w.code) });`,
+        `    console.log(JSON.stringify({ spawned, pages: ast.content.length, codes }));`,
+        `    process.exit(0);`,
+        `})();`,
+    ]);
+    check('pdf: a worker preloaded where no worker file is found is used, in the host, with no warning', bundled.spawned === 0 && bundled.pages === 8 && bundled.codes?.length === 0, JSON.stringify(bundled));
+
+    // An application's own pdf.js of another version in the host (a copy of pdf.js numbered 9.9.9):
+    // pdf.js's API takes the worker module `globalThis.pdfjsWorker` names, of whatever version, the first
+    // time it needs one. Its document opened before a parse in the host failed that parse ("The API
+    // version does not match the Worker version"); a parse in the host before its first document failed
+    // that document the same way. Each now runs on a worker module of its own, in either order, and
+    // a parse leaves the global as it found it.
+    const pdfjsVersion = JSON.parse(fs.readFileSync(require.resolve('pdfjs-dist/package.json'), 'utf8')).version;
+    const foreignDir = fs.mkdtempSync(path.join(os.tmpdir(), 'officeparser-foreign-pdfjs-'));
+    try {
+        const pdfjsBuild = path.dirname(require.resolve('pdfjs-dist/legacy/build/pdf.mjs'));
+        for (const file of ['pdf.mjs', 'pdf.worker.mjs']) fs.writeFileSync(path.join(foreignDir, file), fs.readFileSync(path.join(pdfjsBuild, file), 'utf8').split(pdfjsVersion).join('9.9.9'));
+        const foreignScript = (first: 'app' | 'parse') => runChildScript([
+            `(async () => {`,
+            // This pdf.js's own, loaded first, gives the copy the drawing classes it would find beside its own install.
+            `    await import(pathToFileURL(repoRequire.resolve('pdfjs-dist/legacy/build/pdf.mjs')).href);`,
+            `    const app = await import(pathToFileURL(${JSON.stringify(path.join(foreignDir, 'pdf.mjs'))}).href);`,
+            `    app.GlobalWorkerOptions.workerSrc = pathToFileURL(${JSON.stringify(path.join(foreignDir, 'pdf.worker.mjs'))}).href;`,
+            `    const steps: any[] = [];`,
+            `    const open = async () => { try { const doc = await app.getDocument({ data: new Uint8Array(fs.readFileSync(testPdf)), verbosity: 0 }).promise; const pages = doc.numPages; await doc.loadingTask.destroy(); steps.push(pages); } catch (e: any) { steps.push(String(e.message).slice(0, 120)); } };`,
+            `    const parse = async (separateProcess: boolean) => {`,
+            `        const before = Object.getOwnPropertyDescriptor(globalThis, 'pdfjsWorker');`,
+            `        try { const ast = await OfficeParser.parseOffice(fs.readFileSync(testPdf), { fileType: 'pdf', ocr: false, onWarning: () => {}, pdfParserConfig: { separateProcess } }); steps.push(ast.content.length); } catch (e: any) { steps.push(String(e.message).slice(0, 120)); }`,
+            `        const after = Object.getOwnPropertyDescriptor(globalThis, 'pdfjsWorker');`,
+            `        steps.push(before?.value === after?.value && !!before === !!after ? 'global kept' : 'global changed');`,
+            `    };`,
+            ...(first === 'app'
+                ? [`    await open(); await parse(false); await open(); await parse(true); await open();`]
+                : [`    await parse(false); await open(); await parse(false); await parse(true); await open();`]),
+            `    console.log(JSON.stringify({ version: app.version, steps }));`,
+            `    process.exit(0);`,
+            `})();`,
+        ]);
+        const appFirst = foreignScript('app');
+        check('pdf: an application\'s pdf.js of another version, its document opened first, and parses in the host and in a separate process each read theirs',
+            appFirst.version === '9.9.9' && JSON.stringify(appFirst.steps) === JSON.stringify([8, 8, 'global kept', 8, 8, 'global kept', 8]), JSON.stringify(appFirst));
+        const parseFirst = foreignScript('parse');
+        check('pdf: a parse in the host before an application\'s pdf.js of another version opens its first document leaves that pdf.js its own worker',
+            parseFirst.version === '9.9.9' && JSON.stringify(parseFirst.steps) === JSON.stringify([8, 'global kept', 8, 8, 'global kept', 8, 'global kept', 8]), JSON.stringify(parseFirst));
+    } finally {
+        fs.rmSync(foreignDir, { recursive: true, force: true });
+    }
+    // A worker preloaded as `globalThis.pdfjsWorker` where pdf.js's worker file is found is not used by
+    // parses in the host, three at once, and is the global still after them.
+    const preloadedUnused = runChildScript([
+        `(async () => {`,
+        `    const used: string[] = [];`,
+        `    const preloaded = { WorkerMessageHandler: { setup: () => { used.push('setup'); }, initializeFromPort: () => { used.push('initializeFromPort'); }, createDocumentHandler: () => { used.push('createDocumentHandler'); } } };`,
+        `    (globalThis as any).pdfjsWorker = preloaded;`,
+        `    const codes: string[] = [];`,
+        `    const config = { fileType: 'pdf', ocr: false, onWarning: (w: any) => codes.push(w.code), pdfParserConfig: { separateProcess: false } };`,
+        `    const asts = await Promise.all([1, 2, 3].map(() => OfficeParser.parseOffice(fs.readFileSync(testPdf), config)));`,
+        `    console.log(JSON.stringify({ used, kept: (globalThis as any).pdfjsWorker === preloaded, pages: asts.map((ast: any) => ast.content.length), codes }));`,
+        `    process.exit(0);`,
+        `})();`,
+    ]);
+    check('pdf: parses in the host leave a preloaded worker unused where pdf.js\'s worker file is found, and the global as it was',
+        JSON.stringify(preloadedUnused) === JSON.stringify({ used: [], kept: true, pages: [8, 8, 8], codes: [] }), JSON.stringify(preloadedUnused));
+}
+
+/**
+ * Runs `lines` as a TypeScript script in a fresh Node process (as this one runs, under tsx) and returns
+ * what it printed last as JSON, or `{ error }`. In scope: `fs`, `path`, `pathToFileURL`, `repoRequire`
+ * (resolving from the repository), `testPdf` (test/files/test.pdf) and, unless `browser` is set,
+ * `OfficeParser`. With `browser`, the process passes for a browser page (a `window` with a `document`)
+ * before anything is loaded, and the script requires the parser itself.
+ */
+function runChildScript(lines: string[], browser = false): any {
+    const childProcess = require('child_process') as typeof import('child_process');
+    const repo = path.join(__dirname, '..', '..');
+    const script = path.join(os.tmpdir(), `officeparser-child-${process.pid}-${Math.random().toString(36).slice(2)}.ts`);
+    fs.writeFileSync(script, [
+        ...(browser ? [`(globalThis as any).window = globalThis;`, `(globalThis as any).document = { baseURI: 'https://app.example/' };`] : []),
+        `const fs = require('fs');`,
+        `const path = require('path');`,
+        `const { pathToFileURL } = require('url');`,
+        `const repoRequire = require('module').createRequire(${JSON.stringify(path.join(repo, 'package.json'))});`,
+        `const testPdf = ${JSON.stringify(path.join(repo, 'test', 'files', 'test.pdf'))};`,
+        ...(browser ? [] : [`const { OfficeParser } = require(${JSON.stringify(path.join(repo, 'src', 'OfficeParser'))});`]),
+        ...lines,
+    ].join('\n'));
+    try {
+        const out = childProcess.execFileSync(process.execPath, [...process.execArgv, script], { encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
+        const last = out.trim().split('\n').pop() ?? '';
+        return JSON.parse(last);
+    } catch (e: any) {
+        return { error: String(e?.stderr || e?.message).slice(-500) };
+    } finally {
+        fs.rmSync(script, { force: true });
+    }
 }
 
 /**
@@ -4777,6 +5014,31 @@ async function pdfAssetTests() {
         }
     } finally {
         fs.rmSync(folder, { recursive: true, force: true });
+    }
+
+    // A browser page that preloaded pdf.js's worker (`globalThis.pdfjsWorker` with its
+    // WorkerMessageHandler) fetches no worker, so allowRemoteAssets: false parses it; it was refused
+    // with REMOTE_ASSET_BLOCKED. pdf.js is then given no worker address, so a fallback of its own fails
+    // rather than fetch. A global without the handler is no preload to pdf.js, which would start a
+    // Worker from the default address: still refused. (In a fresh process passing for a browser page;
+    // pdf.js's browser build there needs the DOMMatrix its Node build provides.)
+    const inBrowser = (preload: string) => runChildScript([
+        `(async () => {`,
+        `    await import(pathToFileURL(repoRequire.resolve('pdfjs-dist/legacy/build/pdf.mjs')).href);`,
+        preload,
+        `    const { OfficeParser } = require(${JSON.stringify(path.join(__dirname, '..', '..', 'src', 'OfficeParser'))});`,
+        `    const pdfjs = await import(pathToFileURL(repoRequire.resolve('pdfjs-dist')).href);`,
+        `    let out: string;`,
+        `    try { out = 'parsed ' + (await OfficeParser.parseOffice(new Uint8Array(fs.readFileSync(testPdf)), { fileType: 'pdf', allowRemoteAssets: false, onWarning: () => {} })).content.length; } catch (e: any) { out = String(e?.officeIssue?.code ?? e?.message); }`,
+        `    console.log(JSON.stringify({ out, workerSrc: pdfjs.GlobalWorkerOptions.workerSrc }));`,
+        `    process.exit(0);`,
+        `})();`,
+    ], true);
+    const preloaded = inBrowser(`    (globalThis as any).pdfjsWorker = await import(pathToFileURL(repoRequire.resolve('pdfjs-dist/build/pdf.worker.mjs')).href);`);
+    check('pdf: in a browser, a preloaded pdf.js worker is used under allowRemoteAssets false, with no worker address left to fetch', preloaded.out === 'parsed 8' && preloaded.workerSrc === '', JSON.stringify(preloaded));
+    for (const [label, preload] of [['no preloaded worker', ''], ['a pdfjsWorker global without its WorkerMessageHandler', `    (globalThis as any).pdfjsWorker = {};`]]) {
+        const refused = inBrowser(preload);
+        check(`pdf: in a browser with ${label}, allowRemoteAssets false still refuses the default worker`, refused.out === 'REMOTE_ASSET_BLOCKED', JSON.stringify(refused));
     }
 }
 

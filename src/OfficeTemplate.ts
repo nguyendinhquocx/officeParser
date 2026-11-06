@@ -33,11 +33,11 @@
 
 import { decryptIfNeeded } from './crypto/decryptContainer.js';
 import { DEFAULT_OFFICE_PARSER_CONFIG, DEFAULT_TEMPLATE_CONFIG } from './defaults.js';
-import { compileDocxTemplate, DocxTemplateOptions, openDocx, renderDocxTemplate } from './template/docxTemplate.js';
-import { BlobLike, OfficeErrorType, OfficeParserConfig, OfficeWarningType, TemplateConfig, TemplateData, TemplateDataDetails, TemplateFormatter, TemplateSyntaxDetails } from './types.js';
+import { CompiledDocxTemplate, compileDocxTemplate, DocxTemplateOptions, openDocx, renderDocxTemplate, renderParts, TAG_SKIPPED, TemplatePlace, templateTags } from './template/docxTemplate.js';
+import { BlobLike, OfficeErrorType, OfficeParserConfig, OfficeWarningType, TemplateConfig, TemplateData, TemplateDataDetails, TemplateFormatter, TemplateProblem, TemplateSyntaxDetails, TemplateTagInfo } from './types.js';
 import { PictureSettings } from './template/templateFormat.js';
 import { assertNode } from './utils/envUtils.js';
-import { getOfficeError, logWarning } from './utils/errorUtils.js';
+import { buildOfficeError, getOfficeError, logWarning } from './utils/errorUtils.js';
 import { decompressionLimitsOf, maxPasswordAttemptsOf, PROTOTYPE_POLLUTION_KEYS } from './utils/configUtils.js';
 
 /** Accepted template inputs, matching `parseOffice`'s first argument. */
@@ -173,6 +173,94 @@ function isDataObject(d: unknown): d is TemplateData {
  * Template renderer. See {@link module:OfficeTemplate} for an overview and {@link TemplateConfig} for
  * the options.
  */
+/**
+ * At most this many problems a check lists for one data entry. Past it, the check stops and says so
+ * (`TEMPLATE_CHECK_LIMITED`): each problem holds its message and loops, so a long list of rows each
+ * missing fields would otherwise hold more than the process can.
+ */
+const MAX_TEMPLATE_PROBLEMS = 1000;
+
+/** At most this many problems a check of a batch lists in all: past it, the entries after are not checked (`TEMPLATE_CHECK_LIMITED`). */
+const MAX_BATCH_PROBLEMS = 10_000;
+
+/** Thrown when a check has listed {@link MAX_TEMPLATE_PROBLEMS}: it stops there. */
+const CHECK_FULL: unique symbol = Symbol('check full');
+
+/** A template read and compiled, with the options a render, a listing and a check share. */
+interface PreparedTemplate { compiled: CompiledDocxTemplate; options: DocxTemplateOptions; errCfg: OfficeParserConfig }
+
+/**
+ * Reads, decrypts and compiles a template: every tag error is raised here, before any data is used.
+ * `options` throw the caller's typed errors, as a render reports them.
+ */
+async function prepareTemplate(template: TemplateInput, config: Omit<TemplateConfig, 'data'>, errCfg: OfficeParserConfig): Promise<PreparedTemplate> {
+    // The options themselves, before the template is read: a setting of the wrong shape is refused,
+    // and one render does not take is reported, as a parse reports its own.
+    const unknownOptions = unknownTemplateOptions(config as TemplateConfig);
+    const pictures = pictureSettings(config as TemplateConfig, errCfg, unknownOptions);
+    const delimiters = delimitersOf(config as TemplateConfig, errCfg);
+    if (unknownOptions.length) logWarning(OfficeWarningType.UNRECOGNIZED_CONFIG_OPTION, errCfg, { keys: unknownOptions });
+
+    // The limits a render is held to, each a number of 0 or more (another value is reported, and the default used).
+    const limits = decompressionLimitsOf(config.decompressionLimits, errCfg);
+    let bytes = await readInput(template, errCfg);
+
+    // Decrypt an encrypted template up front (shared with the parser), so rendering sees plaintext.
+    // Threads through `password` and `onPassword` with the same capped-retry semantics as parsing.
+    bytes = await decryptIfNeeded(bytes, {
+        onWarning: config.onWarning,
+        password: config.password,
+        onPassword: config.onPassword,
+        maxPasswordAttempts: maxPasswordAttemptsOf(config as TemplateConfig),
+        decompressionLimits: limits,
+    });
+
+    const entries = await openDocx(bytes, limits, errCfg);
+    if (!entries) {
+        const hint = config.fileType && config.fileType !== 'docx' ? `'${config.fileType}' is not supported` : 'the input is not a .docx';
+        throw getOfficeError(OfficeErrorType.TEMPLATE_UNSUPPORTED_FORMAT, errCfg, hint);
+    }
+
+    const options: DocxTemplateOptions = {
+        start: delimiters.start,
+        end: delimiters.end,
+        onMissing: onMissingOf(config as TemplateConfig, errCfg),
+        // A fixed local-time instant: fflate stamps zip entries from local-time fields, so building the
+        // date from local fields makes the DOS timestamp identical in every timezone (deterministic
+        // output cross-machine) and safely inside fflate's 1980-2099 range everywhere.
+        mtime: new Date(2001, 0, 1, 0, 0, 0),
+        onFieldMissing: (key: string): never => { throw getOfficeError(OfficeErrorType.TEMPLATE_FIELD_MISSING, errCfg, key); },
+        maxRepeatedContent: limits.maxRepeatedContent,
+        onRepeatLimit: (): never => { throw getOfficeError(OfficeErrorType.OUTPUT_TOO_LARGE, errCfg, { repeatedLimit: options.maxRepeatedContent }); },
+        onSyntax: (details: TemplateSyntaxDetails): never => { throw getOfficeError(OfficeErrorType.TEMPLATE_SYNTAX, errCfg, details); },
+        onDataInvalid: (details: TemplateDataDetails): never => { throw getOfficeError(OfficeErrorType.TEMPLATE_DATA_INVALID, errCfg, details); },
+        onNestingLimit: (): never => { throw getOfficeError(OfficeErrorType.MAX_NESTING_DEPTH_EXCEEDED, errCfg); },
+        onOutputLimit: (): never => { throw getOfficeError(OfficeErrorType.OUTPUT_TOO_LARGE, errCfg); },
+        pictures,
+        formatters: templateFormatters(config as TemplateConfig, errCfg),
+        maxXmlElements: limits.maxXmlElements,
+        onElementLimit: (): never => { throw getOfficeError(OfficeErrorType.XML_ELEMENT_LIMIT_EXCEEDED, errCfg, options.maxXmlElements); },
+    };
+
+    // Compiled once: the tags are read, their blocks paired and scoped, and every tag error raised
+    // before any document is rendered; then each data entry renders from the same compiled template.
+    return { compiled: compileDocxTemplate(entries, options), options, errCfg };
+}
+
+/** The data given: one object, or an array of objects, refused (typed) otherwise. */
+function dataRows(config: TemplateConfig, errCfg: OfficeParserConfig): TemplateData[] {
+    if (!config || config.data == null) throw getOfficeError(OfficeErrorType.IMPROPER_ARGUMENTS, errCfg, 'data is required: an object, or an array of objects');
+    // Validate the data up front: one object, or an array of objects. Rejects a null/primitive
+    // batch entry with a typed error instead of a raw TypeError mid-render.
+    const rows = Array.isArray(config.data) ? config.data : [config.data];
+    if (!rows.every(isDataObject)) throw getOfficeError(OfficeErrorType.IMPROPER_ARGUMENTS, errCfg, 'data is an object, or an array of objects');
+    return rows;
+}
+
+/**
+ * Template renderer. See {@link module:OfficeTemplate} for an overview and {@link TemplateConfig} for
+ * the options.
+ */
 export class OfficeTemplate {
     /** Renders a single document from a template and one data map. */
     static render(template: TemplateInput, config: TemplateConfig & { data: TemplateData }): Promise<Uint8Array>;
@@ -183,66 +271,110 @@ export class OfficeTemplate {
         // A config object (even without onWarning) suppresses errorUtils' console fallback, so a thrown
         // rejection is not also printed to stderr; a caller-supplied onWarning is still honored.
         const errCfg: OfficeParserConfig = { onWarning: config?.onWarning };
-        if (!config || config.data == null) throw getOfficeError(OfficeErrorType.IMPROPER_ARGUMENTS, errCfg, 'data is required: an object, or an array of objects');
-        // Validate the data up front: one object, or an array of objects. Rejects a null/primitive
-        // batch entry with a typed error instead of a raw TypeError mid-render.
-        const rows = Array.isArray(config.data) ? config.data : [config.data];
-        if (!rows.every(isDataObject)) throw getOfficeError(OfficeErrorType.IMPROPER_ARGUMENTS, errCfg, 'data is an object, or an array of objects');
-
-        // The options themselves, before the template is read: a setting of the wrong shape is refused,
-        // and one render does not take is reported, as a parse reports its own.
-        const unknownOptions = unknownTemplateOptions(config);
-        const pictures = pictureSettings(config, errCfg, unknownOptions);
-        const delimiters = delimitersOf(config, errCfg);
-        if (unknownOptions.length) logWarning(OfficeWarningType.UNRECOGNIZED_CONFIG_OPTION, errCfg, { keys: unknownOptions });
-
-        // The limits a render is held to, each a number of 0 or more (another value is reported, and the default used).
-        const limits = decompressionLimitsOf(config.decompressionLimits, errCfg);
-        let bytes = await readInput(template, errCfg);
-
-        // Decrypt an encrypted template up front (shared with the parser), so rendering sees plaintext.
-        // Threads through `password` and `onPassword` with the same capped-retry semantics as parsing.
-        bytes = await decryptIfNeeded(bytes, {
-            onWarning: config.onWarning,
-            password: config.password,
-            onPassword: config.onPassword,
-            maxPasswordAttempts: maxPasswordAttemptsOf(config),
-            decompressionLimits: limits,
-        });
-
-        const entries = await openDocx(bytes, limits, errCfg);
-        if (!entries) {
-            const hint = config.fileType && config.fileType !== 'docx' ? `'${config.fileType}' is not supported` : 'the input is not a .docx';
-            throw getOfficeError(OfficeErrorType.TEMPLATE_UNSUPPORTED_FORMAT, errCfg, hint);
-        }
-
-        const options: DocxTemplateOptions = {
-            start: delimiters.start,
-            end: delimiters.end,
-            onMissing: onMissingOf(config, errCfg),
-            // A fixed local-time instant: fflate stamps zip entries from local-time fields, so building the
-            // date from local fields makes the DOS timestamp identical in every timezone (deterministic
-            // output cross-machine) and safely inside fflate's 1980-2099 range everywhere.
-            mtime: new Date(2001, 0, 1, 0, 0, 0),
-            onFieldMissing: (key: string): never => { throw getOfficeError(OfficeErrorType.TEMPLATE_FIELD_MISSING, errCfg, key); },
-            maxRepeatedContent: limits.maxRepeatedContent,
-            onRepeatLimit: (): never => { throw getOfficeError(OfficeErrorType.OUTPUT_TOO_LARGE, errCfg, { repeatedLimit: options.maxRepeatedContent }); },
-            onSyntax: (details: TemplateSyntaxDetails): never => { throw getOfficeError(OfficeErrorType.TEMPLATE_SYNTAX, errCfg, details); },
-            onDataInvalid: (details: TemplateDataDetails): never => { throw getOfficeError(OfficeErrorType.TEMPLATE_DATA_INVALID, errCfg, details); },
-            onNestingLimit: (): never => { throw getOfficeError(OfficeErrorType.MAX_NESTING_DEPTH_EXCEEDED, errCfg); },
-            onOutputLimit: (): never => { throw getOfficeError(OfficeErrorType.OUTPUT_TOO_LARGE, errCfg); },
-            pictures,
-            formatters: templateFormatters(config, errCfg),
-            maxXmlElements: limits.maxXmlElements,
-            onElementLimit: (): never => { throw getOfficeError(OfficeErrorType.XML_ELEMENT_LIMIT_EXCEEDED, errCfg, options.maxXmlElements); },
-        };
-
-        // Compiled once: the tags are read, their blocks paired and scoped, and every tag error raised
-        // before any document is rendered; then each data entry renders from the same compiled template.
-        const compiled = compileDocxTemplate(entries, options);
+        const rows = dataRows(config, errCfg);
+        const { compiled, options } = await prepareTemplate(template, config, errCfg);
         const renderOne = (data: TemplateData): Uint8Array => renderDocxTemplate(compiled, data, options);
-
         return Array.isArray(config.data) ? rows.map(renderOne) : renderOne(config.data);
+    }
+
+    /**
+     * Lists a template's tags: each field, and each tag that opens a block or a branch, with the part
+     * holding it, what it reads from the data, and the loops it is inside. The template is read as a
+     * render reads it, so a tag error rejects as a render's would. No data is needed.
+     */
+    static async tags(template: TemplateInput, config: Omit<TemplateConfig, 'data'> = {}): Promise<TemplateTagInfo[]> {
+        const errCfg: OfficeParserConfig = { onWarning: config?.onWarning };
+        const { compiled, options } = await prepareTemplate(template, config ?? {}, errCfg);
+        return templateTags(compiled, options);
+    }
+
+    /** Checks one data map against a template: every problem a render with `onMissing: 'error'` would reject for, none when the data is enough. */
+    static check(template: TemplateInput, config: TemplateConfig & { data: TemplateData }): Promise<TemplateProblem[]>;
+    /** Checks each data map of a batch: one list of problems per entry. */
+    static check(template: TemplateInput, config: TemplateConfig & { data: TemplateData[] }): Promise<TemplateProblem[][]>;
+    static check(template: TemplateInput, config: TemplateConfig): Promise<TemplateProblem[] | TemplateProblem[][]>;
+    /**
+     * Checks data against a template without writing a document. The data is read as a render with
+     * `onMissing: 'error'` reads it, whatever `onMissing` says: each field, condition and loop the data
+     * leads to, every pass of every loop, and the branch each condition picks (a field only another
+     * branch uses is not needed). Where a render would reject, the problem is noted and the check goes
+     * on, passing over that tag: a missing field writes nothing, and a branch or loop whose condition or
+     * list is missing or does not fit is not entered, so the fields inside it are not checked until it is
+     * given. A template's own errors, the limits a render is held to, and an error a filter of your own
+     * throws reject as a render's do. At most 1,000 problems are listed for one data entry, and 10,000 for a
+     * whole batch: past them the check stops, and says so with a `TEMPLATE_CHECK_LIMITED` warning (for a
+     * batch, the entries after the one it stopped in are not checked, and their lists are empty).
+     */
+    static async check(template: TemplateInput, config: TemplateConfig): Promise<TemplateProblem[] | TemplateProblem[][]> {
+        const errCfg: OfficeParserConfig = { onWarning: config?.onWarning };
+        const rows = dataRows(config, errCfg);
+        const { compiled, options } = await prepareTemplate(template, config, errCfg);
+        // What problems share, made once: each text's number (a key holds numbers, not the texts, which a
+        // template can make long), and each field's or tag's message.
+        const numbers = new Map<string, number>();
+        const numberOf = (text: string): number => {
+            let n = numbers.get(text);
+            if (n === undefined) numbers.set(text, n = numbers.size);
+            return n;
+        };
+        const messages = new Map<string, string>();
+        const messageOf = (key: string, make: () => string): string => {
+            let message = messages.get(key);
+            if (message === undefined) messages.set(key, message = make());
+            return message;
+        };
+        let total = 0;
+        const checkOne = (data: TemplateData, entry?: number): TemplateProblem[] => {
+            const problems: TemplateProblem[] = [];
+            // A problem met again (a field used twice in a pass, a tag in a note copied per reference) is noted
+            // once: by its place (one object per pass, see placeOf), then by what it is, a short key.
+            const seenAt = new WeakMap<TemplatePlace, Set<string>>();
+            const note = (place: TemplatePlace, key: string, make: () => TemplateProblem): void => {
+                let seen = seenAt.get(place);
+                if (!seen) seenAt.set(place, seen = new Set());
+                if (seen.has(key)) return;
+                seen.add(key);
+                problems.push(make());
+                total++;
+                if (problems.length >= MAX_TEMPLATE_PROBLEMS || total >= MAX_BATCH_PROBLEMS) throw CHECK_FULL;
+            };
+            // The part being rendered, which a missing field is noted in.
+            let part = '';
+            const checking: DocxTemplateOptions = {
+                ...options,
+                onMissing: 'error',
+                checking: true,
+                onFieldMissing: (field, place) => {
+                    const fieldNumber = numberOf(field);
+                    note(place, `m${fieldNumber} ${numberOf(part)}`, () => ({
+                        code: OfficeErrorType.TEMPLATE_FIELD_MISSING,
+                        message: messageOf(`m${fieldNumber}`, () => buildOfficeError(OfficeErrorType.TEMPLATE_FIELD_MISSING, field).officeIssue!.message),
+                        field, part, loops: place.loops(),
+                    }));
+                },
+                onDataInvalid: (details, place): never => {
+                    const detailKey = numberOf(`${details.reason}\u0000${details.tag}\u0000${details.part}\u0000${details.kind}\u0000${details.otherKind ?? ''}\u0000${details.filter ?? ''}\u0000${details.takes ?? ''}`);
+                    note(place, `d${detailKey}`, () => ({
+                        code: OfficeErrorType.TEMPLATE_DATA_INVALID,
+                        message: messageOf(`d${detailKey}`, () => buildOfficeError(OfficeErrorType.TEMPLATE_DATA_INVALID, details).officeIssue!.message),
+                        details, part: details.part, loops: place.loops(),
+                    }));
+                    throw TAG_SKIPPED;
+                },
+            };
+            try { renderParts(compiled, data, checking, name => { part = name; }); }
+            catch (e) {
+                if (e !== CHECK_FULL) throw e;
+                // (The batch's limit, where both are reached: the entries after are not checked.)
+                const batch = entry !== undefined && total >= MAX_BATCH_PROBLEMS;
+                const limit = batch ? MAX_BATCH_PROBLEMS : MAX_TEMPLATE_PROBLEMS;
+                logWarning(OfficeWarningType.TEMPLATE_CHECK_LIMITED, errCfg, entry === undefined ? { limit } : batch ? { limit, entry, batch, unchecked: rows.length - entry - 1 } : { limit, entry });
+            }
+            return problems;
+        };
+        if (!Array.isArray(config.data)) return checkOne(config.data);
+        // A batch: once its problems reach MAX_BATCH_PROBLEMS, the entries after are not checked.
+        return rows.map((data, entry) => total >= MAX_BATCH_PROBLEMS ? [] : checkOne(data, entry));
     }
 }
 
