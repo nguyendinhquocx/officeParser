@@ -1,7 +1,10 @@
-import { AdmonitionMetadata, CellMetadata, CodeMetadata, ConversionResult, EmbedMetadata, GeneratorConfig, HeadingMetadata, ImageMetadata, ListMetadata, NoteMetadata, OfficeAttachment, OfficeContentNode, OfficeParserAST, OfficeWarningType, PageMetadata, SlideMetadata, StandaloneConfig, TableMetadata, TextMetadata } from '../types.js';
+import { AdmonitionMetadata, CellMetadata, CodeMetadata, ConversionResult, DisclosureMetadata, EmbedMetadata, GeneratorConfig, HeadingMetadata, ImageMetadata, ListMetadata, NoteMetadata, OfficeAttachment, OfficeContentNode, OfficeParserAST, OfficeWarningType, PageMetadata, SheetMetadata, SlideMetadata, StandaloneConfig, TableMetadata, TextMetadata } from '../types.js';
+import { captionOf } from '../utils/figureCaptions.js';
+import { summaryLine } from '../utils/disclosures.js';
+import { quoteIdOf, sameQuote } from '../utils/quoteGroups.js';
 import { BaseGenerator } from './BaseGenerator.js';
 import { checkAbortSignal } from '../utils/errorUtils.js';
-import { base64ByteLength, documentLanguage, isHeaderRow, resolveEmbed, writableSpacing } from '../utils/officeGenUtils.js';
+import { base64ByteLength, documentLanguage, fillSheetRowGaps, isHeaderRow, resolveEmbed, writableSpacing } from '../utils/officeGenUtils.js';
 import { escapeHtml, isSafeHtmlAttributeName, isSafeStyleMapTag, sanitizeCommentText, sanitizeCssValue, sanitizeUrl, sanitizeImageUrl, serializeForInlineScript } from '../utils/sanitize.js';
 import { isDefaultHighlight } from '../utils/colorUtils.js';
 import { cssListMarker } from '../utils/listMarkers.js';
@@ -9,15 +12,46 @@ import { isSourceComment } from '../utils/commentUtils.js';
 import { clampInt } from '../utils/numberUtils.js';
 import { appendAll } from '../utils/nodeListUtils.js';
 import { MAX_LAYOUT_COLUMNS } from '../utils/tableLayout.js';
+import { isBlockInParagraph } from '../utils/nodeTypeUtils.js';
 
-/** Node types written as block elements (a <div>, <table>, <ul>, <dl>, <section>...), which a <p> cannot hold. */
-const BLOCK_TYPES = new Set<string>(['paragraph', 'heading', 'list', 'table', 'sheet', 'row', 'cell', 'chart', 'embed', 'admonition',
-    'definitionList', 'definitionTerm', 'definitionDescription', 'slide', 'page', 'note']);
-
-/** Node types written as their children alone: blocks when one of their children is. */
-const TRANSPARENT_TYPES = new Set<string>(['drawing', 'header', 'footer', 'slideMaster']);
 /** The sheets whose tab is marked current without the script, each by a rule of its own (see sheetTabsWithoutScript). */
 const MAX_NO_SCRIPT_TAB_RULES = 200;
+
+/**
+ * Written markup with what shows nothing taken out: named anchors (a block's further ids) and source comments,
+ * as a comment or (under `sourceAttributes`) an empty span carrying its text. A line holding only those holds
+ * nothing yet (see processNodeArray's captioned pictures).
+ */
+const withoutHiddenMarkup = (html: string): string => {
+    // Comments found by indexOf, the first unclosed one ending the search: a run of unclosed ones (an onNode
+    // string) is scanned once, not once from each `<!--` to its end.
+    let shown = '';
+    let at = 0;
+    for (let start = html.indexOf('<!--'); start >= 0; start = html.indexOf('<!--', at)) {
+        const end = html.indexOf('-->', start + 4);
+        if (end < 0) break;
+        shown += html.slice(at, start);
+        at = end + 3;
+    }
+    shown += html.slice(at);
+    return shown.replace(/<a id="[^"]*" name="[^"]*"><\/a>|<span data-html-comment="[^"]*"><\/span>/g, '');
+};
+
+/**
+ * Whether `node`, written in a line, starts (or with `last`, ends) with a captioned picture: one, or a node
+ * written as its children (a comment's range, a drawing) whose first (last) child that is not white space does.
+ */
+function figureAtEdge(node: OfficeContentNode, last: boolean): boolean {
+    let current: OfficeContentNode | undefined = node;
+    for (let depth = 0; current && depth < 64; depth++) {
+        if (current.type === 'image') return !!captionOf(current);
+        const throughChildren = (current.type === 'comment' && !isSourceComment(current)) || ['drawing', 'header', 'footer', 'slideMaster'].includes(current.type);
+        if (!throughChildren) return false;
+        const kids: OfficeContentNode[] = (current.children ?? []).filter(child => !isSourceComment(child) && (child.type !== 'text' || !!child.text?.trim() || !!child.notes?.length));
+        current = last ? kids[kids.length - 1] : kids[0];
+    }
+    return false;
+}
 
 /**
  * A child that is a block of its own, which a <p> cannot hold: a code block or display equation, a
@@ -26,11 +60,36 @@ const MAX_NO_SCRIPT_TAB_RULES = 200;
  * out, so a paragraph holding a table or a video wrote a <div> inside its <p>, which a DOM parser
  * closes the paragraph at and XHTML (EPUB's) rejects.
  */
-const isBlockInParagraph = (child: OfficeContentNode): boolean =>
-    BLOCK_TYPES.has(child.type)
-    || (child.type === 'code' && (child.metadata as CodeMetadata | undefined)?.math !== 'inline')
-    || (child.type === 'break' && ['thematic', 'page'].includes((child.metadata as { breakType?: string } | undefined)?.breakType ?? ''))
-    || ((TRANSPARENT_TYPES.has(child.type) || (child.type === 'comment' && !isSourceComment(child))) && !!child.children?.some(isBlockInParagraph));
+/**
+ * The font and size most of the sheets' text has: the workbook's own (a spreadsheet gives every cell its
+ * default font, which a reader of the sheets as a document's tables has no use for on each cell). Each
+ * is the one more than half the sheets' runs of text have, else none. Read to a bounded depth.
+ */
+function workbookTextOf(content: OfficeContentNode[]): { font?: string; size?: string } {
+    const fonts = new Map<string, number>();
+    const sizes = new Map<string, number>();
+    let runs = 0;
+    const walk = (nodes: OfficeContentNode[] | undefined, depth: number) => {
+        if (!nodes || depth > 8) return;
+        for (const node of nodes) {
+            if (node.type === 'text' && (node.text ?? '').trim()) {
+                runs++;
+                const f = node.formatting;
+                if (typeof f?.font === 'string') fonts.set(f.font, (fonts.get(f.font) ?? 0) + 1);
+                if (typeof f?.size === 'string') sizes.set(f.size, (sizes.get(f.size) ?? 0) + 1);
+            }
+            walk(node.children, depth + 1);
+        }
+    };
+    walk(content.filter(n => n.type === 'sheet'), 0);
+    const most = (counts: Map<string, number>) => {
+        for (const [value, count] of counts) if (count * 2 > runs) return value;
+        return undefined;
+    };
+    const font = most(fonts);
+    const size = most(sizes);
+    return { ...(font !== undefined && font !== 'monospace' ? { font } : {}), ...(size !== undefined ? { size } : {}) };
+}
 
 /**
  * Elements a styleMap can write a paragraph as that hold flow content (blocks included), so a block the
@@ -213,6 +272,10 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
      */
     private readonly chartDataIds = new Map<object, string>();
     private isSpreadsheetMode = false;
+    /** Sheets are written as headings and plain tables (htmlConfig.sheetLayout 'tables'). */
+    private sheetsAsTables = false;
+    /** The font and size most of the sheets' text has (the workbook's own), left to the page with sheets as tables. */
+    private workbookText: { font?: string; size?: string } = {};
     /**
      * Set while rendering a heading's children, so `formatText` can drop the run-level bold and
      * font-size the `<hN>` already establishes. See the note there, and the identical flag in
@@ -248,7 +311,10 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
      * @returns An HTML string
      */
     async generate(): Promise<ConversionResult<'html'>> {
-        this.isSpreadsheetMode = this.ast.content.some(n => n.type === 'sheet');
+        // Sheets as a document's tables (htmlConfig.sheetLayout 'tables'): no viewer around them.
+        this.sheetsAsTables = this.config.htmlConfig.sheetLayout === 'tables';
+        if (this.sheetsAsTables) this.workbookText = workbookTextOf(this.ast.content);
+        this.isSpreadsheetMode = !this.sheetsAsTables && this.ast.content.some(n => n.type === 'sheet');
         const isPresentation = this.ast.content.some(n => n.type === 'slide');
         // Key off the source format, not "has a page node": ODG (Draw) also emits `page` nodes but is
         // not a PDF, so it should not get the PDF container class or premium PDF styles.
@@ -734,6 +800,24 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
         // Whether these siblings form a run of text (a paragraph's children) rather than a list of blocks.
         const runHasText = nodes.some(n => n.type === 'text');
         let html = '';
+        // In a line (a heading's, a quote's, a summary's), whether the last thing written was a captioned
+        // picture: what follows it starts a line of its own (see the captioned picture's line break below).
+        let afterFigure = false;
+        // What the line holds so far, kept as each piece is written (looking through `html` at each node took
+        // time quadratic in a long line): whether anything but hidden markup (named anchors, source comments)
+        // and white space is written, and whether the last piece holding more ends in a line break. A piece of
+        // hidden markup alone neither gives the line content nor ends it: a source comment between a line
+        // break and a captioned picture left the picture a break of its own.
+        let lineHasContent = false;
+        let lineEndsWithBreak = false;
+        const write = (piece: string): void => {
+            html += piece;
+            if (!piece.trim()) return;
+            const shown = withoutHiddenMarkup(piece);
+            if (!shown.trim()) return;
+            lineHasContent = true;
+            lineEndsWithBreak = shown.trimEnd().endsWith('<br>');
+        };
         // The node written before this one (see afterPage).
         let previous: OfficeContentNode | undefined;
         // Stack to track active lists. `liClose` is the currently-open item's deferred closing
@@ -754,11 +838,19 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
         const closeListsToLevel = (level: number) => {
             while (listStack.length > 0 && listStack[listStack.length - 1].indentation > level) {
                 const list = listStack.pop();
-                html += list!.liClose + closeListTag(list!.type) + '\n\n';
+                write(list!.liClose + closeListTag(list!.type) + '\n\n');
             }
         };
 
-        for (const node of nodes) {
+        // The quote whose <blockquote> is open: its paragraphs written so far, the last of them (see quoteMember).
+        let openQuote: OfficeContentNode | undefined;
+        const closeQuote = () => {
+            if (!openQuote) return;
+            write('</blockquote>\n\n');
+            openQuote = undefined;
+        };
+
+        for (const [index, node] of nodes.entries()) {
             // Check if node should be filtered out or overridden
             const override = await this.handleOnNode(node);
             if (override === false) {
@@ -809,21 +901,21 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                         // Kind changed at the same level: close the open item and the old list,
                         // then open the replacement list.
                         const last = listStack.pop();
-                        html += last!.liClose + closeListTag(last!.type) + '\n';
-                        html += openListTag(type, isTask) + '\n';
+                        write(last!.liClose + closeListTag(last!.type) + '\n');
+                        write(openListTag(type, isTask) + '\n');
                         listStack.push({ indentation, type, isTask, liClose: '' });
                     } else {
                         // Sibling at the same level: close the previous item before this one opens.
-                        html += top.liClose;
+                        write(top.liClose);
                     }
                 } else {
                     // Deeper level (or the first list): open a nested list INSIDE the currently
                     // open item, leaving the parent <li>'s close pending on its stack frame.
-                    html += openListTag(type, isTask) + '\n';
+                    write(openListTag(type, isTask) + '\n');
                     listStack.push({ indentation, type, isTask, liClose: '' });
                 }
 
-                html += await this.processNodeRecursive(node, this.boundNodeProcessor, { value: override });
+                write(await this.processNodeRecursive(node, this.boundNodeProcessor, { value: override }));
                 // Defer this item's close so a nested list can land inside it. A string override is
                 // a complete replacement item that already carries its own close, so add none.
                 listStack[listStack.length - 1].liClose = (typeof override === 'string')
@@ -832,7 +924,25 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
             } else {
                 // Non-list node closes all active lists
                 closeListsToLevel(-1);
-                let result = await this.processNodeRecursive(node, this.boundNodeProcessor, { value: override });
+                // The paragraphs of one quote (see quoteGroups) in one <blockquote>, each a <p> in it.
+                const member = typeof override !== 'string' && this.quoteMember(node);
+                if (openQuote && !(member && sameQuote(openQuote, node))) closeQuote();
+                if (member && !openQuote && sameQuote(node, nodes[index + 1]) && this.quoteMember(nodes[index + 1])) {
+                    write('<blockquote>');
+                    openQuote = node;
+                }
+                if (openQuote) this.quoteParagraphs++;
+                let result: string;
+                try {
+                    result = await this.processNodeRecursive(node, this.boundNodeProcessor, { value: override });
+                } finally {
+                    if (openQuote) this.quoteParagraphs--;
+                }
+                if (openQuote) {
+                    openQuote = node;
+                    write(result);
+                    continue;
+                }
                 // (A section's start after a page writes nothing, and no gap either.)
                 if (!result && this.afterPage && node.type === 'break') continue;
 
@@ -844,16 +954,40 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                 // anything in a paragraph's or heading's line (a picture, inline math) but a line
                 // break, after which the line starts afresh.
                 const inlineNode = node.type === 'text' || (isSourceComment(node) && runHasText) || (this.inlineDepth > 0 && node.type !== 'break');
+                // A captioned picture in a line (a heading's, a quote's, a summary's: where no <figure> goes) is
+                // on a line of its own, as the Markdown writer writes one there: a line break before it after
+                // what the line holds, and one after it before more, so its caption, its recognized text and
+                // the words beside it are never one run of text ('w1<span class="caption">c</span>w2' read back
+                // as `w1cw2`). Where the line starts or breaks already, none.
+                if (this.inlineDepth > 0 && withoutHiddenMarkup(result).trim()) {
+                    const atLineStart = !lineHasContent || lineEndsWithBreak;
+                    if ((afterFigure || figureAtEdge(node, false)) && !atLineStart && !result.startsWith('<br>')) result = `<br>${result}`;
+                    afterFigure = figureAtEdge(node, true);
+                }
                 if (!inlineNode && !result.endsWith('\n\n')) {
                     if (result.endsWith('\n')) result += '\n';
                     else result += '\n\n';
                 }
-                html += result;
+                write(result);
             }
         }
 
+        closeQuote();
         closeListsToLevel(-1);
         return html;
+    }
+
+    /** Set while the paragraphs of one quote are written inside its <blockquote>: each is a <p>. */
+    private quoteParagraphs = 0;
+
+    /**
+     * Whether `node` is a paragraph written as a quote that can stand in a quote of several: one the
+     * styleMap writes as <blockquote>, with its source's quote id, holding no block of its own.
+     */
+    private quoteMember(node: OfficeContentNode | undefined): boolean {
+        if (!node || quoteIdOf(node) === undefined || node.children?.some(isBlockInParagraph)) return false;
+        const tag = this.getSemanticMapping(node)?.tag;
+        return isSafeStyleMapTag(tag) && tag.toLowerCase() === 'blockquote';
     }
 
     /**
@@ -890,6 +1024,7 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
      */
     private rendersOwnChildren(node: OfficeContentNode): boolean {
         if (node.type === 'sheet') return true;
+        if (node.type === 'summary') return !!summaryLine(node);
         if (node.type === 'table') return this.tableHasRowSpan(node) || this.firstRowIsHeader(node);
         if (node.type === 'row') {
             const cells = (node.children || []).filter(c => c.type === 'cell');
@@ -1067,7 +1202,8 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                 const meta = note.metadata as any;
                 if (meta?.noteType === 'footnote' || meta?.noteType === 'endnote') {
                     const key = this.escape(this.getFootnoteKey(note));
-                    result += `<sup data-footnote-ref="${key}" id="${this.escape(this.footnoteReferenceId(note))}"><a href="#footnote-${key}">${key}</a></sup>`;
+                    // The key names the note in ids and links; the reference shows its mark (see getNoteMark).
+                    result += `<sup data-footnote-ref="${key}" id="${this.escape(this.footnoteReferenceId(note))}"><a href="#footnote-${key}">${this.escape(this.getNoteMark(note))}</a></sup>`;
                 }
             }
         }
@@ -1226,10 +1362,32 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
 
             case 'image': {
                 const mode = this.imageMode();
-                if (mode === 'none') return '';
                 const meta = node.metadata as ImageMetadata;
                 const attachmentName = meta?.attachmentName;
                 const ocr = (node.text || '').trim();
+                // A picture's caption (ImageMetadata.caption) is written in every image mode: 8.6.0 wrote a
+                // figure's caption as a paragraph whatever the mode, and the text and Markdown writers do
+                // (see MarkdownGenerator.pictureParts). What is written, by mode, for a captioned picture:
+                //
+                //   mode            | of the picture                 | among blocks                              | in a line (a heading)
+                //   none            | nothing                        | <p>caption</p>                            | <span class="caption">
+                //   ocr-text-only   | its recognized text, if any    | <figure><pre class="ocr-text"><figcaption> | the <pre>, then the span
+                //                   | (none)                         | <p>caption</p>                            | <span class="caption">
+                //   image-only      | <img>                          | <figure><img><figcaption>                 | <img>, then the span
+                //   image+ocr-text  | <img> and its recognized text  | <figure><img><pre class="ocr-text"><figcaption> | <img><br><span class="ocr-text">, then the span
+                //
+                // A <figure> where a picture or its recognized text is written; the caption alone where nothing
+                // else of the picture is, carrying the picture's ids. A picture without a caption is as in 8.6.0.
+                const caption = captionOf(node);
+                const captionHtml = caption ? this.escape(caption) : '';
+                const captionInLine = caption ? ` <span class="caption">${captionHtml}</span>` : '';
+                if (mode === 'none' || (mode === 'ocr-text-only' && !ocr)) {
+                    if (!caption) return '';
+                    // (In a line its ids are named anchors before it: a span's id is not read back.)
+                    return this.inlineDepth > 0
+                        ? `${this.namedAnchors(node)}<span class="caption">${captionHtml}</span>`
+                        : `${extraAnchors}<p${idAttr}>${captionHtml}</p>`;
+                }
 
                 // ocr-text-only: emit the recognized text as a visible block, no <img>. A <pre>
                 // preserves the 2-D column layout the OCR reconstruction encodes with spaces. Carry the
@@ -1237,9 +1395,12 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                 // attributes and inline style through too, so this mode is not the one image emission
                 // site that silently drops them.
                 if (mode === 'ocr-text-only') {
-                    if (!ocr) return '';
                     const preClass = ` class="${this.escape(['ocr-text', ...classes].join(' '))}"`;
-                    return `${extraAnchors}<pre${preClass}${mappedAttrs}${idAttr}${styleAttr}>${this.escape(ocr)}</pre>`;
+                    const pre = `<pre${preClass}${mappedAttrs}${idAttr}${styleAttr}>${this.escape(ocr)}</pre>`;
+                    if (!caption) return `${extraAnchors}${pre}`;
+                    // A captioned picture's recognized text is a figure with its caption, as its picture is.
+                    if (this.inlineDepth > 0) return `${extraAnchors}${pre}${captionInLine}`;
+                    return `${extraAnchors}<figure>${pre}<figcaption>${captionHtml}</figcaption></figure>`;
                 }
 
                 let src = meta?.url || attachmentName || '';
@@ -1307,12 +1468,19 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
                 // and parser.
                 if (this.inlineDepth > 0) {
                     const ocrText = mode === 'image+ocr-text' && ocr ? `<br><span class="ocr-text">${this.escape(ocr)}</span>` : '';
-                    return `${extraAnchors}${imgWithId(idAttr)}${ocrText}`;
+                    // (A paragraph's captioned picture is a figure among its blocks; in a heading, where no
+                    // block goes, its caption follows it in the line.)
+                    return `${extraAnchors}${imgWithId(idAttr)}${ocrText}${captionInLine}`;
                 }
                 // Among the blocks too its id is on the <img>, after the anchors of its other ids, as they
                 // are read back: on the wrapper it was read after them, and the order flipped each save.
                 const img = imgWithId(idAttr);
-                // No caption under it: its file name is not one, and no other writer shows it.
+                // A picture with a caption (ImageMetadata.caption) is a figure: the picture, then its caption.
+                if (caption) {
+                    const ocrBlock = mode === 'image+ocr-text' && ocr ? `<pre class="ocr-text">${this.escape(ocr)}</pre>` : '';
+                    return `${extraAnchors}<figure>${img}${ocrBlock}<figcaption>${captionHtml}</figcaption></figure>`;
+                }
+                // No caption under it otherwise: its file name is not one, and no other writer shows it.
                 let content = this.config.includeFormatting ? `<div class="image-container">${img}</div>` : img;
                 // image+ocr-text: the image, then its recognized text (a <pre> keeps the 2-D layout).
                 if (mode === 'image+ocr-text' && ocr) content += `<pre class="ocr-text">${this.escape(ocr)}</pre>`;
@@ -1601,6 +1769,15 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
             case 'sheet': {
                 const rows = node.children || [];
 
+                // As a document holds it: its name as a heading, then its cells as a plain table, its empty
+                // rows filled in (each cell keeps its column), then its pictures and charts.
+                if (this.sheetsAsTables) {
+                    const name = (node.metadata as SheetMetadata | undefined)?.sheetName || `Sheet ${Math.max(0, this.sheetIndex(node)) + 1}`;
+                    const heading = { type: 'heading', text: name, metadata: { level: 2, ...(anchorIds.length ? { anchorIds } : {}) }, children: [{ type: 'text', text: name }] } as OfficeContentNode;
+                    const table = { type: 'table', children: fillSheetRowGaps(rows.filter(c => c.type === 'row'), n => this.takeGridPositions(n)) } as OfficeContentNode;
+                    return this.processNodeArray([heading, ...(table.children!.length ? [table] : []), ...rows.filter(c => c.type !== 'row')]);
+                }
+
                 // Each cell's place in the grid: the row and column a spreadsheet parser gives it, else
                 // (a sheet built by hand) the next free place in reading order, past the cells a merge
                 // above covers. A cell with no place was left out of the grid, and with it the sheet.
@@ -1777,7 +1954,9 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
             case 'heading': {
                 // The styleMap tag wins over the structural default; that is the whole point of
                 // mapping "Heading 1"/"Intense Quote" onto a semantic element.
-                const tag = mappedTag ?? (node.type === 'heading' ? `h${clampInt((node.metadata as HeadingMetadata)?.level, 1, 6, 1)}` : 'p');
+                // (A paragraph of a quote of several is a <p> in the quote's <blockquote>.)
+                const tag = this.quoteParagraphs > 0 && node.type === 'paragraph' && mappedTag === 'blockquote' ? 'p'
+                    : mappedTag ?? (node.type === 'heading' ? `h${clampInt((node.metadata as HeadingMetadata)?.level, 1, 6, 1)}` : 'p');
 
                 // Normalize empty paragraphs so DOCX and PPTX empty cells render with consistent height
                 // Strip tags to check if it's purely empty or just contains non-breaking spaces (like PPTX)
@@ -1884,6 +2063,29 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
             case 'definitionDescription':
                 return `${extraAnchors}<dd${idAttr}${className}${mappedAttrs}${styleAttr}>${childrenOutput}</dd>`;
 
+            case 'disclosure': {
+                // A <details>: its summary (its first child, see the summary case; none where the source gave
+                // none, which a browser shows as "Details"), then its blocks; open as the document opens where it was.
+                const meta = node.metadata as DisclosureMetadata | undefined;
+                // (`open=""`, which XHTML, EPUB's, reads as well as HTML: a bare `open` is not well-formed XML.)
+                const open = meta?.open ? ' open=""' : '';
+                return `${extraAnchors}<details${idAttr}${className}${mappedAttrs}${styleAttr}${open}>${childrenOutput}</details>`;
+            }
+
+            case 'summary': {
+                // A <summary>: one line of text in it as that line (a <p> in it would put the line under the
+                // marker), anything else as its blocks.
+                const line = summaryLine(node);
+                if (!line) return `${extraAnchors}<summary${idAttr}${className}${mappedAttrs}${styleAttr}>${childrenOutput}</summary>`;
+                this.inlineDepth++;
+                try {
+                    const inline = line.children?.length ? await this.processNodeArray(line.children) : this.escape(line.text ?? '');
+                    return `${extraAnchors}<summary${idAttr}${className}${mappedAttrs}${styleAttr}>${inline}</summary>`;
+                } finally {
+                    this.inlineDepth--;
+                }
+            }
+
             // Rendered through their children only. Listed explicitly, with no `default`, so that
             // under `noImplicitReturns` a new OfficeContentNodeType fails to compile until it is
             // classified here rather than silently degrading to its children.
@@ -1938,7 +2140,10 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
             case 'definitionList':
             case 'definitionTerm':
             case 'definitionDescription':
+            case 'disclosure':
                 return 'div';
+            case 'summary':
+                return 'summary';
         }
     }
 
@@ -1950,7 +2155,9 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
             // Inline code: a monospace run becomes `<code>`, not a `font-family: monospace` span, so
             // an editor keying on <code> sees it and it re-imports as inline code (HtmlParser maps
             // <code> back to a monospace run). Innermost, so bold/italic wrap it (`<b><code>…`).
-            if (f.font === 'monospace') result = `<code>${result}</code>`;
+            // Keyboard input is <kbd> (TextFormatting.keyboard), itself monospace.
+            if (f.keyboard) result = `<kbd>${result}</kbd>`;
+            else if (f.font === 'monospace') result = `<code>${result}</code>`;
             // Inside an `<hN>`, the heading's own styling is authoritative. A run that also carries
             // bold and a font size - the normal case for ODF, where a heading's paragraph style is
             // inherited by its runs - would wrap the text in `<b>` the heading already implies and,
@@ -2093,10 +2300,11 @@ export class HtmlGenerator extends BaseGenerator<'html'> {
             // Highlights are emitted as <mark> by formatText (see there); when that path owns the
             // background it passes skipBackgroundColor so the colour is not also duplicated here.
             if (f.backgroundColor && !options.skipBackgroundColor) pushSafe('background-color', f.backgroundColor);
-            if (f.size && !options.skipFontSize) pushSafe('font-size', f.size);
+            // (With sheets as tables, the workbook's own font and size are the page's: see workbookTextOf.)
+            if (f.size && !options.skipFontSize && f.size !== this.workbookText.size) pushSafe('font-size', f.size);
             // A monospace run is emitted as <code> by formatText, so it must not also become a
             // font-family style here (that was the old, non-semantic inline-code shape).
-            if (f.font && f.font !== 'monospace') {
+            if (f.font && f.font !== 'monospace' && f.font !== this.workbookText.font) {
                 const safeFont = sanitizeCssValue(f.font);
                 if (safeFont) styles.push(`font-family: ${safeFont}, sans-serif`);
             }

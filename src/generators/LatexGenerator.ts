@@ -1,4 +1,6 @@
 import { zipSync, Zippable } from 'fflate';
+import { openedDisclosure } from '../utils/disclosures.js';
+import { sameQuote } from '../utils/quoteGroups.js';
 import { UniqueNames } from '../utils/uniqueNames.js';
 import { trimEndChars } from '../utils/textUtils.js';
 import type { PageNumberFormat } from '../types.js';
@@ -7,7 +9,7 @@ import { checkAbortSignal } from '../utils/errorUtils.js';
 import { onDocumentPage } from '../utils/pageLimits.js';
 import { clampInt } from '../utils/numberUtils.js';
 import { ADMONITION_COLOR, decodeBase64, embedUrl, fillSheetRowGaps, hexColor, isHeaderRow, furnitureKind, lengthToPt, MIME_EXT, resolvePaper, resolveZipInstant, runningFurniture, sectionFurniture, sectionFurnitureIndex, sniffImageSize, toW3CDTF } from '../utils/officeGenUtils.js';
-import { LatexMathPlan, LatexScripts, LatexUnicodePlan, LISTINGS_LANGUAGES, mathCommandsOf, planLatexMath, planLatexUnicode, withLatexMathMacros } from '../utils/latexUtils.js';
+import { LatexMathPlan, LatexScripts, LatexUnicodePlan, LISTINGS_LANGUAGES, mathCommandsOf, planLatexMath, planLatexUnicode, withLatexMathMacros, withoutGeneratorCommands } from '../utils/latexUtils.js';
 import { escapeLatex, latexComment, latexSourceComment, sanitizeLatexImagePath, sanitizeLatexMath, sanitizeLatexUrl } from '../utils/sanitize.js';
 import { isSourceComment } from '../utils/commentUtils.js';
 import { contentHash, imageToTextPdf, newDecodeBudget } from '../utils/textPdf.js';
@@ -194,6 +196,16 @@ function fmtPt(n: number): string {
 }
 
 /**
+ * The name of the command boxing a word in a background colour (see LatexGenerator.highlightRef): `ophl`
+ * and the colour's six hex digits as the letters `a` to `p`, `FFFF00` as `ophlppppaa`.
+ */
+function highlightCommand(hex: string): string {
+    let name = 'ophl';
+    for (const digit of hex) name += String.fromCharCode(97 + parseInt(digit, 16));
+    return name;
+}
+
+/**
  * Formats a length the document or the configuration gives in points. A point there is 1/72 of an
  * inch, which TeX calls a big point (`bp`): its own `pt` is 1/72.27 of an inch, so such a length
  * written as `pt` came out 0.4% short (an A4 page of `595.28pt` was 593.06 points wide).
@@ -372,6 +384,8 @@ export class LatexGenerator extends BaseGenerator<'tex'> {
     private nestedFootnotes: string[] = [];
     /** Colors the body uses, as validated `RRGGBB` hex, each defined once by name. */
     private readonly colors = new Set<string>();
+    /** Background colours the body boxes words in, as validated `RRGGBB` hex, each one's command defined once (see highlightRef). */
+    private readonly highlights = new Set<string>();
     /** The control words the formulas written use, for the packages and definitions they need (see planLatexMath). */
     private readonly mathCommands = new Set<string>();
     /** Every key the AST cites (found before rendering, for finding its bibliography), and those `\cite` wrote and `\bibitem` defined. */
@@ -612,8 +626,24 @@ export class LatexGenerator extends BaseGenerator<'tex'> {
         return `hex${hex}`;
     }
 
+    /**
+     * The command that boxes one word in a background colour (a validated `RRGGBB` value), defined once
+     * beside the colour (see colorDefinitions). Written out at every word, a highlight took about 30
+     * characters a word, 15 times the text of a run of one-letter words. Its name is letters alone, as a
+     * TeX command's is: the colour's hex digits as the letters `a` to `p`.
+     */
+    private highlightRef(hex: string): string {
+        this.colorRef(hex);
+        this.highlights.add(hex);
+        return highlightCommand(hex);
+    }
+
     private colorDefinitions(): string[] {
-        return [...this.colors].sort().map(h => `\\definecolor{hex${h}}{HTML}{${h}}`);
+        return [
+            ...[...this.colors].sort().map(h => `\\definecolor{hex${h}}{HTML}{${h}}`),
+            // (\providecommand, legal in a fragment's body too, as \definecolor is.)
+            ...[...this.highlights].sort().map(h => `\\providecommand{\\${highlightCommand(h)}}[1]{{\\setlength{\\fboxsep}{1pt}\\colorbox{hex${h}}{\\strut #1}}}`),
+        ];
     }
 
     private warnOnce(key: string, type: OfficeWarningType, info: unknown): void {
@@ -657,6 +687,8 @@ export class LatexGenerator extends BaseGenerator<'tex'> {
             inline = [];
         };
         let prevPaginated: string | null = null;
+        /** The block written last, when it was a node of its own (a quote paragraph whose environment the next may join). */
+        let lastQuote: OfficeContentNode | undefined;
         for (let i = 0; i < items.length; i++) {
             checkAbortSignal(this.config.abortSignal);
             const node = items[i];
@@ -718,7 +750,12 @@ export class LatexGenerator extends BaseGenerator<'tex'> {
             }
             if ((node.type === 'page' || node.type === 'slide') && prevPaginated === node.type) blocks.push('\\clearpage');
             const out = (await this.renderBlockNode(node)).trim();
-            if (out) blocks.push(out);
+            // A paragraph of the quote the block before ends (see quoteGroups) goes into its environment.
+            const quoteOpen = '\\begin{quote}\n', quoteClose = '\n\\end{quote}';
+            if (out && lastQuote && sameQuote(lastQuote, node) && lastQuote === items[i - 1] && out.startsWith(quoteOpen) && out.endsWith(quoteClose) && blocks[blocks.length - 1]?.endsWith(quoteClose)) {
+                blocks[blocks.length - 1] = `${blocks[blocks.length - 1].slice(0, -quoteClose.length)}${BLOCK_SEPARATOR}${out.slice(quoteOpen.length)}`;
+            } else if (out) blocks.push(out);
+            lastQuote = out ? node : undefined;
             prevPaginated = (node.type === 'page' || node.type === 'slide') ? node.type : null;
         }
         await flushInline();
@@ -737,6 +774,10 @@ export class LatexGenerator extends BaseGenerator<'tex'> {
             case 'note': return this.standaloneNote(node);
             case 'comment': return (isSourceComment(node) ? latexSourceComment(node.text || '') : this.commentLines(node)).trimEnd();
             case 'admonition': return this.admonition(node);
+            // (Opened before any writer but HTML's and Markdown's sees it, see disclosures: its summary in bold, then its body.)
+            case 'disclosure': return this.renderFlow(openedDisclosure(node));
+            // (A disclosure's summary is written by its disclosure; one standing alone is its blocks.)
+            case 'summary': return this.renderFlow(node.children || []);
             case 'chart': return this.chart(node);
             case 'embed': return this.embed(node);
             case 'definitionList': return this.renderDescriptionRun(node.children || []);
@@ -1052,8 +1093,10 @@ export class LatexGenerator extends BaseGenerator<'tex'> {
             // A \colorbox cannot break across lines, so a highlighted sentence would run off the page.
             // Boxing each word keeps the highlight and lets the line break between words. Applied to
             // the bare escaped text, where a space is always a word boundary (none of the escapes
-            // contain one), before any wrapper adds braces a split could cut through.
-            t = `{${this.cmd('setlength')}{\\fboxsep}{1pt}${t.split(/( +)/).map(w => (w.trim() ? `${this.cmd('colorbox')}{${this.colorRef(bg)}}{${this.cmd('strut')} ${w}}` : w)).join('')}}`;
+            // contain one), before any wrapper adds braces a split could cut through. Each word is
+            // boxed by the colour's own command (see highlightRef).
+            const box = this.highlightRef(bg);
+            t = t.split(/( +)/).map(w => (w.trim() ? `${this.cmd(box)}{${w}}` : w)).join('');
         }
         if (fmt.font && MONOSPACE_FONTS.has(fmt.font.trim().toLowerCase())) t = `${this.cmd('texttt')}{${t}}`;
         const size = this.suppressSize ? null : this.scaledSize(fmt.size);
@@ -1107,7 +1150,8 @@ export class LatexGenerator extends BaseGenerator<'tex'> {
     private mathLatex(latex: string): string {
         const out = withLatexMathMacros(latex);
         mathCommandsOf(out, this.mathCommands);
-        return out;
+        // (A command named as one the generator defines for itself is another: written as its name, see GENERATOR_COMMAND.)
+        return withoutGeneratorCommands(out);
     }
 
     private inlineMath(source: string): string {

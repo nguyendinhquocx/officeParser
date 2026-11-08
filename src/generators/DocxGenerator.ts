@@ -1,4 +1,5 @@
 import { zipSync, Zippable } from 'fflate';
+import { openedDisclosure } from '../utils/disclosures.js';
 import { UniqueNames } from '../utils/uniqueNames.js';
 import { layoutTableRows } from '../utils/tableLayout.js';
 import { BreakMetadata, ConversionResult, DocxGeneratorConfig, GeneratorConfig, ImageMode, OfficeContentNode, OfficeMetadata, OfficeParserAST, OfficeWarningType, PageSetup, TextFormatting, TextMetadata } from '../types.js';
@@ -10,6 +11,7 @@ import { pageFieldInstruction, wordFmtOf } from '../utils/pageNumbers.js';
 import { clampInt } from '../utils/numberUtils.js';
 import { ADMONITION_COLOR, decodeBase64, embedUrl, encUrl, fillSheetRowGaps, hexColor, isHeaderRow, furnitureKind, lengthToPt, MIME_EXT, ooxmlCustomPropertiesXml, resolvePaper, resolveZipInstant, runningFurniture, sectionFurniture, sectionFurnitureIndex, sniffImageSize, toBookmarkNameRaw, toW3CDTF, writableSpacing } from '../utils/officeGenUtils.js';
 import { markerPattern, MarkerPattern } from '../utils/listMarkers.js';
+import { customNoteMark } from '../utils/noteMarks.js';
 import { BaseGenerator } from './BaseGenerator.js';
 import { lookupTable } from '../utils/lookupUtils.js';
 
@@ -287,6 +289,10 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
                 return this.wrapP(await this.renderInline([node]));
             case 'page': case 'slide': case 'drawing': case 'definitionList':
                 return this.renderBlocks(node.children); // containers: flatten (page/slide breaks handled by caller sequence)
+            // (Opened before any writer but HTML's and Markdown's sees it, see disclosures: its summary in bold, then its body.)
+            case 'disclosure': return this.renderBlocks(openedDisclosure(node));
+            // (A disclosure's summary is written by its disclosure; one standing alone is its blocks.)
+            case 'summary': return this.renderBlocks(node.children);
             case 'slideMaster': return ''; // template furniture, dropped
             default: {
                 // Exhaustiveness guard: a new OfficeContentNodeType must be classified here.
@@ -544,7 +550,9 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
      * Each note written, at its first reference: its number as Word shows it, and the bookmark around
      * that reference when the AST refers to the note again (see noteRefField).
      */
-    private readonly writtenNotes = new Map<OfficeContentNode, { kind: 'footnote' | 'endnote'; number: number; bookmark?: string }>();
+    private readonly writtenNotes = new Map<OfficeContentNode, { kind: 'footnote' | 'endnote'; number: number; bookmark?: string; mark?: string }>();
+    /** How many footnotes and endnotes Word numbers (a note with a custom mark takes no number). */
+    private readonly numberedNotes = { footnote: 0, endnote: 0 };
 
     /**
      * Registers a note into the footnotes/endnotes part at its first reference, rendering its body with
@@ -559,16 +567,21 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
         const key = this.getFootnoteKey(note);
         const notes = kind === 'endnote' ? this.endnotes : this.footnotes;
         notes.push({ key, kind, node: note });
-        const entry: { kind: 'footnote' | 'endnote'; number: number; bookmark?: { id: number; name: string } } = { kind, number: notes.length };
+        // A mark the author chose (`*`) is written as Word's custom mark: after the reference, and in place
+        // of the number at the note's start. Word numbers the other notes without it.
+        const mark = customNoteMark(note);
+        const entry: { kind: 'footnote' | 'endnote'; number: number; bookmark?: { id: number; name: string } } = { kind, number: mark === undefined ? ++this.numberedNotes[kind] : this.numberedNotes[kind] };
         if (this.noteReferences(note) > 1) entry.bookmark = this.mintBookmark(`_RefNote${this.writtenNotes.size + 1}`);
         // Marked written before its body is, so a reference to the note inside it refers back.
-        this.writtenNotes.set(note, { kind, number: entry.number, bookmark: entry.bookmark?.name });
+        this.writtenNotes.set(note, { kind, number: entry.number, bookmark: entry.bookmark?.name, mark });
         const owner = kind === 'endnote' ? 'word/endnotes.xml' : 'word/footnotes.xml';
         const body = (await this.withRelOwner(owner, () => this.renderBlocks(this.bodyBlocks(note)))) || '<w:p/>';
-        this.noteBodies.set(key, this.withNoteMarker(this.styleNoteBody(body), kind, this.pointBookmarks(note)));
+        this.noteBodies.set(key, this.withNoteMarker(this.styleNoteBody(body), kind, this.pointBookmarks(note), mark));
         const id = this.noteId(key);
         const tag = kind === 'endnote' ? 'w:endnoteReference' : 'w:footnoteReference';
-        const reference = `<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><${tag} w:id="${id}"/></w:r>`;
+        const reference = mark === undefined
+            ? `<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><${tag} w:id="${id}"/></w:r>`
+            : `<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><${tag} w:customMarkFollows="1" w:id="${id}"/><w:t xml:space="preserve">${escapeXml(stripInvalidXmlChars(mark))}</w:t></w:r>`;
         if (!entry.bookmark) return reference;
         return `<w:bookmarkStart w:id="${entry.bookmark.id}" w:name="${escapeXml(entry.bookmark.name)}"/>${reference}<w:bookmarkEnd w:id="${entry.bookmark.id}"/>`;
     }
@@ -581,8 +594,9 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
      * referred to once (a reference outside the content, such as a header's) has no bookmark, and is its
      * mark alone.
      */
-    private noteRefField(written: { kind: 'footnote' | 'endnote'; number: number; bookmark?: string }): string {
-        const mark = `<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:t>${noteMark(written.kind, written.number)}</w:t></w:r>`;
+    private noteRefField(written: { kind: 'footnote' | 'endnote'; number: number; bookmark?: string; mark?: string }): string {
+        const shown = written.mark === undefined ? `<w:t>${noteMark(written.kind, written.number)}</w:t>` : `<w:t xml:space="preserve">${escapeXml(stripInvalidXmlChars(written.mark))}</w:t>`;
+        const mark = `<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr>${shown}</w:r>`;
         if (!written.bookmark) return mark;
         return `<w:fldSimple w:instr=" NOTEREF ${escapeXml(written.bookmark)} \\f${this.config.ignoreInternalLinks ? '' : ' \\h'} ">${mark}</w:fldSimple>`;
     }
@@ -596,8 +610,9 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
      * Prepends the numbered marker run (w:footnoteRef/w:endnoteRef) to the note body's first paragraph,
      * followed by the note's own bookmarks (`anchors`), where a link to the note arrives.
      */
-    private withNoteMarker(body: string, kind: 'footnote' | 'endnote', anchors = ''): string {
-        const ref = `<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:${kind}Ref/></w:r>${anchors}`;
+    private withNoteMarker(body: string, kind: 'footnote' | 'endnote', anchors = '', customMark?: string): string {
+        const marker = customMark === undefined ? `<w:${kind}Ref/>` : `<w:t xml:space="preserve">${escapeXml(stripInvalidXmlChars(customMark))}</w:t>`;
+        const ref = `<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr>${marker}</w:r>${anchors}`;
         const m = /^<w:p>(<w:pPr>[\s\S]*?<\/w:pPr>)?/.exec(body);
         if (m) return body.slice(0, m[0].length) + ref + body.slice(m[0].length);
         // The body does not open with a paragraph (a note whose first block is a table). A run is not
@@ -1067,7 +1082,7 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
         return map[tag.toLowerCase()];
     }
     private knownStyle(style: string | undefined): string | undefined {
-        const known = new Set(['Quote', 'IntenseQuote', 'Title', 'ListParagraph', 'Code', 'DefinitionTerm']);
+        const known = new Set(['Quote', 'IntenseQuote', 'Title', 'ListParagraph', 'Code', 'DefinitionTerm', 'Caption']);
         return style && known.has(style) ? style : undefined;
     }
 
@@ -1266,6 +1281,8 @@ function buildStyles(): string {
         + `<w:style w:type="paragraph" w:styleId="Code"><w:name w:val="Code"/><w:basedOn w:val="Normal"/><w:pPr><w:shd w:val="clear" w:color="auto" w:fill="F5F5F5"/></w:pPr><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/></w:rPr></w:style>`
         + `<w:style w:type="character" w:styleId="CodeChar"><w:name w:val="Code Char"/><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/></w:rPr></w:style>`
         + `<w:style w:type="paragraph" w:styleId="DefinitionTerm"><w:name w:val="Definition Term"/><w:basedOn w:val="Normal"/><w:rPr><w:b/></w:rPr></w:style>`
+        // Word's own caption style (a figure's or table's caption: a picture's caption is written so).
+        + `<w:style w:type="paragraph" w:styleId="Caption"><w:name w:val="caption"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:pPr><w:spacing w:after="200"/></w:pPr><w:rPr><w:i/><w:sz w:val="18"/></w:rPr></w:style>`
         + `<w:style w:type="character" w:styleId="Hyperlink"><w:name w:val="Hyperlink"/><w:rPr><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr></w:style>`
         + `<w:style w:type="character" w:styleId="FootnoteReference"><w:name w:val="Footnote Reference"/><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style>`
         + `<w:style w:type="paragraph" w:styleId="FootnoteText"><w:name w:val="Footnote Text"/><w:basedOn w:val="Normal"/></w:style>`

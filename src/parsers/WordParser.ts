@@ -60,8 +60,8 @@
  * @see https://learn.microsoft.com/en-us/openspecs/office_standards/ms-docx/ [MS-DOCX] Specification
  */
 
-import { attachmentLookup, takeRepeats } from '../utils/repeatUtils.js';
-import { BreakMetadata, CellMetadata, CodeMetadata, CommentMetadata, FullOfficeParserConfig, HeaderFooterMetadata, ImageMetadata, ShapeMetadata, PageNumberFormat, IndentationMetadata, ListMetadata, OfficeAttachment, OfficeContentNode, OfficeErrorType, OfficeIssue, OfficeParserAST, OfficeWarningType, PageSetup, ParagraphSpacing, TableMetadata, TextFormatting, TextMetadata } from '../types.js';
+import { attachmentLookup, contentWeigher, takeRepeats } from '../utils/repeatUtils.js';
+import { BreakMetadata, CellMetadata, CodeMetadata, CommentMetadata, FullOfficeParserConfig, HeaderFooterMetadata, ImageMetadata, ShapeMetadata, PageNumberFormat, IndentationMetadata, ListMetadata, NoteMetadata, OfficeAttachment, OfficeContentNode, OfficeErrorType, OfficeIssue, OfficeParserAST, OfficeWarningType, PageSetup, ParagraphSpacing, TableMetadata, TextFormatting, TextMetadata } from '../types.js';
 import { MAX_PAGE_PT } from '../utils/pageLimits.js';
 import { lengthToPt, titlePagesTakeHiddenFirsts } from '../utils/officeGenUtils.js';
 import { fieldSwitchFormat, pageNumberStartOf, wordPageNumberFormat } from '../utils/pageNumbers.js';
@@ -90,6 +90,8 @@ import { parseRtf } from './RtfParser.js';
 interface WordChunk {
     bytesLeft: number;
     bytesUsed: number;
+    /** The document's quote ids (see HtmlPartContext.quoteId), shared with the chunks it holds. */
+    quoteId: () => string;
 }
 
 /** SmartArt data parts (see readDiagram). */
@@ -665,6 +667,28 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
         if (!node) referencedNodes.set(`${kind}:${id}`, node = build());
         return node;
     };
+    /**
+     * A note given the mark its author typed (`w:customMarkFollows`), when it has one. Word writes that
+     * mark again at the note's start (as text, where a numbered note has `w:footnoteRef`): it is the
+     * note's mark, not its text, and is taken off.
+     */
+    const customMarkedNote = (note: OfficeContentNode, mark: string): OfficeContentNode => {
+        const trimmed = mark.trim();
+        if (!trimmed) return note;
+        (note.metadata as NoteMetadata).mark = trimmed;
+        (note.metadata as NoteMetadata).customMark = true;
+        const first = note.children?.[0];
+        const run = first?.children?.find(c => c.type === 'text' && (c.text ?? '').trim());
+        if (first && run && (run.text ?? '').trimStart().startsWith(trimmed)) {
+            const rest = (run.text ?? '').trimStart().slice(trimmed.length);
+            const children = first.children!.filter(c => c !== run || rest);
+            const kept = children.map(c => (c === run ? { ...run, text: rest } : c));
+            const paragraph = { ...first, children: kept, text: kept.map(c => c.text ?? '').join('').replace(/^\s+/, '') };
+            note.children = [paragraph, ...note.children!.slice(1)];
+            note.text = note.children.map(n => n.text).join(' ');
+        }
+        return note;
+    };
     const endnoteMap = new Map<string, OfficeContentNode[]>();
     const commentMap = new Map<string, OfficeContentNode[]>();
     const commentMetadataMap = new Map<string, CommentMetadata>();
@@ -723,6 +747,9 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
     };
     // What a DOCX chunk may inflate: what this document left of the limit, shared by all its chunks.
     let chunkBytesLeft = byteLimit - inflatedBytes;
+    // The quotes of its imported HTML, numbered across the document and the chunks it holds (see HtmlPartContext.quoteId).
+    let chunkQuotes = 0;
+    const chunkQuoteId = chunk?.quoteId ?? (() => `html-quote-${++chunkQuotes}`);
     const adoptChunk = (ast: OfficeParserAST): OfficeContentNode[] => {
         const renamed = new Map<string, string>();
         for (const attachment of ast.attachments) {
@@ -736,7 +763,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
     /** A chunk part's content, read by its kind (`extension`). */
     const readChunkPart = async (content: Buffer, path: string, extension: string): Promise<OfficeContentNode[]> => {
         if (extension === 'docx') {
-            const nested: WordChunk = { bytesLeft: Math.max(0, chunkBytesLeft), bytesUsed: 0 };
+            const nested: WordChunk = { bytesLeft: Math.max(0, chunkBytesLeft), bytesUsed: 0, quoteId: chunkQuoteId };
             try {
                 return adoptChunk(await parseWord(content, config, nested));
             } finally {
@@ -789,7 +816,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
         }
         // Its elements count against the document's budget, as an EPUB chapter's do (see maxXmlElements).
         takeXmlElements(html, config);
-        return adoptChunk(await parseHtml(Buffer.from(html, 'utf8'), config, { imageAttachment }));
+        return adoptChunk(await parseHtml(Buffer.from(html, 'utf8'), config, { imageAttachment, quoteId: chunkQuoteId }));
     };
     /**
      * The content of the chunk `element` stands for, its relationship looked up in `rels` (those of the
@@ -1241,6 +1268,11 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
                 const runItems: Node[] = [];
                 const pushRunItems = (nodes: ArrayLike<Node>) => { for (let i = nodes.length - 1; i >= 0; i--) runItems.push(nodes[i]); };
                 pushRunItems(runNode.childNodes);
+                // A note reference with a mark the author typed (`w:customMarkFollows`): the run's text is
+                // that mark, the note's (NoteMetadata.mark), not the paragraph's.
+                const markedReference = config.ignoreNotes ? undefined : (ownFirst(runNode, "w:footnoteReference") ?? ownFirst(runNode, "w:endnoteReference"));
+                const customMarkFollows = !!markedReference && !['', 'false', '0', 'off'].includes(markedReference.getAttribute("w:customMarkFollows") ?? '');
+                let customMark = '';
                 while (runItems.length) {
                     const child = runItems.pop()!;
                     if (!isElement(child)) continue;
@@ -1255,6 +1287,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
                     if (child.tagName === "w:t" || child.tagName === "t" || child.tagName === "m:t") {
                         if (hiddenResults > 0) continue;
                         const tNode = child;
+                        if (customMarkFollows) { customMark += tNode.textContent || ''; continue; }
 
                         const tContent = tNode.textContent || '';
                         text += tContent;
@@ -1434,12 +1467,12 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
                         const id = footnoteRef.getAttribute("w:id");
                         if (id && footnoteMap.has(id)) {
                             const noteNodes = footnoteMap.get(id)!;
-                            const noteNode = referencedNode('footnote', id, () => ({
+                            const noteNode = referencedNode('footnote', id, () => customMarkedNote({
                                 type: 'note',
                                 text: noteNodes.map((n: OfficeContentNode) => n.text).join(' '),
                                 children: noteNodes,
                                 metadata: { noteType: 'footnote', noteId: id }
-                            } as OfficeContentNode));
+                            }, customMarkFollows ? customMark : ''));
                             attach(noteNode, 'notes');
                             noteReferenced(noteNode);
                         }
@@ -1450,12 +1483,12 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
                         const id = endnoteRef.getAttribute("w:id");
                         if (id && endnoteMap.has(id)) {
                             const noteNodes = endnoteMap.get(id)!;
-                            const noteNode = referencedNode('endnote', id, () => ({
+                            const noteNode = referencedNode('endnote', id, () => customMarkedNote({
                                 type: 'note',
                                 text: noteNodes.map((n: OfficeContentNode) => n.text).join(' '),
                                 children: noteNodes,
                                 metadata: { noteType: 'endnote', noteId: id }
-                            } as OfficeContentNode));
+                            }, customMarkFollows ? customMark : ''));
                             attach(noteNode, 'notes');
                             noteReferenced(noteNode);
                         }
@@ -2029,6 +2062,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
         // is charged to the repeated content budget, going without its blocks once that is spent.
         const byPath = new Map(files.map(f => [f.path, f]));
         const read = new Map<string, { children: OfficeContentNode[]; text: string; weight: number } | null>();
+        const weighPart = contentWeigher();
         const given = new Set<string>();
         const inForce = new Map<string, string>();
         const readInto = async (path: string, kind: 'header' | 'footer', metadata: HeaderFooterMetadata) => {
@@ -2050,10 +2084,10 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
                 const blocks: OfficeContentNode[] = [];
                 await readPart(partFile.path, partDoc.documentElement, () => readBlocks(partDoc.documentElement, partXml, blocks));
                 const text = blocks.map(c => c.text || '').join('\n');
-                let count = 0;
-                const stack = [...blocks];
-                while (stack.length) { const n = stack.pop()!; count++; for (const c of n.children ?? []) stack.push(c); }
-                read.set(path, part = { children: blocks, text, weight: text.length + 16 * count });
+                // A later showing shares these blocks, whose values boundRepeatedValues sees once: its charge
+                // carries them (an 8 KB document showing a header in a 50,000-character font 2,000 times made
+                // 100 MB of JSON, unwarned).
+                read.set(path, part = { children: blocks, text, weight: text.length + weighPart(blocks) });
             }
             if (!part) return;
             const kept = !repeat || takeRepeats(config, 1, part.weight) > 0;

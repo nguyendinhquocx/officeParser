@@ -64,7 +64,7 @@ const ERROR_MESSAGES: Record<OfficeErrorType, string | ((...args: any[]) => stri
     [OfficeErrorType.PASSWORD_REQUIRED]: `This document is password-protected. Provide the password via the 'password' config option (or an 'onPassword' callback) to parse it.`,
     [OfficeErrorType.PASSWORD_INCORRECT]: `The password provided is incorrect for this document.`,
     [OfficeErrorType.DOCUMENT_DECRYPTION_FAILED]: (detail: string) => `Could not decrypt this document${detail ? `: ${detail}` : ''}.`,
-    [OfficeErrorType.TEMPLATE_UNSUPPORTED_FORMAT]: (detail: string) => `This document type cannot be used as a template${detail ? `: ${detail}` : ''}. Template rendering currently supports DOCX (.docx).`,
+    [OfficeErrorType.TEMPLATE_UNSUPPORTED_FORMAT]: (detail: string) => `This document type cannot be used as a template${detail ? `: ${detail}` : ''}. Template rendering supports Word documents (.docx) and OpenDocument texts and text templates (.odt, .ott).`,
     [OfficeErrorType.TEMPLATE_FIELD_MISSING]: (field: string) => `Template field '${field}' has no matching value in the data, and onMissing is 'error'. Provide the field, or set onMissing to 'keep' or 'empty'.`,
     [OfficeErrorType.TEMPLATE_SYNTAX]: (info: TemplateSyntaxDetails) => `Template tag '${info.tag}' in ${info.part} ${templateSyntaxReason(info)}.`,
     [OfficeErrorType.TEMPLATE_DATA_INVALID]: (info: TemplateDataDetails) => `Template tag '${info.tag}' in ${info.part} ${templateDataReason(info)}.`,
@@ -192,6 +192,19 @@ const WARNING_MESSAGES: Record<OfficeWarningType, string | ((...args: any[]) => 
         const value = shown.length > 80 ? `${shown.slice(0, 77)}...` : shown;
         const fallback = info.fallback === '' || info.fallback === undefined ? 'the default is' : `the default (${JSON.stringify(info.fallback)}) is`;
         return `Invalid ${info.option}: ${value}. Expected ${info.expected}; ${fallback} used instead.`;
+    },
+    [OfficeWarningType.TEMPLATE_NOT_A_TAG]: (info: { texts: { text: string; part: string; reason: string }[]; found: number }) => {
+        const why: Record<string, string> = {
+            'space-in-name': 'a name has no spaces', 'unknown-filter': 'a word after | is no filter',
+            'missing-delimiter': 'a delimiter is a character short', 'full-width': 'its delimiters are typed full-width',
+        };
+        // At most 1,000 are listed: past them, only counted.
+        const found = Math.max(info.found ?? 0, info.texts.length);
+        const shown = info.texts.slice(0, 5).map(t => `'${t.text}' in ${t.part} (${why[t.reason] ?? t.reason})`).join(', ');
+        const more = found > 5 ? `, and ${found - 5} more` : '';
+        const cut = found > info.texts.length ? ` (only the first ${info.texts.length} are listed)` : '';
+        const one = found === 1;
+        return `${one ? 'Text that looks like a template tag is' : `${found} texts that look like template tags are`} not ${one ? 'a tag' : 'tags'} and ${one ? 'is' : 'are'} written as typed${cut}: ${shown}${more}.`;
     },
     [OfficeWarningType.TEMPLATE_CHECK_LIMITED]: (info: { limit: number; entry?: number; batch?: boolean; unchecked?: number }) => info.batch
         ? `A template check stopped after ${info.limit} problems in all, in data entry ${info.entry}${info.unchecked ? `; the ${info.unchecked} entr${info.unchecked === 1 ? 'y' : 'ies'} after it ${info.unchecked === 1 ? 'was' : 'were'} not checked` : ''}. Fix these and check again.`

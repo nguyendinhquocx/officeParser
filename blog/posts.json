@@ -14,6 +14,42 @@
     ],
     "posts": [
         {
+            "slug": "filling-an-opendocument-template",
+            "title": "Filling an OpenDocument Template",
+            "shortTitle": "Filling an ODT Template",
+            "category": "deep-dive",
+            "published": "2026-11-08",
+            "description": "How officeParser 8.7.0 fills .odt and .ott templates with the same tags and data as Word's: tags split across spans, spaces stored as elements, blocks over list items and heading rows, and fresh names for every copy a loop makes.",
+            "deck": "An OpenDocument template splits a typed tag across spans, keeps a million spaces in 25 bytes, and holds names LibreOffice wants unique. Filling one means reading it short, writing it back whole, and renaming every copy."
+        },
+        {
+            "slug": "text-that-looks-like-a-tag",
+            "title": "Text That Looks Like a Tag: When Data for People Meets a Template for Machines",
+            "shortTitle": "Text That Looks Like a Tag",
+            "category": "deep-dive",
+            "published": "2026-11-08",
+            "description": "How officeParser 8.7.0 reports template text that only looks like a tag without flagging braces in prose, code or JSON, and how it reads numbers with a decimal comma, numbers stored as text and block keywords spelt as other template languages spell them.",
+            "deck": "{{first name}} was never a tag, so every document printed it as typed and nothing said so. Telling a near miss from braces that are meant takes a stack of braces, one linear pass, and a rule that took two rewrites to get right."
+        },
+        {
+            "slug": "reading-details-in-markdown",
+            "title": "Reading a Details Block in Markdown the Way GitHub Shows It",
+            "shortTitle": "Details Blocks in Markdown",
+            "category": "deep-dive",
+            "published": "2026-11-08",
+            "description": "How officeParser 8.7.0 reads a README's details and summary tags as a disclosure, following CommonMark for blocks and a browser's tree builder for which element an end tag closes, and how it is checked against a reference and a browser.",
+            "deck": "A disclosure in a README is a tag, Markdown, and another tag. CommonMark decides the blocks and a browser decides what each end tag closes, so reading it means following both."
+        },
+        {
+            "slug": "testing-a-document-library",
+            "title": "How a Document Library Is Tested",
+            "shortTitle": "Testing a Document Library",
+            "category": "architecture",
+            "published": "2026-11-08",
+            "description": "What officeParser 8.7.0's test suite holds and why: committed baselines and fingerprints, round trips that must settle, seeded generators and the references they are checked against, linear-time ratios, budgets tested from both sides, and LibreOffice as a referee.",
+            "deck": "A test that passes can still prove nothing: a baseline that churns, a generator that cycles through 367 cases while claiming 200,000, a time limit that depends on the machine. Each layer of the suite answers one of those."
+        },
+        {
             "slug": "two-versions-of-pdfjs-in-one-process",
             "title": "Two Versions of pdf.js in One Process",
             "shortTitle": "Two pdf.js in One Process",
@@ -66,10 +102,10 @@
             "published": "2026-10-29",
             "updated": "2026-11-01",
             "revisions": [
+                { "id": "lines-apart", "date": "2026-11-01", "release": "8.5.0", "note": "Lines are now moved one by one, and to the pages of their part, and a header may be missing from some pages. A number counting from elsewhere is a field too." },
                 { "id": "ranges", "date": "2026-11-01", "release": "8.5.0", "note": "A range from a later page now keeps its page numbers out of the text, as fields." },
                 { "id": "parts", "date": "2026-11-01", "release": "8.5.0", "note": "Lines that differ are now parts as a word processor's are, and a tagged PDF's artifacts go there whatever they say." },
                 { "id": "book-parts", "date": "2026-11-01", "release": "8.5.0", "note": "Even and odd heads, a cover without a header, roman front matter and an article's numbers are now handled." },
-                { "id": "lines-apart", "date": "2026-11-01", "release": "8.5.0", "note": "Lines are now moved one by one, and to the pages of their part, and a header may be missing from some pages. A number counting from elsewhere is a field too." },
                 { "id": "roman-untagged", "date": "2026-11-01", "note": "This holds for an untagged PDF: a tagged PDF's artifacts in roman numerals are page numbers without page labels too." }
             ],
             "description": "How officeParser 8.4.1 finds an untagged PDF's running headers and footers by comparing its pages, turns a printed page number back into a field, and leaves a header in its pages when no single header could hold it.",
@@ -173,8 +209,9 @@
             "shortTitle": "From String Scraping to AST",
             "category": "architecture",
             "published": "2026-10-04",
-            "updated": "2026-10-28",
+            "updated": "2026-11-08",
             "revisions": [
+                { "id": "disclosure-nodes", "date": "2026-11-08", "release": "8.7.0", "note": "Two node types joined the set: a details block in HTML or Markdown is now read as a disclosure node, whose first child is a summary node holding its summary." },
                 { "id": "more-outputs", "date": "2026-10-28", "release": "8.3.0", "note": "XLSX, ODS, PPTX and ODP output took the outputs from 11 to 15." },
                 { "id": "bundle-size", "date": "2026-10-28", "release": "8.3.0", "note": "The browser bundle was about 5.5 MB when this post went out, and grew to about 6 MB with this release." },
                 { "id": "own-fonts", "date": "2026-10-28", "release": "8.2.0", "note": "The native engine now also draws in TrueType and OpenType fonts you give it, for any script." }
@@ -190,9 +227,9 @@
             "published": "2026-10-04",
             "updated": "2026-11-01",
             "revisions": [
-                { "id": "fixed-node-releases", "date": "2026-11-01", "release": "8.5.0", "note": "Earlier Node.js releases have a flaw in their Brotli decoder (CVE-2026-111497), so the package now asks for one with the fix." },
                 { "id": "xlsx-written", "date": "2026-10-28", "release": "8.3.0", "note": "officeParser now writes .xlsx files, with each cell's value and not its formula." },
-                { "id": "spreadsheets-and-slides", "date": "2026-10-26", "release": "8.3.0", "note": "officeParser now writes .xlsx, .ods, .pptx and .odp files, so this section is now about what those files leave out." }
+                { "id": "spreadsheets-and-slides", "date": "2026-10-26", "release": "8.3.0", "note": "officeParser now writes .xlsx, .ods, .pptx and .odp files, so this section is now about what those files leave out." },
+                { "id": "fixed-node-releases", "date": "2026-11-01", "release": "8.5.0", "note": "Earlier Node.js releases have a flaw in their Brotli decoder (CVE-2026-111497), so the package now asks for one with the fix." }
             ],
             "description": "The jobs officeParser does not do: PDFs that match Word exactly, formula recalculation, legacy .doc files, formulas and native charts in what it writes, macros, and TeX typesetting, and what to use instead.",
             "deck": "Most documentation reads like a sales pitch, with the drawbacks in the fine print. I would rather be plain: here are the problems officeParser does not solve, and the tools to use instead."

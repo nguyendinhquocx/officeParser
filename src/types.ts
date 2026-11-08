@@ -172,6 +172,14 @@ export enum OfficeWarningType {
     PDF_ASSET_UNAVAILABLE = 'PDF_ASSET_UNAVAILABLE',
     /** `ocr: true` was set without `extractAttachments: true`; OCR runs over extracted images (in every format), so no OCR was performed */
     OCR_REQUIRES_ATTACHMENTS = 'OCR_REQUIRES_ATTACHMENTS',
+    /**
+     * A template holds text that looks like a tag but is not one (see `TemplateTextReason`), which a render
+     * writes as typed: `{{first name}}`, `{{ name }`, `｛｛nom｝｝`. Raised once by `OfficeTemplate.render` and
+     * `OfficeTemplate.check`, with each such text, its part and why in `details.texts` (at most 1,000) and
+     * how many there are in `details.found`; `OfficeTemplate.tags` lists them as tags of kind `text`, and
+     * raises it only when it found more than it lists.
+     */
+    TEMPLATE_NOT_A_TAG = 'TEMPLATE_NOT_A_TAG',
     /** A template check found as many problems as it lists (`details.limit`: 1,000 for one data entry, or 10,000 in all for a batch, `details.batch`) and stopped there, in `details.entry` of a batch, with `details.unchecked` entries after it not checked; fix these and check again */
     TEMPLATE_CHECK_LIMITED = 'TEMPLATE_CHECK_LIMITED',
     /** A config option was passed that this version does not recognize (e.g. a key renamed in a major release); it had no effect */
@@ -1647,6 +1655,18 @@ export interface HtmlGeneratorConfig {
      * default-ish colour. Off by default; the default output is unchanged.
      */
     omitDefaultTextColor?: boolean;
+    /**
+     * How a spreadsheet's sheets (XLSX, ODS, CSV) are written:
+     * - `'viewer'` (default): a spreadsheet viewer, each sheet a grid with column letters and row
+     *   numbers, the sheets switched by tabs (a script resizes columns where scripts are written).
+     * - `'tables'`: as a document holds them, for a host that embeds a workbook in a document: each
+     *   sheet a heading with its name (`<h2>`) and a plain table of its cells, merged cells as spans,
+     *   its empty rows and columns kept in place, its first row a header only where the source marks
+     *   it so (a header-styled or all-bold row); no tabs, column letters, row numbers or script, and
+     *   not the workbook's own font and size on every cell (the font and size most of the cells' text
+     *   has is the workbook's, and is left to the page; a cell set apart keeps its own).
+     */
+    sheetLayout?: 'viewer' | 'tables';
 }
 
 /**
@@ -2311,7 +2331,7 @@ export interface FallbackToHtmlConfig {
     alignment?: boolean;
     /** Internal-link/heading `<a id>`/`<a name>` anchor tags. */
     anchors?: boolean;
-    /** Nested-table and merged-cell (colspan/rowspan) HTML `<table>` fallback. */
+    /** Nested-table, merged-cell (colspan/rowspan) and disclosure-holding (`<details>` in a cell) HTML `<table>` fallback. */
     tables?: boolean;
     /**
      * YouTube embed `<div data-youtube-video>` vs. a plain link.
@@ -2712,6 +2732,12 @@ export interface TemplateSyntaxDetails {
     part: string;
     /** More about the reason, where there is more to say. */
     detail?: string;
+    /**
+     * The tag as it should be typed, delimiters included, where the reason says how: a block keyword
+     * spelt as other template languages spell it (`{{ elseif x }}`, `{{ elif x }}`) is `{{ else if x }}`,
+     * and `{{ end if }}` is `{{ endif }}`. The spaces typed around the tag's text are kept.
+     */
+    suggestion?: string;
 }
 
 /** Why a template's data was rejected with `TEMPLATE_DATA_INVALID`. */
@@ -2748,13 +2774,36 @@ export interface TemplateLoopPlace {
 }
 
 /**
+ * Why text that looks like a tag is not one (see {@link TemplateTagInfo}, kind `text`). Exactly these,
+ * and nothing else is reported (single braces, `{x}`, JSON, `{{}}` are not):
+ * - `space-in-name`: text between the delimiters that is a name with white space in it, made of letters,
+ *   digits, `_ . -` and white space, starting with a letter or `_`, at most 64 characters: `{{first name}}`
+ *   (a field's name has no spaces; `{{first_name}}` with a data key `first_name` is one).
+ * - `unknown-filter`: a field through a word after `|` that is no filter, built-in or in `formatters`:
+ *   `{{ total | fromat "0.00" }}`.
+ * - `missing-delimiter`: for delimiters of one character typed twice or more (the default `{{ }}`), a
+ *   name between a start delimiter and an end delimiter one of which is a character short: `{{ name }`,
+ *   `{ name }}` (a short start inside braces still open, or a short end whose brace a later one closes,
+ *   as code nests them, is not reported).
+ * - `full-width`: a name between delimiters typed with full-width characters (U+FF01 to U+FF5E), as a
+ *   Japanese or Chinese keyboard types them: `｛｛nom｝｝`.
+ */
+export type TemplateTextReason = 'space-in-name' | 'unknown-filter' | 'missing-delimiter' | 'full-width';
+
+/**
  * A tag of a template, as {@link OfficeTemplate.tags} lists it: a field, or a block's opening or
- * branch tag (`endif` and `endfor` close what they open and are not listed). In the order of each part.
+ * branch tag (`endif` and `endfor` close what they open and are not listed); or (`kind: 'text'`) text
+ * that looks like a tag but is not one, which a render writes as typed. In the order of each part.
  */
 export interface TemplateTagInfo {
-    /** `field` (`{{ name }}`), `if`, `elseif`, `else` or `for`. */
-    kind: 'field' | 'if' | 'elseif' | 'else' | 'for';
-    /** The tag as typed, delimiters included (a very long one is cut short). */
+    /**
+     * `field` (`{{ name }}`), `if`, `elseif`, `else` or `for`; or `text`: text that looks like a tag but is
+     * not one (`{{first name}}`, `{{ name }`, `｛｛nom｝｝`), written as typed, with why in `reason`, no
+     * `fields`, and the loops it is inside. At most 1,000 such texts are listed for a template; when there
+     * are more, a `TEMPLATE_NOT_A_TAG` warning says how many (`details.found`).
+     */
+    kind: 'field' | 'if' | 'elseif' | 'else' | 'for' | 'text';
+    /** The tag as typed, delimiters included (a very long one is cut short); for `text`, the text as typed. */
     tag: string;
     /** The document part holding it, e.g. `word/document.xml` or `word/header1.xml`. */
     part: string;
@@ -2768,6 +2817,8 @@ export interface TemplateTagInfo {
     filters?: string[];
     /** A `for` tag's item name (`line` in `{{ for line in lines }}`). */
     item?: string;
+    /** For `text`: why it is not a tag. */
+    reason?: TemplateTextReason;
     /**
      * The `for` tags this tag is inside, outermost first, each as its item name and list as typed. A note
      * only loops refer to is listed as its part holds it, outside them: its fields may start with the
@@ -2850,6 +2901,19 @@ export interface TemplateConfig {
      */
     numberSeparators?: { decimal?: string; group?: string };
     /**
+     * How a number written as text in the data is read, by a number picture and where a condition
+     * compares it with a number: its decimal point and the separator of its groups of three digits.
+     * `{ decimal: ',', group: '.' }` reads `12,50` and `1.234,50`; `{ decimal: ',', group: ' ' }` reads
+     * `1 234,50` (a space separator matches a no-break space too). Each is one character; `group` may be
+     * `''` (the default when left out) for none, and `decimal` defaults to `.`. A group separator where
+     * groups of three do not follow makes the text no number (`1.5` with `.` for groups), nor is one
+     * after a first group starting with 0 (`0.500`), so an ambiguous text is refused rather than misread. Not given (the default), text is read with `.` for the point and
+     * no group separator (`1250.5`). `numberSeparators` says how numbers are written, this how they are
+     * read, so data written one way can fill a document written another. A value of the wrong shape is
+     * refused (`IMPROPER_ARGUMENTS`).
+     */
+    dataNumberSeparators?: { decimal?: string; group?: string };
+    /**
      * The month and day names and AM/PM markers a date picture writes. Default English. A value that is
      * not an object of names, or a list of the wrong length, is refused (`IMPROPER_ARGUMENTS`).
      */
@@ -2879,12 +2943,12 @@ export interface TemplateConfig {
     /** How many times `onPassword` is asked before the render rejects, as the parser's option of the same name. Default is 3. */
     maxPasswordAttempts?: number;
     /**
-     * Optional hint for the template's format. DOCX is the only supported template format today, and the
-     * format is always detected from the bytes, so this hint does not influence detection: it only
-     * refines the `TEMPLATE_UNSUPPORTED_FORMAT` message when an unsupported file is passed. It is kept as
-     * the extension point for a second template format.
+     * Optional hint for the template's format: a Word document (`docx`), or an OpenDocument text (`odt`)
+     * or text template (`ott`, rendered as an `.odt`). The format is always detected from the bytes, so
+     * this hint does not influence detection: it only refines the `TEMPLATE_UNSUPPORTED_FORMAT` message
+     * when an unsupported file is passed.
      */
-    fileType?: 'docx';
+    fileType?: 'docx' | 'odt' | 'ott';
     /**
      * Limits on decompressing the (untrusted) template zip, same shape and defaults as the parser's.
      * Guards against zip-bomb templates. Defaults to 512 MiB / 10000 entries. `maxXmlElements` (2,000,000)
@@ -2931,7 +2995,7 @@ export interface BlobLike {
 /**
  * Types of content nodes in the AST.
  */
-export type OfficeContentNodeType = 'paragraph' | 'heading' | 'table' | 'list' | 'text' | 'image' | 'chart' | 'drawing' | 'slide' | 'note' | 'sheet' | 'row' | 'cell' | 'page' | 'break' | 'code' | 'comment' | 'header' | 'footer' | 'slideMaster' | 'embed' | 'admonition' | 'definitionList' | 'definitionTerm' | 'definitionDescription';
+export type OfficeContentNodeType = 'paragraph' | 'heading' | 'table' | 'list' | 'text' | 'image' | 'chart' | 'drawing' | 'slide' | 'note' | 'sheet' | 'row' | 'cell' | 'page' | 'break' | 'code' | 'comment' | 'header' | 'footer' | 'slideMaster' | 'embed' | 'admonition' | 'definitionList' | 'definitionTerm' | 'definitionDescription' | 'disclosure' | 'summary';
 
 /**
  * Supported MIME types for attachments.
@@ -3046,6 +3110,12 @@ export interface TextFormatting {
      * @example "center", "right"
      */
     alignment?: TextAlignment;
+
+    /**
+     * The text is keyboard input (`<kbd>` in HTML and Markdown): written as `<kbd>` there, read with
+     * `font: 'monospace'` too, so every format without the notion shows it as code.
+     */
+    keyboard?: boolean;
 
     /**
      * The text is drawn invisibly, to be found and copied but not seen: a PDF's text in rendering mode
@@ -3244,6 +3314,15 @@ export interface ParagraphMetadata {
     rotation?: number;
     /** The style of the paragraph. */
     style?: string;
+    /**
+     * For a quote paragraph (`style: 'Quote'`), the quote it belongs to: adjacent quote paragraphs with
+     * the same id are the paragraphs of one quote (Markdown `> a` `>` `> b`, HTML
+     * `<blockquote><p>a</p><p>b</p></blockquote>`, a LaTeX `quote` environment), written back as one
+     * where the format has the notion. Paragraphs without one are each a quote of their own, as a
+     * word processor's Quote-styled paragraphs are. A grouping key derived while parsing.
+     * @example "md-quote-1"
+     */
+    quoteId?: string;
     /** Detailed indentation information. */
     paragraphIndentation?: IndentationMetadata;
     /** The space around the paragraph and between its lines. */
@@ -3461,6 +3540,14 @@ export interface ImageMetadata {
     /** Advisory image title (Markdown `![alt](url "title")`, HTML `<img title>`), if any. */
     title?: string;
     /**
+     * The picture's caption, as text: an HTML or EPUB `<figure>`'s `<figcaption>` (a caption of plain
+     * text; a richer one stays a paragraph after the picture). Written as `<figure><figcaption>` in HTML
+     * and EPUB, as an HTML `<figure>` block in Markdown, and as a caption paragraph (`style: 'Caption'`)
+     * after the picture everywhere else (`\captionof` in LaTeX), so it is never lost. Unlike `altText`,
+     * which stands in for the picture, it is shown with it.
+     */
+    caption?: string;
+    /**
      * Where the image links to, when it is a link: a badge or a clickable picture (Markdown
      * `[![alt](src)](target)`, HTML `<a href><img></a>`, a hyperlinked picture in Word, PowerPoint,
      * ODF, RTF or LaTeX's `\href`). An internal target is `#` and an anchor id.
@@ -3513,6 +3600,23 @@ export interface AdmonitionMetadata {
      * (`'gitlab'`) or `::: {.note}` (`'pandoc'`). Always populated by the parser.
      */
     sourceSyntax?: 'github' | 'gitlab' | 'pandoc';
+    /** Unique anchor IDs for internal linking. */
+    anchorIds?: string[];
+}
+
+/**
+ * Metadata for a `disclosure` node: a block a reader opens and closes (HTML `<details>`), in HTML, EPUB
+ * and Markdown (where it is that HTML, its body Markdown). Its `children` are its summary, a `summary`
+ * node first (what it shows while closed: blocks, as `<summary>` holds any content, a heading, a link, a
+ * picture, a note, a line break, a nested disclosure), then the blocks it shows when open. With no
+ * `summary` child a browser shows "Details", and writers without the block write that. HTML, EPUB and
+ * Markdown write it back as `<details>` (Markdown: a list item or table holding one as HTML, whose cells
+ * and items hold blocks); every other writer, which has no such block, writes its summary in bold (its
+ * paragraphs' text bold, its other blocks as they are) followed by the body, all shown.
+ */
+export interface DisclosureMetadata {
+    /** It is open (shows its body) as the document opens (`<details open>`). */
+    open?: boolean;
     /** Unique anchor IDs for internal linking. */
     anchorIds?: string[];
 }
@@ -3643,6 +3747,23 @@ export interface NoteMetadata {
      * @example "1", "2"
      */
     noteId?: string;
+    /**
+     * The mark the note's reference shows, as the source records it: ODT's number as its
+     * `text:notes-configuration` gives it (format and start value, as LibreOffice shows it; the cached
+     * `text:note-citation` for footnotes numbered per page or chapter), the text of an HTML or EPUB note
+     * reference, a custom mark (see `customMark`). `noteId` is an internal
+     * key (DOCX's `w:id`, ODT's `ftn1`) and never shown. Absent where the source numbers its notes
+     * itself and records no mark (DOCX, RTF, Markdown, LaTeX): writers then show the note's ordinal
+     * within its kind, footnotes `1, 2, 3` and endnotes `i, ii, iii`, as word processors number them.
+     * @example "1", "iv", "*"
+     */
+    mark?: string;
+    /**
+     * True when `mark` is one the author chose rather than a number the application gave (ODT's
+     * `text:label`, DOCX's `w:customMarkFollows`). Writers that number notes themselves (DOCX, ODT)
+     * write it as their own custom mark; other numbers they give again.
+     */
+    customMark?: boolean;
     /** Unique anchor IDs for internal linking. */
     anchorIds?: string[];
     /** The slide number this note is associated with (used in PowerPoint). */
@@ -3964,6 +4085,9 @@ export type OfficeContentNode = BaseContentNode & (
     | { type: 'definitionList'; metadata?: DefinitionMetadata }
     | { type: 'definitionTerm'; metadata?: DefinitionMetadata }
     | { type: 'definitionDescription'; metadata?: DefinitionMetadata }
+    | { type: 'disclosure'; metadata?: DisclosureMetadata }
+    /** A disclosure's summary (`<summary>`), its first child: blocks, with no metadata (see DisclosureMetadata). */
+    | { type: 'summary'; metadata?: undefined }
 );
 
 /**

@@ -36,6 +36,14 @@ import { isHeaderRow } from '../../src/utils/officeGenUtils.js';
 import { fontkitUnbrotli, nativeUnbrotli, sfntOf } from '../../src/generators/pdf/fontFiles.js';
 import { toWoff, toWoff2 } from '../helpers/webFontWriter';
 import { BOX, cffTable, type CffSpec, charString, EMPTY, withCffOutlines } from '../helpers/cffFontWriter';
+import { checkLookalikeScan } from '../helpers/lookalikeReference';
+import { checkDisclosureReference } from '../helpers/disclosureReference';
+import { checkDisclosureAstRoundTrip } from '../helpers/disclosureAstRoundTrip';
+import { checkMarkdownLineLoss } from '../helpers/markdownLineLoss';
+import { checkHtmlPathRoundTrip, HTML_PATH_KINDS } from '../helpers/htmlPathRoundTrip';
+import { checkOdtSpaceRuns } from '../helpers/odtSpaceRuns';
+import { OfficeTemplate } from '../../src/OfficeTemplate';
+import { findLookalikeTags, PartContext, triggersOf } from '../../src/template/templateEngine.js';
 
 // ============================================================================
 // CONSTANTS & CONFIGURATION
@@ -2793,6 +2801,168 @@ async function runTableGeometryTests(): Promise<GenFeatureTest[]> {
 }
 
 /**
+ * The template engine's readings checked against plain references on random inputs: the look-alike scan
+ * (text that looks like a tag) against test/helpers/lookalikeReference.ts, and spaces kept as `<text:s/>` in
+ * an ODT read as if typed out (test/helpers/odtSpaceRuns.ts). Fast mode runs fewer cases.
+ */
+async function runTemplatePropertyTests(): Promise<GenFeatureTest[]> {
+    const results: GenFeatureTest[] = [];
+    const mk = (feature: string, exp: any, act: any, ok: boolean, details: string, duration: number): GenFeatureTest => ({
+        category: 'Template Properties', feature, sourceFormat: 'synthetic', destFormat: 'docx',
+        result: { status: ok ? 'PASS' : 'FAIL', expected: exp, actual: act, details, duration },
+    });
+    const cases = FAST_MODE ? 20_000 : 200_000;
+    const started = Date.now();
+    const scan = (joined: string, start: string, end: string, room: number) => {
+        const ctx = { opts: { start, end }, triggers: triggersOf({ start }), nearRoom: { left: room }, nearUnlisted: 0 } as unknown as PartContext;
+        const found = findLookalikeTags(joined, ctx);
+        return { found, unlisted: ctx.nearUnlisted };
+    };
+    const { withLookalikes, failures } = checkLookalikeScan(scan, cases, 1);
+    results.push(mk(`the look-alike scan lists and counts what the reference finds (${cases} texts, rooms 0 to 3 and 1,000)`,
+        'no difference', failures.length ? `${failures.length} differences` : 'none', failures.length === 0,
+        failures.length ? failures.slice(0, 3).join('\n') : `${withLookalikes} texts with look-alikes`, Date.now() - started));
+    const paragraphs = FAST_MODE ? 1_000 : 4_000;
+    const odtStarted = Date.now();
+    const odtFailures = await checkOdtSpaceRuns((bytes, config) => OfficeTemplate.render(bytes, config) as Promise<Uint8Array>, paragraphs, 1);
+    results.push({
+        category: 'Template Properties', feature: `ODT spaces as <text:s/> render as typed out, next to tags with space edges (${paragraphs} paragraphs)`,
+        sourceFormat: 'synthetic', destFormat: 'odt',
+        result: { status: odtFailures.length ? 'FAIL' : 'PASS', expected: 'no difference', actual: odtFailures.length ? `${odtFailures.length} differences` : 'none', details: odtFailures.slice(0, 3).join('\n'), duration: Date.now() - odtStarted },
+    });
+    return results;
+}
+
+/**
+ * Markdown disclosures against a reference written independently of the Markdown reader
+ * (test/helpers/disclosureReference.ts: CommonMark's blocks, then a browser's tree building) on random
+ * Markdown mixing disclosures with every block kind (tag names in attributes, comments, enclosing
+ * elements, summaries holding blocks, links, pictures, breaks and notes among them): each text's
+ * disclosure tree is the reference's, and stays so over three round trips, the Markdown settled. The
+ * generator has a full period, so each seed draws its own texts; the distinct ones are counted. Fast
+ * mode runs one seed of 1,000 texts, the full run three of 10,000.
+ */
+async function runMarkdownDisclosureReferenceTests(): Promise<GenFeatureTest[]> {
+    const perSeed = FAST_MODE ? 1_000 : 10_000;
+    const seeds = FAST_MODE ? [1] : [1, 2, 3];
+    const results: GenFeatureTest[] = [];
+    for (const seed of seeds) {
+        const started = Date.now();
+        const { checked, outOfDomain, distinct, reasons, mismatches, unstable } = await checkDisclosureReference(
+            markdown => OfficeParser.parseOffice(Buffer.from(markdown), { fileType: 'md' }),
+            async ast => String((await ast.to('md')).value), perSeed, seed);
+        const failures = [...mismatches, ...unstable];
+        console.log(`\n    seed ${seed}: ${perSeed} texts, ${distinct} distinct, ${checked} in the reference's domain, ${mismatches.length} differ, ${unstable.length} unsettled`);
+        results.push({
+            category: 'Markdown Disclosures', feature: `disclosure trees are the reference's and keep over three round trips (seed ${seed}: ${perSeed} texts, ${distinct} distinct, ${checked} in its domain)`,
+            sourceFormat: 'md', destFormat: 'md',
+            result: {
+                status: failures.length ? 'FAIL' : 'PASS', expected: 'no difference',
+                actual: failures.length ? `${mismatches.length} differ, ${unstable.length} unsettled` : 'none',
+                details: failures.length ? failures.slice(0, 3).join('\n') : `${outOfDomain} texts out of its domain: ${JSON.stringify(reasons)}`, duration: Date.now() - started,
+            },
+        });
+    }
+    return results;
+}
+
+/**
+ * Disclosures from the AST through Markdown and HTML and back (test/helpers/disclosureAstRoundTrip.ts):
+ * random ASTs of disclosures whose summaries hold every kind of content (formatting, links, notes, line
+ * breaks, headings, tables, lists, nested disclosures), whose bodies hold every block kind, and which
+ * stand in list items and table cells too, written and read back over three passes (HTML four): the same
+ * disclosure tree after every pass, no word or note lost, the output settled. Fast mode draws 2,000 ASTs
+ * for Markdown and 500 for HTML, the full run 20,000 and 3,000.
+ */
+async function runDisclosureAstRoundTripTests(): Promise<GenFeatureTest[]> {
+    const results: GenFeatureTest[] = [];
+    for (const [format, count] of [['md', FAST_MODE ? 2_000 : 20_000], ['html', FAST_MODE ? 500 : 3_000]] as const) {
+        const started = Date.now();
+        const result = await checkDisclosureAstRoundTrip(
+            async ast => String((await OfficeGenerator.generate(ast, format, format === 'html' ? { htmlConfig: { standalone: false } } : undefined)).value),
+            output => OfficeParser.parseOffice(Buffer.from(output), { fileType: format }),
+            async ast => String((await ast.to('text')).value), count, 1, format === 'html' ? 4 : 3);
+        const failed = result.treeDiffers + result.wordsLost + result.notesLost + result.unsettled;
+        console.log(`\n    ${format}: ${count} ASTs, ${result.distinct} distinct, ${result.treeDiffers} trees differ, ${result.wordsLost} lose words, ${result.notesLost} lose notes, ${result.unsettled} unsettled`);
+        results.push({
+            category: 'Markdown Disclosures', feature: `disclosures from the AST through ${format} and back keep their tree, words and notes (${count} ASTs, ${result.distinct} distinct)`,
+            sourceFormat: 'synthetic', destFormat: format,
+            result: {
+                status: failed ? 'FAIL' : 'PASS', expected: 'no difference',
+                actual: failed ? `${result.treeDiffers} trees differ, ${result.wordsLost} lose words, ${result.notesLost} lose notes, ${result.unsettled} unsettled` : 'none',
+                details: result.failures.join('\n').slice(0, 6000), duration: Date.now() - started,
+            },
+        });
+    }
+    return results;
+}
+
+/**
+ * No line of Markdown is lost (test/helpers/markdownLineLoss.ts): random texts of quotes, list markers,
+ * empty items, blank and quoted blank lines, indented and leading blank lines, disclosure tags, summaries,
+ * divs, headings and setext lines keep every word in their text, and after a Markdown round trip. The
+ * generator has a full period, so each seed draws its own texts; the distinct ones are counted. Fast mode
+ * runs one seed of 4,000 texts, the full run three of 10,000.
+ */
+async function runMarkdownLineLossTests(): Promise<GenFeatureTest[]> {
+    const perSeed = FAST_MODE ? 4_000 : 10_000;
+    const seeds = FAST_MODE ? [1] : [1, 2, 3];
+    const results: GenFeatureTest[] = [];
+    for (const seed of seeds) {
+        const started = Date.now();
+        const result = await checkMarkdownLineLoss(
+            markdown => OfficeParser.parseOffice(Buffer.from(markdown), { fileType: 'md' }),
+            async ast => String((await ast.to('text')).value),
+            async ast => String((await ast.to('md')).value), perSeed, seed);
+        const failed = result.lost + result.lostAfterRoundTrip;
+        console.log(`\n    seed ${seed}: ${perSeed} texts, ${result.distinct} distinct, ${result.lost} lose words, ${result.lostAfterRoundTrip} lose words after the round trip, ${result.joined} with a word joined`);
+        results.push({
+            category: 'Markdown Lines', feature: `no word of a Markdown text is lost, read or written back (seed ${seed}: ${perSeed} texts, ${result.distinct} distinct)`,
+            sourceFormat: 'md', destFormat: 'md',
+            result: {
+                status: failed ? 'FAIL' : 'PASS', expected: 'no word lost',
+                actual: failed ? `${result.lost} lose words, ${result.lostAfterRoundTrip} after the round trip` : 'none',
+                details: failed ? result.failures.join('\n') : `${result.joined} texts with a word joined (a <summary> outside any disclosure)`, duration: Date.now() - started,
+            },
+        });
+    }
+    return results;
+}
+
+/**
+ * List items and table cells written as HTML in Markdown keep what they hold (test/helpers/htmlPathRoundTrip.ts):
+ * random ASTs of list items holding a disclosure and tables with a merged cell, holding every node kind,
+ * written as Markdown and read back three times: no word lost or joined, no anchor id lost, the Markdown
+ * settled. The generator has a full period, so each seed draws its own ASTs; the distinct ones are
+ * counted. Fast mode runs one seed of 1,000 ASTs, the full run twelve of 2,000.
+ */
+async function runHtmlPathRoundTripTests(): Promise<GenFeatureTest[]> {
+    const perSeed = FAST_MODE ? 1_000 : 2_000;
+    const seeds = FAST_MODE ? [1] : Array.from({ length: 12 }, (_, i) => i + 1);
+    const results: GenFeatureTest[] = [];
+    for (const seed of seeds) {
+        const started = Date.now();
+        const result = await checkHtmlPathRoundTrip(
+            async ast => String((await OfficeGenerator.generate(ast, 'md')).value),
+            markdown => OfficeParser.parseOffice(Buffer.from(markdown), { fileType: 'md' }),
+            async ast => String((await ast.to('text')).value), perSeed, seed);
+        const failed = result.lost + result.joined + result.anchorsLost + result.unsettled;
+        const allKinds = result.kinds === HTML_PATH_KINDS.length;
+        console.log(`\n    seed ${seed}: ${perSeed} ASTs, ${result.distinct} distinct, ${result.kinds} of ${HTML_PATH_KINDS.length} kinds, ${result.lost} lose words, ${result.joined} join words, ${result.anchorsLost} lose anchors, ${result.unsettled} unsettled`);
+        results.push({
+            category: 'Markdown HTML Items and Cells', feature: `list items and cells written as HTML keep every node kind over three round trips (seed ${seed}: ${perSeed} ASTs, ${result.distinct} distinct)`,
+            sourceFormat: 'synthetic', destFormat: 'md',
+            result: {
+                status: failed || !allKinds ? 'FAIL' : 'PASS', expected: `no difference, all ${HTML_PATH_KINDS.length} kinds drawn`,
+                actual: failed || !allKinds ? `${result.lost} lose words, ${result.joined} join words, ${result.anchorsLost} lose anchors, ${result.unsettled} unsettled, ${result.kinds} kinds` : 'none',
+                details: result.failures.join('\n').slice(0, 6000), duration: Date.now() - started,
+            },
+        });
+    }
+    return results;
+}
+
+/**
  * The spreadsheet viewer (HTML output of a workbook) in hosts that limit it: a frame with scripts but no
  * storage, where any localStorage access throws, and a host with scripts off, where the sheet tabs switch
  * by CSS `:target` alone. What a browser does with these was checked in one; here, what the HTML says.
@@ -3224,6 +3394,36 @@ async function runAllTests(): Promise<void> {
     const spreadsheetViewerResults = await runSpreadsheetViewerTests();
     allResults.push(...spreadsheetViewerResults);
     console.log(spreadsheetViewerResults.filter(r => r.result.status === 'FAIL').length > 0 ? ' \u2717' : ' \u2713');
+
+    // Template readings against plain references on random inputs
+    process.stdout.write('  template properties...');
+    const templatePropertyResults = await runTemplatePropertyTests();
+    allResults.push(...templatePropertyResults);
+    console.log(templatePropertyResults.filter(r => r.result.status === 'FAIL').length > 0 ? ' \u2717' : ' \u2713');
+
+    // Markdown disclosures against a plain reference on random inputs
+    process.stdout.write('  markdown disclosure reference...');
+    const disclosureReferenceResults = await runMarkdownDisclosureReferenceTests();
+    allResults.push(...disclosureReferenceResults);
+    console.log(disclosureReferenceResults.filter(r => r.result.status === 'FAIL').length > 0 ? ' \u2717' : ' \u2713');
+
+    // Disclosures from the AST through Markdown and HTML and back, on random ASTs
+    process.stdout.write('  disclosure AST round trip...');
+    const disclosureRoundTripResults = await runDisclosureAstRoundTripTests();
+    allResults.push(...disclosureRoundTripResults);
+    console.log(disclosureRoundTripResults.filter(r => r.result.status === 'FAIL').length > 0 ? ' \u2717' : ' \u2713');
+
+    // No line of Markdown lost, on random texts of quotes, list markers and blank lines
+    process.stdout.write('  markdown line loss...');
+    const lineLossResults = await runMarkdownLineLossTests();
+    allResults.push(...lineLossResults);
+    console.log(lineLossResults.filter(r => r.result.status === 'FAIL').length > 0 ? ' \u2717' : ' \u2713');
+
+    // List items and cells written as HTML in Markdown, on random ASTs of every node kind
+    process.stdout.write('  markdown HTML items and cells...');
+    const htmlPathResults = await runHtmlPathRoundTripTests();
+    allResults.push(...htmlPathResults);
+    console.log(htmlPathResults.filter(r => r.result.status === 'FAIL').length > 0 ? ' \u2717' : ' \u2713');
 
     // Degrade fidelity: over-cap images, unembeddable pictures, notes, OCR line breaks
     process.stdout.write('  degrade fidelity...');

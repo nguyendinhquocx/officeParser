@@ -1,4 +1,5 @@
 import { zipSync, Zippable } from 'fflate';
+import { openedDisclosure } from '../utils/disclosures.js';
 import { UniqueNames } from '../utils/uniqueNames.js';
 import { clampInt } from '../utils/numberUtils.js';
 import { layoutTableRows } from '../utils/tableLayout.js';
@@ -9,7 +10,8 @@ import { escapeXml, isSafeStyleMapTag, sanitizeOfficePackageUrl, stripInvalidXml
 import { heldColumns } from '../utils/columnUtils.js';
 import { onDocumentPage } from '../utils/pageLimits.js';
 import { ADMONITION_COLOR, decodeBase64, embedUrl, encUrl, fillSheetRowGaps, hexColor, isHeaderRow, furnitureKind, lengthToPt, MIME_EXT, odfUserDefinedXml, resolvePaper, resolveZipInstant, runningFurniture, sectionFurniture, sectionFurnitureIndex, sniffImageSize, toBookmarkNameRaw, toW3CDTF, writableSpacing } from '../utils/officeGenUtils.js';
-import { markerPattern, MarkerPattern, odfNumFormat } from '../utils/listMarkers.js';
+import { formatListNumber, markerPattern, MarkerPattern, odfNumFormat } from '../utils/listMarkers.js';
+import { customNoteMark } from '../utils/noteMarks.js';
 import { BaseGenerator } from './BaseGenerator.js';
 import { lookupTable } from '../utils/lookupUtils.js';
 
@@ -188,7 +190,9 @@ export class OdtGenerator extends BaseGenerator<'odt'> {
     private commentCounter = 0;
     private footnoteOrd = 0;
     /** Where each note was written: its id and number, in each part (by the part's style registry) it is written in. */
-    private readonly writtenNotes = new Map<OfficeContentNode, { id: string; ord: number; cls: 'footnote' | 'endnote'; part: StyleRegistry }[]>();
+    private readonly writtenNotes = new Map<OfficeContentNode, { id: string; ord: number; cls: 'footnote' | 'endnote'; part: StyleRegistry; mark?: string }[]>();
+    /** How many footnotes and endnotes were written, their ids' numbers (a note with a custom mark takes an id, not a number). */
+    private readonly notesWritten = { footnote: 0, endnote: 0 };
     private endnoteOrd = 0;
 
     private usedBookmarkNames = new UniqueNames();
@@ -394,6 +398,10 @@ export class OdtGenerator extends BaseGenerator<'odt'> {
                 return `<text:p>${await this.renderInline([node])}</text:p>`;
             case 'page': case 'slide': case 'drawing': case 'definitionList':
                 return this.renderBlocks(node.children);
+            // (Opened before any writer but HTML's and Markdown's sees it, see disclosures: its summary in bold, then its body.)
+            case 'disclosure': return this.renderBlocks(openedDisclosure(node));
+            // (A disclosure's summary is written by its disclosure; one standing alone is its blocks.)
+            case 'summary': return this.renderBlocks(node.children);
             case 'slideMaster': return ''; // template furniture, dropped
             default: {
                 const _exhaustive: never = node;
@@ -668,14 +676,25 @@ export class OdtGenerator extends BaseGenerator<'odt'> {
         // the same number.
         const written = this.writtenNotes.get(node);
         const writtenHere = written?.find(w => w.part === this.activeStyles);
-        if (writtenHere) return `<text:note-ref text:note-class="${writtenHere.cls}" text:reference-format="text" text:ref-name="${writtenHere.id}">${writtenHere.ord}</text:note-ref>`;
-        const ord = written ? written[0].ord : cls === 'footnote' ? ++this.footnoteOrd : ++this.endnoteOrd;
-        const id = `${cls === 'footnote' ? 'ftn' : 'edn'}${ord}${written ? `_${written.length + 1}` : ''}`;
-        const entry = { id, ord, cls, part: this.activeStyles };
+        if (writtenHere) return `<text:note-ref text:note-class="${writtenHere.cls}" text:reference-format="text" text:ref-name="${writtenHere.id}">${writtenHere.mark !== undefined ? escapeXml(stripInvalidXmlChars(writtenHere.mark)) : this.citationOf(writtenHere.cls, writtenHere.ord)}</text:note-ref>`;
+        // A mark the author chose (`*`) is the citation's label, and the note takes no number.
+        const mark = written ? written[0].mark : customNoteMark(node);
+        const ord = written ? written[0].ord : mark !== undefined ? (cls === 'footnote' ? this.footnoteOrd : this.endnoteOrd) : cls === 'footnote' ? ++this.footnoteOrd : ++this.endnoteOrd;
+        const seq = written ? undefined : ++this.notesWritten[cls];
+        const id = written ? `${written[0].id}_${written.length + 1}` : `${cls === 'footnote' ? 'ftn' : 'edn'}${seq}`;
+        const entry = { id, ord, cls, part: this.activeStyles, mark };
         if (written) written.push(entry);
         else this.writtenNotes.set(node, [entry]);
         const body = this.styleNoteBody((await this.renderBlocks(this.bodyBlocks(node))) || '<text:p/>');
-        return `<text:note text:id="${id}" text:note-class="${cls}"><text:note-citation>${ord}</text:note-citation><text:note-body>${body}</text:note-body></text:note>`;
+        const citation = mark !== undefined
+            ? `<text:note-citation text:label="${escapeXml(stripInvalidXmlChars(mark))}">${escapeXml(stripInvalidXmlChars(mark))}</text:note-citation>`
+            : `<text:note-citation>${this.citationOf(cls, ord)}</text:note-citation>`;
+        return `<text:note text:id="${id}" text:note-class="${cls}">${citation}<text:note-body>${body}</text:note-body></text:note>`;
+    }
+
+    /** A note's number as LibreOffice shows it by default (the citation is its cached text): footnotes 1, 2, 3, endnotes i, ii, iii. */
+    private citationOf(cls: 'footnote' | 'endnote', ord: number): string {
+        return cls === 'endnote' ? formatListNumber(ord, 'lowerRoman') : String(ord);
     }
 
     private styleNoteBody(body: string): string {
@@ -1222,7 +1241,7 @@ export class OdtGenerator extends BaseGenerator<'odt'> {
         return map[tag.toLowerCase()];
     }
     private knownParaStyle(style: string | undefined): string | undefined {
-        const map: Record<string, string> = lookupTable({ Quote: 'Quotations', IntenseQuote: 'Quotations', Title: 'Title', Code: 'Preformatted_20_Text' });
+        const map: Record<string, string> = lookupTable({ Quote: 'Quotations', IntenseQuote: 'Quotations', Title: 'Title', Code: 'Preformatted_20_Text', Caption: 'Caption' });
         return style ? map[style] : undefined;
     }
 
@@ -1365,6 +1384,8 @@ const NAMED_STYLES = (() => {
         + heading(1, 18) + heading(2, 16) + heading(3, 14) + heading(4, 13) + heading(5, 12) + heading(6, 12)
         + `<style:style style:name="Title" style:family="paragraph" style:parent-style-name="Standard"><style:text-properties fo:font-weight="bold" fo:font-size="28pt" style:font-size-asian="28pt"/></style:style>`
         + `<style:style style:name="Quotations" style:family="paragraph" style:parent-style-name="Standard"><style:paragraph-properties fo:margin-left="0.5in" fo:margin-right="0.5in"/><style:text-properties fo:font-style="italic" style:font-style-asian="italic"/></style:style>`
+        // LibreOffice's own caption style (a picture's caption is written so).
+        + `<style:style style:name="Caption" style:family="paragraph" style:parent-style-name="Standard" style:class="extra"><style:paragraph-properties fo:margin-top="0.0835in" fo:margin-bottom="0.0835in"/><style:text-properties fo:font-size="10pt" fo:font-style="italic" style:font-style-asian="italic"/></style:style>`
         + `<style:style style:name="Preformatted_20_Text" style:display-name="Preformatted Text" style:family="paragraph" style:parent-style-name="Standard"><style:paragraph-properties fo:background-color="#f5f5f5"/><style:text-properties style:font-name="Courier New"/></style:style>`
         + `<style:style style:name="Footnote" style:family="paragraph" style:parent-style-name="Standard"><style:text-properties fo:font-size="10pt" style:font-size-asian="10pt"/></style:style>`;
 })();

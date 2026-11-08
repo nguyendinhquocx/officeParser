@@ -189,6 +189,12 @@
         <code>before</code> and <code>after</code> in points, <code>lineMultiple</code> for proportional line spacing,
         or <code>lineHeight</code> in points, with <code>lineAtLeast</code> for a least height). A PDF paragraph whose
         text is turned on its page has <code>rotation</code> (degrees clockwise).</p>
+    <p>A quoted paragraph is a <code>paragraph</code> with <code>style: 'Quote'</code>. The paragraphs of one quote of
+        several (Markdown <code>&gt; a</code>, <code>&gt;</code>, <code>&gt; b</code>; HTML
+        <code>&lt;blockquote&gt;&lt;p&gt;a&lt;/p&gt;&lt;p&gt;b&lt;/p&gt;&lt;/blockquote&gt;</code>; a LaTeX
+        <code>quote</code> environment) share <code>ParagraphMetadata.quoteId</code>: adjacent paragraphs with the same
+        id are written back as one quote where the format has one (HTML and EPUB, Markdown, LaTeX). Quote paragraphs
+        without one (a word processor's Quote style) are each a quote of their own.</p>
 
     <h3>2b. Pages and Sections</h3>
     <p><code>ast.metadata.pageSetup</code> (a <code>PageSetup</code>: <code>width</code>, <code>height</code>,
@@ -292,6 +298,19 @@
 
     <h3>4b. Annotation Nodes</h3>
     <ul>
+        <li><strong><code>note</code></strong>: A footnote or endnote, attached to the run that cites it via
+            <code>node.notes[]</code>. Carries <code>NoteMetadata</code>: <code>noteType</code>
+            (<code>'footnote' | 'endnote'</code>), <code>noteId</code> (the source's internal key, such as DOCX's
+            <code>w:id</code> or ODT's <code>ftn1</code>, which writers use in ids and links and never show), and
+            <code>mark</code>, the mark the reference shows where the source records one (ODT's number as the
+            document's <code>text:notes-configuration</code> gives it, or a section's own where that numbers the
+            section's notes, format and start value, as LibreOffice shows it; for footnotes the document numbers
+            per page or chapter, and for a note in a text box, drawing, header, footer, comment or another note,
+            the cached <code>text:note-citation</code>; the text of an HTML or EPUB note reference). <code>customMark: true</code>
+            says the author chose that mark (<code>*</code>: ODT's <code>text:label</code>, DOCX's
+            <code>w:customMarkFollows</code>); DOCX and ODT write it as their own custom mark. Where no mark is
+            recorded, writers show the note's ordinal within its kind: footnotes <code>1, 2, 3</code>, endnotes
+            <code>i, ii, iii</code>.</li>
         <li><strong><code>comment</code></strong>: An inline comment or annotation attached to a document node via
             <code>node.comments[]</code>. Carries <code>CommentMetadata</code>: <code>author</code>,
             <code>initials</code>, <code>date</code>, <code>commentId</code>, and for a reply in a PowerPoint
@@ -319,11 +338,26 @@
             <strong><code>definitionDescription</code></strong>: Markdown Extra-style definition lists
             (<code>Term\n: Definition</code>). The list node's <code>children</code> alternate term and
             description nodes. Each may carry <code>DefinitionMetadata.anchorIds</code>.</li>
+        <li><strong><code>disclosure</code></strong>: A block a reader opens and closes (HTML <code>&lt;details&gt;</code>,
+            in HTML, EPUB and Markdown, where it is that HTML block with Markdown inside). Carries
+            <code>DisclosureMetadata</code>: <code>open</code> and <code>anchorIds</code>. Its <code>children</code> are its
+            summary, a <code>summary</code> node first where it has one, then the blocks it shows when open. Written back as
+            <code>&lt;details&gt;</code> in HTML, EPUB and Markdown (a Markdown list item or table holding one is written as
+            HTML); every other writer writes its summary in bold followed by its body, all shown.</li>
+        <li><strong><code>summary</code></strong>: A disclosure's summary (<code>&lt;summary&gt;</code>), what it shows while
+            closed: its first child, with no metadata. Its <code>children</code> are blocks, as <code>&lt;summary&gt;</code>
+            holds any content: a paragraph for a line of text (its formatting, links, pictures, notes and line breaks kept),
+            and headings, lists, tables or a nested disclosure. A disclosure with none is shown as "Details". Markdown writes
+            a line of plain text as <code>&lt;summary&gt;text&lt;/summary&gt;</code> and anything else as Markdown between a
+            <code>&lt;summary&gt;</code> line and a <code>&lt;/summary&gt;</code> line; formats without the block write its
+            paragraphs' text in bold and its other blocks as they are.</li>
         <li><strong><code>list</code></strong> task-list items: <code>ListMetadata.isTask</code> and
             <code>.checked</code> mark a GFM task-list item (<code>- [x] Done</code>).</li>
         <li>Text-node metadata additions: <code>TextMetadata.citationKey</code> (Pandoc/MultiMarkdown
             <code>[@key]</code>), <code>.wikilink</code> (Obsidian <code>[[page]]</code>), and
-            <code>.abbreviationTitle</code> (Markdown Extra <code>*[HTML]: ...</code> abbreviations).</li>
+            <code>.abbreviationTitle</code> (Markdown Extra <code>*[HTML]: ...</code> abbreviations), and
+            <code>TextFormatting.keyboard</code> for keyboard input (<code>&lt;kbd&gt;</code>, read with
+            <code>font: 'monospace'</code> so formats without the notion write it as code).</li>
         <li><strong>Equations</strong> are <code>code</code> nodes carrying
             <code>CodeMetadata.math</code> (<code>'inline' | 'block'</code>), with
             <code>node.text</code> holding bare LaTeX. Every format that can carry an equation
@@ -339,7 +373,12 @@
         <li><strong><code>image</code></strong>: References an item in the root <code>attachments</code> array via
             <code>metadata.attachmentName</code>. Also carries optional <code>width</code> and
             <code>align</code> (<code>'left' | 'center' | 'right'</code>), round-tripped from HTML
-            <code>data-width</code>/<code>data-align</code> or an inline <code>style="width:..."</code>. An image
+            <code>data-width</code>/<code>data-align</code> or an inline <code>style="width:..."</code>. A picture
+            with a caption (an HTML or EPUB <code>&lt;figure&gt;</code>'s <code>&lt;figcaption&gt;</code> of plain text)
+            carries it as <code>caption</code>: a figure again in HTML, EPUB and Markdown (an HTML
+            <code>&lt;figure&gt;</code> block), a caption paragraph (<code>style: 'Caption'</code>) after the picture in
+            every other format. The caption is written in every <code>includeImages</code> mode,
+            <code>'none'</code> included. An image
             that is a link (a badge, a clickable picture) carries <code>link</code>, <code>linkType</code>
             (<code>'internal' | 'external'</code>) and an optional <code>linkTitle</code>, as a linked run
             carries them on <code>TextMetadata</code>.</li>

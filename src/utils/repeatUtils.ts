@@ -22,6 +22,13 @@ export const REPEAT_ALLOWANCE = 64;
 const DEFAULT_MAX_REPEATED_CONTENT = 16 * 1024 * 1024;
 
 /**
+ * What a workbook's cell showing a shared string again may weigh past REPEAT_ALLOWANCE without charge,
+ * while the document's REPEATED_CELL_CHARACTERS_PER_BYTE last (see budgetUtils): a cell of a few rich runs
+ * (text, runs, their fonts and colours, the cell's fill) weighs two to four hundred.
+ */
+export const CELL_REPEAT_ALLOWANCE = 128;
+
+/**
  * What one parse may repeat in all: `decompressionLimits.maxRepeatedContent` (16 MB by default), plus
  * REPEATED_CHARACTERS_PER_BYTE for each byte of the document (see budgetUtils).
  */
@@ -65,13 +72,6 @@ export const valuesLength = (values: object | undefined): number => {
     return length;
 };
 
-/** The start of `text` a copy past the budget keeps: REPEAT_ALLOWANCE characters, not splitting a surrogate pair. */
-export const repeatPreview = (text: string): string => {
-    if (text.length <= REPEAT_ALLOWANCE) return text;
-    const code = text.charCodeAt(REPEAT_ALLOWANCE - 1);
-    return text.slice(0, code >= 0xD800 && code <= 0xDBFF ? REPEAT_ALLOWANCE - 1 : REPEAT_ALLOWANCE) + '…';
-};
-
 /** Formatting values a style gives every run it applies to. */
 const FORMATTING_VALUES = ['font', 'color', 'backgroundColor', 'size'] as const;
 /**
@@ -80,6 +80,84 @@ const FORMATTING_VALUES = ['font', 'color', 'backgroundColor', 'size'] as const;
  * values: without them a reference breaks.
  */
 const METADATA_VALUES = ['link', 'linkTitle', 'title', 'style', 'altText', 'author', 'initials', 'date', 'abbreviationTitle', 'backgroundColor', 'language', 'citationKey', 'label'] as const;
+
+const BOUNDED = { formatting: new Set<string>(FORMATTING_VALUES), metadata: new Set<string>(METADATA_VALUES) };
+
+/**
+ * What a value weighs on a fresh copy (a node made for the copy, holding a value an earlier node holds).
+ * boundRepeatedValues charges a value of a key it bounds (FORMATTING_VALUES, METADATA_VALUES) past
+ * REPEAT_ALLOWANCE characters on every node holding it but the first it meets, so the copy's own charge
+ * carries the rest of it, REPEAT_ALLOWANCE at most; any other string, which boundRepeatedValues never
+ * charges, it carries whole. So each character of each value a copy writes is charged once: left to
+ * boundRepeatedValues alone, a value of 64 characters or less was charged by neither, and 2,000 cells
+ * styled over one rich string of 500 runs wrote 13 times the budget as HTML.
+ */
+export const freshValueLength = (field: 'formatting' | 'metadata', key: string, value: unknown): number =>
+    typeof value !== 'string' ? 0 : BOUNDED[field].has(key) ? Math.min(value.length, REPEAT_ALLOWANCE) : value.length;
+
+/** What the values an object holds directly weigh on a fresh copy; see freshValueLength. */
+export const freshValuesLength = (field: 'formatting' | 'metadata', values: object | undefined): number => {
+    let length = 0;
+    if (values) for (const key in values) length += freshValueLength(field, key, (values as Record<string, unknown>)[key]);
+    return length;
+};
+
+/** The style flags a writer writes a tag pair for around a node's text (`<strong>`, `\textbf{}`, `\b ... \b0`, `"bold":true`). */
+const STYLE_FLAGS = ['bold', 'italic', 'underline', 'strikethrough', 'superscript', 'subscript', 'invisible'] as const;
+
+/**
+ * What a node's style flags weigh: 8 for each one set. A flag is no string, so it weighed nothing, while
+ * every writer writes it with each copy of the node: a cell of 2,000 one-letter spans in four styles,
+ * repeated, wrote 4.6 times the repeated content budget as JSON.
+ */
+export const flagsWeight = (formatting: object | undefined): number => {
+    let weight = 0;
+    if (formatting) for (const flag of STYLE_FLAGS) if ((formatting as Record<string, unknown>)[flag] === true) weight += 8;
+    return weight;
+};
+
+/** Weighs node lists; see contentWeigher. */
+export type ContentWeigher = (nodes: OfficeContentNode[] | undefined) => number;
+
+/**
+ * A weigher of shared content: what one more path to `nodes` writes. For each node, 16 for the node
+ * itself (a generator spends on a node what it spends on a dozen or two characters of text), its text,
+ * its formatting and metadata values (a style's 64 KB font is written with every copy), its style flags
+ * (see flagsWeight), and its children, comments and notes. Counted along every path, as a generator writes a shared node each
+ * time it meets it (a nested table's repeated cells share their content), and memoized per node and
+ * per list so a shared subtree is summed once.
+ *
+ * It is the weight of content a copy shares (the same node objects), whose values boundRepeatedValues
+ * sees once: the copy's charge must carry them. A copy made of fresh node objects is charged its text,
+ * its nodes and flags, and its values as freshValuesLength weighs them.
+ */
+export const contentWeigher = (): ContentWeigher => {
+    const weights = new WeakMap<object, number>();
+    const weigh: ContentWeigher = nodes => {
+        if (!nodes || nodes.length === 0) return 0;
+        let total = weights.get(nodes);
+        if (total !== undefined) return total;
+        total = 0;
+        for (const node of nodes) {
+            let weight = weights.get(node);
+            if (weight === undefined) {
+                weight = 16 + (node.text?.length ?? 0) + valuesLength(node.formatting) + flagsWeight(node.formatting) + valuesLength(node.metadata) + weigh(node.children) + weigh(node.comments) + weigh(node.notes);
+                weights.set(node, weight);
+            }
+            total += weight;
+        }
+        weights.set(nodes, total);
+        return total;
+    };
+    return weigh;
+};
+
+/** The start of `text` a copy past the budget keeps: REPEAT_ALLOWANCE characters, not splitting a surrogate pair. */
+export const repeatPreview = (text: string): string => {
+    if (text.length <= REPEAT_ALLOWANCE) return text;
+    const code = text.charCodeAt(REPEAT_ALLOWANCE - 1);
+    return text.slice(0, code >= 0xD800 && code <= 0xDBFF ? REPEAT_ALLOWANCE - 1 : REPEAT_ALLOWANCE) + '…';
+};
 
 /** The longest attachment name kept as it is (a longer one is shortened; see boundRepeatedValues). */
 const MAX_ATTACHMENT_NAME = 128;

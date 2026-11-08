@@ -28,8 +28,8 @@ import { extractChartData } from '../utils/chartUtils.js';
 import { checkAbortSignal, logWarning } from '../utils/errorUtils.js';
 import { createAttachment } from '../utils/imageUtils.js';
 import { ocrDuringParse } from '../utils/ocrUtils.js';
-import { attachmentLookup, repeatPreview, takeRepeats, valuesLength } from '../utils/repeatUtils.js';
-import { documentBytesOf, TABLE_CELLS_PER_BYTE } from '../utils/budgetUtils.js';
+import { attachmentLookup, CELL_REPEAT_ALLOWANCE, flagsWeight, freshValueLength, freshValuesLength, REPEAT_ALLOWANCE, repeatPreview, takeRepeats, valuesLength } from '../utils/repeatUtils.js';
+import { documentBytesOf, REPEATED_CELL_CHARACTERS_PER_BYTE, TABLE_CELLS_PER_BYTE } from '../utils/budgetUtils.js';
 import { chargeRawContent, decodeXmlEntities, getChildElements, getElementsByTagName, parseOfficeMetadata, parseOOXMLAppProperties, parseOOXMLCustomProperties, parseXmlString, takeNodes } from '../utils/xmlUtils.js';
 import { MAX_COL_SPAN, MAX_ROW_SPAN } from '../utils/numberUtils.js';
 import { BUILTIN_NUMBER_FORMATS, BUILTIN_OTHER_FORMATS, excelShownText } from '../utils/excelFormat.js';
@@ -360,6 +360,92 @@ const formatDateSerial = (value: string, kind: DateFormatKind, date1904: boolean
     return kind === 'date' ? date : `${date} ${time}`;
 };
 
+/** A cell's hyperlink, given to the text runs it shows. */
+type CellLink = { link: string; linkType: 'internal' | 'external' };
+
+/** The values a cell's style gives the runs of a rich string it shows: its background and alignment always, its font and size where a run has none (see restyledRuns). */
+const STYLE_GIVES = ['backgroundColor', 'alignment', 'font', 'size'] as const;
+
+/**
+ * What a rich shared string's runs weigh beyond their text: 16 a run and its style flags (see
+ * flagsWeight); its runs' formatting and metadata values whole (`shared`), and those of its runs other
+ * than text runs (`kept`: a link copies only text runs); the same values as a copy of the runs carries
+ * them (`fresh`, and `freshText` for its `textRuns` text runs: see freshValuesLength); and for each value
+ * a cell's style gives the runs (STYLE_GIVES), what the runs' own values of it weigh (`own`) and how
+ * many runs have none (`missing`).
+ */
+export type RichRunWeight = {
+    runs: number; shared: number; kept: number; fresh: number; freshText: number; textRuns: number;
+    own: Partial<Record<typeof STYLE_GIVES[number], number>>; missing: Partial<Record<typeof STYLE_GIVES[number], number>>;
+};
+
+/** Weighs a rich shared string's runs once, for every cell showing it; see RichRunWeight. */
+export const richRunWeight = (runs: OfficeContentNode[]): RichRunWeight => {
+    const weight: RichRunWeight = { runs: 0, shared: 0, kept: 0, fresh: 0, freshText: 0, textRuns: 0, own: {}, missing: {} };
+    for (const run of runs) {
+        const values = valuesLength(run.formatting) + valuesLength(run.metadata);
+        const fresh = freshValuesLength('formatting', run.formatting) + freshValuesLength('metadata', run.metadata);
+        weight.runs += 16 + flagsWeight(run.formatting);
+        weight.shared += values;
+        weight.fresh += fresh;
+        if (run.type !== 'text') weight.kept += values;
+        else { weight.freshText += fresh; weight.textRuns++; }
+        for (const key of STYLE_GIVES) {
+            const value = (run.formatting as Record<string, unknown> | undefined)?.[key];
+            if (value) weight.own[key] = (weight.own[key] ?? 0) + freshValueLength('formatting', key, value);
+            else weight.missing[key] = (weight.missing[key] ?? 0) + 1;
+        }
+    }
+    return weight;
+};
+
+/**
+ * The values one more cell showing a rich string writes with its runs, from the string's weight alone (a
+ * refused cell builds no runs to be weighed): whole where the cell shares the runs; where its style
+ * (`restyle`) or its link makes copies of them, each copy as restyledRuns and linkedRuns build it,
+ * weighed as fresh copies are (freshValuesLength).
+ */
+export const richCopyValues = (weight: RichRunWeight, runCount: number, restyle: TextFormatting | undefined, link: CellLink | undefined): number => {
+    if (!restyle && !link) return weight.shared;
+    const linkValues = link ? weight.textRuns * freshValuesLength('metadata', link) : 0;
+    if (!restyle) return weight.kept + weight.freshText + linkValues;
+    let values = weight.fresh;
+    for (const key of STYLE_GIVES) {
+        const given = (restyle as Record<string, unknown>)[key];
+        if (!given) continue;
+        const each = freshValueLength('formatting', key, given);
+        if (key === 'backgroundColor' || key === 'alignment') values += runCount * each - (weight.own[key] ?? 0);
+        else values += (weight.missing[key] ?? 0) * each;
+    }
+    return values + linkValues;
+};
+
+/**
+ * A rich string's runs as a cell in the style `restyle` shows them: the cell's style under each run's
+ * own, its background and alignment always, its font and size where a run has none. On copies of the
+ * runs, which every cell showing the string shares: merged into them in place, the last cell's style
+ * was every cell's. (richCopyValues weighs these copies from STYLE_GIVES: a key merged here is a key
+ * there.)
+ */
+export const restyledRuns = (runs: OfficeContentNode[], restyle: TextFormatting | undefined): OfficeContentNode[] => {
+    if (!restyle) return runs.slice();
+    const { backgroundColor, alignment, font, size } = restyle;
+    return runs.map(run => ({
+        ...run,
+        formatting: {
+            ...run.formatting,
+            ...(backgroundColor ? { backgroundColor } : {}),
+            ...(alignment ? { alignment } : {}),
+            ...(font && !run.formatting?.font ? { font } : {}),
+            ...(size && !run.formatting?.size ? { size } : {}),
+        },
+    }));
+};
+
+/** A cell's nodes with its hyperlink on its text runs, as a document's links are on theirs (copies of those runs). */
+export const linkedRuns = (nodes: OfficeContentNode[], link: CellLink | undefined): OfficeContentNode[] =>
+    link ? nodes.map(run => run.type === 'text' ? { ...run, metadata: { ...(run.metadata as TextMetadata | undefined), ...link } as TextMetadata } : run) : nodes;
+
 /**
  * Parses an Excel spreadsheet (.xlsx) and extracts sheets, rows, and cells.
  * 
@@ -433,11 +519,17 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
     const richStringText = new Map<number, string>();
     // How many cells have shown each shared string so far.
     const sharedStringUses = new Map<number, number>();
-    // What each rich shared string's runs weigh beyond their text: 16 a run, and its formatting values.
-    // Cells showing the string share its runs, and every writer writes a run's font or colour again in
-    // each cell: counted by run alone, one run of a 64 KB font shown in 7,500 cells (1.8 KB of XLSX)
-    // made 492 MB of HTML.
-    const richStringRunWeight = new Map<number, number>();
+    // What each rich shared string's runs weigh beyond their text (see RichRunWeight). Cells showing the
+    // string share its runs, and every writer writes a run's font or colour again in each cell: counted by
+    // run alone, one run of a 64 KB font shown in 7,500 cells (1.8 KB of XLSX) made 492 MB of HTML. A cell
+    // whose style or link makes copies of the runs is charged their values as a copy's (see
+    // richCopyValues), boundRepeatedValues the rest of each: left to it alone, values of 64 characters or
+    // less were charged by neither, and 2,000 styled cells over 500 runs wrote 13 times the budget as HTML.
+    const richStringRunWeight = new Map<number, RichRunWeight>();
+    // What cells showing a shared string again may still weigh past REPEAT_ALLOWANCE without charge, up to
+    // CELL_REPEAT_ALLOWANCE each (see budgetUtils): each is a cell element of its own, which a flat budget
+    // and one for the zip's bytes did not count, and a workbook of 100,000 such cells (361 KB) lost text.
+    let cellAllowanceLeft = REPEATED_CELL_CHARACTERS_PER_BYTE * documentBytesOf(config);
 
     if (sharedStringsFile) {
         // Read as the sheets are, without building XML elements: a workbook of a million distinct
@@ -954,6 +1046,27 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
                     let value: string | undefined, numberFormat: string | undefined;
                     let cellNodes: OfficeContentNode[] = [];
 
+                    // Parse cell coordinate
+                    const coordMatch = cAttrs.match(/r="([A-Z]+)(\d+)"/);
+                    let colIndex: number;
+                    let ref: string | undefined;
+                    if (coordMatch) {
+                        ref = coordMatch[1] + coordMatch[2];
+                        colIndex = colToNumber(coordMatch[1]);
+                        // If row index is missing in cell coord (unlikely but possible), use rowIndex
+                    } else {
+                        colIndex = lastColIndex + 1;
+                    }
+                    lastColIndex = colIndex;
+
+                    const cellFormatting = (styleIdx !== undefined && cellFormatMap[styleIdx]) ? cellFormatMap[styleIdx] : {};
+                    // The cell's hyperlink, given to its text runs below.
+                    const link = links.get(`${rowIndex}:${colIndex}`);
+                    // Whether the cell's style is merged into rich runs below: then the cell holds copies of the
+                    // runs rather than the runs themselves (and a link copies its text runs). One boolean for the
+                    // charge and the copy, so they cannot disagree.
+                    const restyled = !!(cellFormatting.backgroundColor || cellFormatting.alignment || cellFormatting.font || cellFormatting.size);
+
                     // Shared rich-text runs, merged with this cell's style below (the runs themselves are shared).
                     let sharedRuns: OfficeContentNode[] | undefined;
                     if (type === 's' && vContent !== undefined) {
@@ -966,19 +1079,21 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
                         // 1 MB string in 400 cells made 400 MB of CSV. Past it a cell shows the string's start.
                         const shown = sharedStringUses.get(idx) ?? 0;
                         sharedStringUses.set(idx, shown + 1);
-                        let runWeight = Array.isArray(content) ? richStringRunWeight.get(idx) : 0;
-                        if (runWeight === undefined && Array.isArray(content)) {
-                            runWeight = 0;
-                            for (const run of content) runWeight += 16 + valuesLength(run.formatting) + valuesLength(run.metadata);
-                            richStringRunWeight.set(idx, runWeight);
-                        }
-                        const weight = (joined?.length ?? 0) + (runWeight ?? 0);
-                        if (shown > 0 && takeRepeats(config, 1, weight) === 0) {
+                        let runWeight = Array.isArray(content) ? richStringRunWeight.get(idx) : undefined;
+                        if (runWeight === undefined && Array.isArray(content)) richStringRunWeight.set(idx, runWeight = richRunWeight(content));
+                        // The runs' values as this cell writes them, shared or copied (see richCopyValues).
+                        const runValues = runWeight ? richCopyValues(runWeight, content.length, restyled ? cellFormatting : undefined, link) : 0;
+                        const weight = (joined?.length ?? 0) + (runWeight ? runWeight.runs + runValues : 0);
+                        // (Its share of the cells' allowance, spent only on a copy made.)
+                        const free = shown > 0 ? Math.min(CELL_REPEAT_ALLOWANCE, Math.max(0, weight - REPEAT_ALLOWANCE), cellAllowanceLeft) : 0;
+                        if (shown > 0 && takeRepeats(config, 1, weight - free) === 0) {
                             text = repeatPreview(joined ?? '');
                         } else if (Array.isArray(content)) {
+                            cellAllowanceLeft -= free;
                             sharedRuns = content;
                             text = joined ?? '';
                         } else {
+                            cellAllowanceLeft -= free;
                             text = content || '';
                         }
                     } else if (isContent !== undefined) {
@@ -1027,40 +1142,11 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
                         }
                     }
 
-                    // Parse cell coordinate
-                    const coordMatch = cAttrs.match(/r="([A-Z]+)(\d+)"/);
-                    let colIndex: number;
-                    let ref: string | undefined;
-                    if (coordMatch) {
-                        ref = coordMatch[1] + coordMatch[2];
-                        colIndex = colToNumber(coordMatch[1]);
-                        // If row index is missing in cell coord (unlikely but possible), use rowIndex
-                    } else {
-                        colIndex = lastColIndex + 1;
-                    }
-                    lastColIndex = colIndex;
-
                     if (text || sharedRuns?.length) {
-                        const cellFormatting = (styleIdx !== undefined && cellFormatMap[styleIdx]) ? cellFormatMap[styleIdx] : {};
-
                         if (sharedRuns?.length) {
-                            // The cell's style under each run's own: its background and alignment always
-                            // apply, its font and size where a run has none. On copies of the runs, which
-                            // every cell showing the string shares: merged into them in place, the last
-                            // cell's style was every cell's.
-                            const { backgroundColor, alignment, font, size } = cellFormatting;
-                            cellNodes = backgroundColor || alignment || font || size
-                                ? sharedRuns.map(run => ({
-                                    ...run,
-                                    formatting: {
-                                        ...run.formatting,
-                                        ...(backgroundColor ? { backgroundColor } : {}),
-                                        ...(alignment ? { alignment } : {}),
-                                        ...(font && !run.formatting?.font ? { font } : {}),
-                                        ...(size && !run.formatting?.size ? { size } : {}),
-                                    },
-                                }))
-                                : sharedRuns.slice();
+                            // The cell's style under each run's own (see restyledRuns, whose copies
+                            // richCopyValues weighs from the same key list, STYLE_GIVES).
+                            cellNodes = restyledRuns(sharedRuns, restyled ? cellFormatting : undefined);
                         } else {
                             // Simple text node
                             cellNodes.push({
@@ -1071,8 +1157,7 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
                         }
 
                         // The cell's hyperlink on its runs, as a document's links are on theirs.
-                        const link = links.get(`${rowIndex}:${colIndex}`);
-                        if (link) cellNodes = cellNodes.map(run => run.type === 'text' ? { ...run, metadata: { ...(run.metadata as TextMetadata | undefined), ...link } as TextMetadata } : run);
+                        cellNodes = linkedRuns(cellNodes, link);
 
                         const commentsNodeList = (ref && sheetCommentsMap[ref]) ? sheetCommentsMap[ref] : undefined;
 

@@ -1,4 +1,7 @@
-import { AdmonitionMetadata, AdmonitionSyntax, AttributeListSyntax, BreakMetadata, CitationSyntax, CodeMetadata, ConversionResult, DefinitionListSyntax, DeprecatedAdmonitionFlavor, EmbedMetadata, EmbedSyntax, FallbackToHtmlConfig, FootnoteSyntax, GeneratorConfig, HeadingMetadata, HighlightSyntax, ImageMetadata, ListMetadata, MarkdownDialectConfig, MarkdownDialectPreset, NoteMetadata, OfficeContentNode, OfficeParserAST, OfficeWarningType, StrikethroughSyntax, TableMetadata, TextFormatting, TextMetadata, WikilinkSyntax } from '../types.js';
+import { AdmonitionMetadata, AdmonitionSyntax, AttributeListSyntax, BreakMetadata, CitationSyntax, CodeMetadata, DisclosureMetadata, ConversionResult, DefinitionListSyntax, DeprecatedAdmonitionFlavor, EmbedMetadata, EmbedSyntax, FallbackToHtmlConfig, FootnoteSyntax, GeneratorConfig, HeadingMetadata, HighlightSyntax, ImageMetadata, ListMetadata, MarkdownDialectConfig, MarkdownDialectPreset, NoteMetadata, OfficeContentNode, OfficeParserAST, OfficeWarningType, StrikethroughSyntax, TableMetadata, TextFormatting, TextMetadata, WikilinkSyntax } from '../types.js';
+import { captionOf } from '../utils/figureCaptions.js';
+import { plainSummaryText, summaryLine, summaryOf } from '../utils/disclosures.js';
+import { sameQuote } from '../utils/quoteGroups.js';
 import { escapeHtml, isCssLength, isVideoId, markdownEscapeInline, markdownEscapePlain, markdownEscapeTags, markdownEscapeText, sanitizeCommentText, sanitizeCssValue, sanitizeImageUrl, sanitizeMarkdownUrl, sanitizeUrl } from '../utils/sanitize.js';
 import { isDefaultHighlight } from '../utils/colorUtils.js';
 import { cssListMarker, writtenMarkerLabel } from '../utils/listMarkers.js';
@@ -9,6 +12,7 @@ import { BaseGenerator } from './BaseGenerator.js';
 import { checkAbortSignal } from '../utils/errorUtils.js';
 import { TextBuilder, trimAsciiWhitespace, trimEndChars, trimStartChars } from '../utils/textUtils.js';
 import { appendAll } from '../utils/nodeListUtils.js';
+import { isBlockInParagraph } from '../utils/nodeTypeUtils.js';
 
 /**
  * A fully-resolved dialect: every capability collapsed to its canonical syntax variant (or `'none'`).
@@ -69,7 +73,7 @@ const markdownTitle = (title: unknown): string => ` "${markdownEscapePlain(foldL
 const SEPARATED_BLOCK_TYPES = new Set(['code', 'table', 'sheet', 'slide', 'page', 'embed', 'break']);
 
 /** Nodes that are blocks of their own in Markdown (the parts of a definition list are laid out by it). */
-const BLOCK_NODE_TYPES = new Set(['paragraph', 'heading', 'list', 'table', 'sheet', 'slide', 'page', 'admonition', 'definitionList', 'embed', 'header', 'footer', 'chart', 'drawing', 'slideMaster']);
+const BLOCK_NODE_TYPES = new Set(['paragraph', 'heading', 'list', 'table', 'sheet', 'slide', 'page', 'admonition', 'disclosure', 'summary', 'definitionList', 'embed', 'header', 'footer', 'chart', 'drawing', 'slideMaster']);
 
 /**
  * `text` as a code span: fenced by one backtick more than its longest run of them, and padded with a
@@ -119,9 +123,96 @@ const isBlankRun = (node: OfficeContentNode): boolean =>
     node.type === 'text' && !node.metadata && !node.notes?.length && !node.comments?.length && !trimAsciiWhitespace(node.text ?? '');
 
 /** A block written in the middle of a paragraph's children: a rule, a code block or display math. */
+/** Keyboard input's text inside `<kbd>`: HTML-escaped, its Markdown characters as character references. */
+const keyboardText = (text: string): string =>
+    escapeHtml(text).replace(/[\\`*_[\]~=$|{}]/g, ch => `&#${ch.charCodeAt(0)};`).replace(/[\r\n]+/g, ' ');
+
+/**
+ * A captioned picture: a figure, which is a block, in every image mode (its caption is written in each,
+ * see MarkdownGenerator.pictureParts, so a figure is never empty). Where no block can stand (a list item,
+ * a cell, a definition, a heading), its lines end where it does, as a block's last line is.
+ */
+const isFigure = (node: OfficeContentNode): boolean => node.type === 'image' && !!captionOf(node);
+
+/**
+ * A picture's recognized text as Markdown: one line as text, escaped as a line's start is; several in
+ * a fenced block, verbatim (a scanned page's layout is in its spaces and line breaks), its fence one
+ * backtick longer than any run in it.
+ */
+const ocrMarkdown = (ocr: string): string => {
+    if (!ocr) return '';
+    if (!/[\r\n]/.test(ocr)) return markdownEscapeInline(ocr, true);
+    const fence = '`'.repeat(Math.max(3, Math.max(0, ...(ocr.match(/`+/g) || []).map(run => run.length)) + 1));
+    return `${fence}\n${ocr}\n${fence}`;
+};
+
+/**
+ * A figure's recognized text as lines of text, each escaped as a line's start is: a fence was broken
+ * where a figure's lines are joined (one line of Markdown) or only its first is quoted (a quote paragraph).
+ */
+const ocrTextLines = (ocr: string): string[] =>
+    ocr.split(/\r?\n/).map(line => trimAsciiWhitespace(line)).filter(Boolean).map(line => markdownEscapeInline(line, true));
+
+/** A line of Markdown that is a figure's HTML block (see MarkdownGenerator.figureHtml): its anchors, then the <figure>. */
+const FIGURE_LINE = /^(?:<a id="[^"]*"><\/a>)*<figure>.*<\/figure>$/;
+
+/**
+ * A figure's lines where no block can go (a list item, cell, definition or heading): its picture with
+ * its caption after it, then its recognized text ('image+ocr-text'); with no image written, its
+ * recognized text, then its caption (after the anchors, when nothing else carries them).
+ */
+const pictureLines = (image: string, ocr: string, caption: string, anchors: string): string[] =>
+    image ? [`${image} ${caption}`, ...(ocr ? [ocr] : [])] : [...(ocr ? [ocr] : []), anchors + caption];
+
 const isBlockInLine = (node: OfficeContentNode): boolean =>
     (node.type === 'break' && (node.metadata as BreakMetadata | undefined)?.breakType === 'thematic')
-    || (node.type === 'code' && (node.metadata as CodeMetadata | undefined)?.math !== 'inline');
+    || (node.type === 'code' && (node.metadata as CodeMetadata | undefined)?.math !== 'inline')
+    || isFigure(node);
+
+/** `text` without the line ends that end it. */
+const withoutTrailingLineEnds = (text: string): string => {
+    let end = text.length;
+    while (end > 0 && (text.charCodeAt(end - 1) === 10 || text.charCodeAt(end - 1) === 13)) end--;
+    return text.slice(0, end);
+};
+
+/**
+ * Blocks with each paragraph holding a block in HTML (see isBlockInParagraph) as its parts, as
+ * HtmlGenerator writes one: each run of inline content a paragraph, each block on its own. The first part
+ * takes the paragraph's ids, notes and comments (a block first, its ids joined to its own). Written whole in
+ * an HTML cell or item, the `<p>` closed at the block and the `</p>` after it read back as an empty paragraph,
+ * one more on every save in a disclosure.
+ */
+const paragraphsSplitAtBlocks = (nodes: OfficeContentNode[]): OfficeContentNode[] => {
+    let out: OfficeContentNode[] | undefined;
+    for (let i = 0; i < nodes.length; i++) {
+        const node = nodes[i];
+        if (node.type !== 'paragraph' || !node.children?.some(isBlockInParagraph)) { out?.push(node); continue; }
+        out ??= nodes.slice(0, i);
+        const anchorIds = (node.metadata as { anchorIds?: string[] } | undefined)?.anchorIds;
+        const later = { ...node, metadata: node.metadata ? { ...(node.metadata as object), anchorIds: undefined } as any : undefined, notes: undefined, comments: undefined };
+        let first = true;
+        let run: OfficeContentNode[] = [];
+        const flush = () => {
+            if (run.some(c => c.type !== 'text' || trimAsciiWhitespace(c.text ?? '') || c.notes?.length)) {
+                out!.push({ ...(first ? node : later), children: run });
+                first = false;
+            }
+            run = [];
+        };
+        for (const child of node.children) {
+            if (!isBlockInParagraph(child)) { run.push(child); continue; }
+            flush();
+            if (first && anchorIds?.length) {
+                const own = (child.metadata as { anchorIds?: string[] } | undefined)?.anchorIds ?? [];
+                out.push({ ...child, metadata: { ...(child.metadata as object), anchorIds: [...anchorIds, ...own] } as any });
+            } else out.push(child);
+            first = false;
+        }
+        flush();
+    }
+    return out ?? nodes;
+};
 
 /**
  * A paragraph's or heading's children without the line breaks (and blank runs among them) that end it
@@ -157,9 +248,9 @@ const isStandingNote = (node: OfficeContentNode): boolean => {
     return noteType === 'footnote' || noteType === 'endnote';
 };
 
-/** Whether `node` is a block (a code node is one unless it is inline math). */
+/** Whether `node` is a block (a code node is one unless it is inline math; a picture, when it is a figure). */
 const isBlockNode = (node: OfficeContentNode): boolean =>
-    BLOCK_NODE_TYPES.has(node.type) || (node.type === 'code' && (node.metadata as CodeMetadata | undefined)?.math !== 'inline');
+    BLOCK_NODE_TYPES.has(node.type) || (node.type === 'code' && (node.metadata as CodeMetadata | undefined)?.math !== 'inline') || isFigure(node);
 
 /**
  * Collapses each run of blank lines (whitespace-only lines count) to one empty line, outside fenced
@@ -232,6 +323,9 @@ const trimBlockEdges = (markdown: string): string => trimEndChars(trimStartChars
 
 /** Appends a node's Markdown, leaving exactly one blank line before a separated block. */
 /** `html` with no line end that could end a Markdown HTML block: no blank line, no lone carriage return. */
+/** How deep holdsDisclosure looks for a disclosure among a node's descendants. */
+const MAX_DISCLOSURE_SEARCH_DEPTH = 256;
+
 const closedUpLines = (html: string): string => html.replace(/\r\n?/g, '\n').replace(/\n[ \t]*(?=\n)/g, '');
 
 const appendBlock = (output: TextBuilder, node: { type: string }, next: string): void =>
@@ -388,6 +482,8 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
     private inListItem = 0;
     /** How many definition terms or descriptions are being written: each is one line too. */
     private inDefinition = 0;
+    /** How many headings are being written: a heading is one line, where no figure can stand. */
+    private inHeading = 0;
     /** How many nodes holding a line of text (a paragraph, heading, item, cell, definition) are being written. */
     private lineDepth = 0;
     /** For each definition list being written, innermost last: whether it is in one line (see inOneLine). */
@@ -402,6 +498,12 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
     private atLineStart = false;
     /** Rendering the cells of an HTML table (the fallback for merged cells, or the `html` table dialect): their content is HTML. */
     private inHtmlTable = 0;
+    /** Whether each node asked holds a disclosure (see holdsDisclosure). */
+    private disclosureHolders = new WeakMap<OfficeContentNode, boolean>();
+    /** The summaries of the disclosures being written (each its first child): any other summary node is a block of its own (see htmlCellNode). */
+    private disclosureSummaries = new WeakSet<OfficeContentNode>();
+    /** List items written as HTML lists (see assignListDepths, writesItemAsHtml). */
+    private htmlItems = new WeakSet<OfficeContentNode>();
     /** The last character written before the node being rendered, within its parent ('' for none). */
     private previousOutputChar = '';
     /** The sibling after the node being rendered, if any. */
@@ -700,7 +802,12 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                         // backtick can't close the span early, padded when the content touches a
                         // backtick. Done before emphasis so bold/italic wrap the span (`**`code`**`).
                         // Previously a monospace text node emitted its bare text, dropping the code.
-                        if (node.formatting.font === 'monospace') {
+                        if (node.formatting.keyboard) {
+                            // Keyboard input is <kbd> (Markdown has no syntax of its own for it), its text
+                            // HTML-escaped and its Markdown characters written as references, which a
+                            // renderer and the parser both read back as the characters.
+                            text = `<kbd>${keyboardText(node.text || '')}</kbd>`;
+                        } else if (node.formatting.font === 'monospace') {
                             // A reader strips one space from each end of a span that has one at both
                             // (and is not all spaces), so such content is padded too, to keep its spaces.
                             text = codeSpan(node.text || '');
@@ -709,7 +816,7 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                         // stays outside: a delimiter next to a space cannot open or close emphasis
                         // (CommonMark's flanking rule), so `**Note: **` would not be bold at all.
                         // Whitespace alone takes no delimiters.
-                        const core = node.formatting.font === 'monospace' ? text : text.trim();
+                        const core = node.formatting.font === 'monospace' || node.formatting.keyboard ? text : text.trim();
                         const lead = core === text ? '' : text.slice(0, text.length - text.trimStart().length);
                         const trail = core === text || !core ? '' : text.slice(text.trimEnd().length);
                         // A backslash that ended in a space (so was left as it is) now stands before the
@@ -906,6 +1013,7 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                 }
 
                 case 'list': {
+                    if (this.writesItemAsHtml(node)) return await this.listItemAsHtml(node);
                     const meta = node.metadata as ListMetadata;
                     const indentSpaces = ' '.repeat(4);
                     // Clamp the nesting depth: `indentation` derives from an uncapped document `ilvl`,
@@ -934,69 +1042,54 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                 }
 
                 case 'image': {
-                    const mode = this.imageMode();
-                    if (mode === 'none') return '';
                     const meta = node.metadata as ImageMetadata;
+                    // What of the picture is written is pictureParts' to say; where it goes, the line's.
+                    const parts = this.pictureParts(node, false);
+                    if (!parts) return '';
                     const anchors = this.renderAnchors(meta, false);
                     // On the image's line, as a paragraph's are: a line break after them is a line break
                     // in the paragraph holding the image. On a line of their own only before a fenced
                     // block of recognized text, which must start a line.
                     const withAnchors = (markdown: string) => (anchors && markdown.startsWith('`') ? `${anchors}\n` : anchors) + markdown;
-                    const ocr = (node.text || '').trim();
-
-                    // OCR text from a scanned page carries meaning in its whitespace and line breaks
-                    // (columns, indentation, aligned rows). Regular Markdown collapses runs of spaces and
-                    // joins single line breaks, which destroys that layout, so render multi-line OCR
-                    // verbatim inside a fenced block (one backtick longer than any embedded run so an
-                    // inner ``` can't close it early) and keep single-line OCR as ordinary prose.
-                    let ocrMd = '';
-                    if (ocr) {
-                        if (/[\r\n]/.test(ocr)) {
-                            const longestRun = Math.max(0, ...(ocr.match(/`+/g) || []).map(s => s.length));
-                            const fence = '`'.repeat(Math.max(3, longestRun + 1));
-                            ocrMd = `${fence}\n${ocr}\n${fence}`;
-                        } else {
-                            ocrMd = markdownEscapeInline(ocr, true);
-                        }
+                    const ocrMd = ocrMarkdown(parts.ocr);
+                    let imageMd = '';
+                    if (parts.src !== undefined) {
+                        // Alt text on one line, escaped as text (a `]` would close the `![...]`, and a
+                        // renderer reads markup in alt text), and the URL scheme neutralized.
+                        // (No alt text is `![](...)`: a made-up `image` was read back as the picture's alt text.)
+                        const safeAlt = markdownEscapeInline(foldLines(meta?.altText || ''));
+                        const safeSrc = sanitizeMarkdownUrl(parts.src, { allowDataImage: true });
+                        const imgTitle = meta?.title ? markdownTitle(meta.title) : '';
+                        imageMd = withAnchors(this.linkedImage(meta, `![${safeAlt}](${safeSrc}${imgTitle})${this.renderAttributeList(meta)}`));
                     }
-
-                    // ocr-text-only: emit just the recognized text, no image markup.
-                    if (mode === 'ocr-text-only') return ocr ? withAnchors(ocrMd) : '';
-
-                    // Build the image markup: inline as a data URI when small, otherwise reference by
-                    // name (never inline a multi-MB image, which would emit a single line that overflows
-                    // downstream Markdown parsers).
-                    let src = meta?.url || meta?.attachmentName || '';
-                    if (!meta?.url && meta?.attachmentName && this.ast) {
-                        const attachment = this.getAttachment(meta.attachmentName);
-                        if (attachment) {
-                            const bytes = base64ByteLength(attachment.data);
-                            if (bytes <= this.config.maxInlineImageBytes) {
-                                if (this.inlineWithinBudget(bytes, meta.attachmentName)) src = `data:${attachment.mimeType || 'image/png'};base64,${attachment.data}`;
-                            } else {
-                                // Over the cap, so the picture itself cannot travel in the output
-                                // (inlining a multi-MB image would overflow downstream Markdown
-                                // parsers). Surface it, then keep the image's recognized text when it
-                                // has any - that is the readable content of a scanned page, and it is
-                                // what maxInlineImageBytes documents - falling back to the compact
-                                // name reference when there is none.
-                                // ('image+ocr-text' already emits both, so only 'image-only' changes.)
-                                this.warn(OfficeWarningType.IMAGE_NOT_INLINED, { name: meta.attachmentName, bytes, limit: this.config.maxInlineImageBytes });
-                                if (ocr && mode === 'image-only') return withAnchors(ocrMd);
-                            }
-                        }
+                    if (parts.caption === undefined) {
+                        // A picture without a caption runs in its line: its image, then its recognized
+                        // text ('image+ocr-text'), or that text alone in the image's place.
+                        if (parts.src === undefined) return withAnchors(ocrMd);
+                        return parts.ocr ? `${imageMd}\n\n${ocrMd}` : imageMd;
                     }
-                    // Alt text on one line, escaped as text (a `]` would close the `![...]`, and a
-                    // renderer reads markup in alt text), and the URL scheme neutralized.
-                    // (No alt text is `![](...)`: a made-up `image` was read back as the picture's alt text.)
-                    const safeAlt = markdownEscapeInline(foldLines(meta?.altText || ''));
-                    const safeSrc = sanitizeMarkdownUrl(src, { allowDataImage: true });
-                    const imgTitle = meta?.title ? markdownTitle(meta.title) : '';
-                    const imageMd = withAnchors(this.linkedImage(meta, `![${safeAlt}](${safeSrc}${imgTitle})${this.renderAttributeList(meta)}`));
-
-                    // image+ocr-text: the image, then its recognized text.
-                    if (mode === 'image+ocr-text' && ocr) return `${imageMd}\n\n${ocrMd}`;
-                    return imageMd;
+                    // A figure (a captioned picture, in every image mode: see pictureParts) stands apart
+                    // from the text before it on its line. The children loop puts a line end after that
+                    // text, but not where the node before the figure wrote nothing (a space, trimmed there).
+                    const after = this.previousOutputChar;
+                    if (!this.inOneLine && this.inHeading === 0) {
+                        const lead = this.atLineStart || after === '\n' ? '' : '\n\n';
+                        // Its picture as an HTML <figure> block, which Markdown has no syntax for (CommonMark
+                        // passes it through, and it reads back as one), on lines of its own.
+                        if (parts.src !== undefined) return `${lead}${this.figureHtml(meta, parts)}\n\n`;
+                        // No image written: its recognized text as a paragraph of its lines, then its caption as one.
+                        const ocrText = ocrTextLines(parts.ocr).join('  \n');
+                        const caption = markdownEscapeInline(parts.caption, true);
+                        return `${lead}${anchors}${ocrText ? `${ocrText}\n\n${caption}` : caption}\n\n`;
+                    }
+                    // In one line (a list item, a cell, a definition, a heading), where no block can go, its
+                    // lines as a block's are (see pictureLines): the line ends after it are the children loop's.
+                    this.warn(OfficeWarningType.CONTENT_NOT_REPRESENTABLE, { format: 'md', feature: 'a figure in a list item, table cell, definition or heading (its caption follows the picture as text)' });
+                    const caption = markdownEscapeInline(parts.caption);
+                    const lead = after === '' || after === '\n' ? '' : '\n\n';
+                    // Its recognized text as lines of the line (see ocrTextLines).
+                    const ocrLines = ocrTextLines(parts.ocr).join('\n\n');
+                    return lead + (parts.src !== undefined ? pictureLines(imageMd, ocrLines, caption, '') : pictureLines('', ocrLines && anchors + ocrLines, caption, ocrLines ? '' : anchors)).join('\n\n');
                 }
 
                 case 'table': {
@@ -1138,12 +1231,21 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                             // Dialect has no footnote syntax - the caller inlines this bare body
                             // as a parenthetical at the reference point instead of collecting it
                             // into an end-of-document "### Notes" section under a [^id] marker.
-                            return `${this.deferAnchors(meta)}${trimAsciiWhitespace(childrenOutput)}`;
+                            // A figure (see the image case) starting or ending the body keeps its own lines:
+                            // in the reference's line its HTML block would be text.
+                            const body = trimAsciiWhitespace(childrenOutput);
+                            const lead = FIGURE_LINE.test(body.slice(0, body.indexOf('\n') + 1 || undefined).trimEnd()) ? '\n\n' : '';
+                            const trail = FIGURE_LINE.test(body.slice(body.lastIndexOf('\n') + 1)) ? '\n\n' : '';
+                            return `${this.deferAnchors(meta)}${lead}${body}${trail}`;
                         }
                         // Indent continuation lines one level so a multi-line body re-parses as a
                         // single definition (a bare newline would end it). Single-line bodies, the
                         // common case, are unaffected. The note's ids start its body.
-                        return `[^${this.getFootnoteKey(node)}]: ${this.renderAnchors(meta)}${trimAsciiWhitespace(childrenOutput).replace(/\n/g, '\n    ')}\n\n`;
+                        // A body of one line is read back as the note's text, where a figure's HTML block
+                        // would be text: a figure alone (see the image case) closes on a line of its own.
+                        let body = trimAsciiWhitespace(childrenOutput);
+                        if (!body.includes('\n') && FIGURE_LINE.test(body)) body = `${body.slice(0, -'</figure>'.length)}\n</figure>`;
+                        return `[^${this.getFootnoteKey(node)}]: ${this.renderAnchors(meta)}${body.replace(/\n/g, '\n    ')}\n\n`;
                     }
                     return `> ${this.renderAnchors(meta)}**Note:** ${trimAsciiWhitespace(childrenOutput)}\n\n`;
                 }
@@ -1269,6 +1371,34 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                     }
                 }
 
+                case 'disclosure': {
+                    // An HTML <details> block, as CommonMark has it: the tag, its summary (see the summary
+                    // case), a blank line, the body as Markdown, a blank line, the closing tag (each a block
+                    // of its own, so the body is read as Markdown). In one line of Markdown (a list item, a
+                    // cell), where no block goes, its summary and then its body, reported.
+                    const meta = node.metadata as DisclosureMetadata | undefined;
+                    const body = trimAsciiWhitespace(childrenOutput);
+                    const summarized = node.children?.[0]?.type === 'summary';
+                    if (this.inOneLine) {
+                        this.warn(OfficeWarningType.CONTENT_NOT_REPRESENTABLE, { format: 'md', feature: 'a disclosure (<details>) in a list item or table cell (written open, its summary in bold)' });
+                        return `${this.deferAnchors(meta)}${summarized ? '' : '**Details** '}${body}\n\n`;
+                    }
+                    return `${this.anchorsBefore(meta)}<details${meta?.open ? ' open' : ''}>\n${body ? `${summarized ? '' : '\n'}${body}\n\n` : ''}</details>\n\n`;
+                }
+
+                case 'summary': {
+                    // A disclosure's summary: one line of plain text in a `<summary>` on the line after the
+                    // `<details>` tag; anything else (formatting, a link, a picture, a note, a line break, a
+                    // heading, a nested disclosure) as Markdown between a `<summary>` line and a `</summary>`
+                    // line, blank lines around it, which CommonMark reads as Markdown. In one line of Markdown,
+                    // plain text in bold, anything else as it is written there.
+                    const content = trimAsciiWhitespace(childrenOutput);
+                    const plain = plainSummaryText(node);
+                    if (this.inOneLine) return plain !== undefined ? (plain ? `**${markdownEscapeInline(plain)}** ` : '') : content ? `${content} ` : '';
+                    if (plain !== undefined) return plain ? `<summary>${this.escapeInHtmlBlock(plain)}</summary>\n\n` : '';
+                    return content ? `<summary>\n\n${content}\n\n</summary>\n\n` : '';
+                }
+
                 case 'definitionList':
                     // In a list item, cell or definition (one line of Markdown) it is its lines (see below).
                     if (this.inOneLine) return `${this.deferAnchors(node.metadata)}${childrenOutput}\n`;
@@ -1343,6 +1473,7 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                     }
                 }
             }
+            result = this.joinQuote(node, nextNode, result);
 
             appendBlock(body, node, result);
         }
@@ -1422,13 +1553,20 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
             return override;
         }
 
-        const walkedByProcessor = node.type === 'table' || node.type === 'sheet';
+        const walkedByProcessor = node.type === 'table' || node.type === 'sheet' || this.writesItemAsHtml(node);
+        if (node.type === 'disclosure') { const summary = summaryOf(node); if (summary) this.disclosureSummaries.add(summary); }
+        // Anchors waiting (see pendingAnchorIds) as a disclosure is reached are written before it, not taken by
+        // its summary's line inside it, which a plain summary writes as text (they were lost): set aside while
+        // its content is written, they wait again for the disclosure's own anchors, first.
+        const waitingBeforeDisclosure = node.type === 'disclosure' && this.pendingAnchorIds.length ? this.pendingAnchorIds.splice(0) : undefined;
         const wasInImplicitBold = this.inImplicitBold;
         if (node.type === 'heading' && this.hasUniformFormatting(node, f => f?.bold === true)) this.inImplicitBold = true;
         let childrenOutput = '';
         if (!walkedByProcessor && node.children && node.children.length > 0) {
             // Optimization: Merge adjacent text nodes with identical formatting
-            const optimizedChildren = this.optimizeNodes(node.type === 'paragraph' || node.type === 'heading' ? withoutBreaksAtBlocks(node.children) : node.children);
+            let optimizedChildren = this.optimizeNodes(node.type === 'paragraph' || node.type === 'heading' ? withoutBreaksAtBlocks(node.children) : node.children);
+            // (In an HTML cell or item, a container's paragraphs holding blocks as their parts: see paragraphsSplitAtBlocks.)
+            if (this.inHtmlTable > 0 && node.type !== 'paragraph' && node.type !== 'heading') optimizedChildren = paragraphsSplitAtBlocks(optimizedChildren);
             this.assignListDepths(optimizedChildren);
             // What a paragraph, list item or definition holds starts a line, where a block marker at
             // its start must be escaped (`- # x` is an item holding a heading); a heading or cell holds
@@ -1439,6 +1577,7 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
             if (holdsLine) this.lineDepth++;
             if (node.type === 'definitionList') this.definitionListsInLine.push(this.inOneLine);
             if (node.type === 'list') this.inListItem++;
+            if (node.type === 'heading') this.inHeading++;
             const definition = node.type === 'definitionTerm' || node.type === 'definitionDescription';
             if (definition) this.inDefinition++;
             const children = new TextBuilder();
@@ -1466,14 +1605,17 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                 if (next && childOutput && (isBlockNode(child) || isBlockNode(next)) && !(child.type === 'list' && next.type === 'list') && !childOutput.endsWith('\n\n')) {
                     childOutput += childOutput.endsWith('\n') ? '\n' : '\n\n';
                 }
+                childOutput = this.joinQuote(child, next, childOutput);
                 appendBlock(children, child, childOutput);
             }
             childrenOutput = children.toString();
             if (holdsLine) this.lineDepth--;
             if (node.type === 'definitionList') this.definitionListsInLine.pop();
             if (node.type === 'list') this.inListItem--;
+            if (node.type === 'heading') this.inHeading--;
             if (definition) this.inDefinition--;
         }
+        if (waitingBeforeDisclosure) this.pendingAnchorIds = waitingBeforeDisclosure.concat(this.pendingAnchorIds);
 
         this.inImplicitBold = wasInImplicitBold;
 
@@ -1511,12 +1653,22 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                     // In an HTML table cell the reference is HTML too (as HtmlGenerator writes it), which
                     // the parser ties to its `[^id]:` definition.
                     const key = this.getFootnoteKey(note);
-                    result += this.inHtmlTable ? `<sup data-footnote-ref="${escapeHtml(key)}">${escapeHtml(key)}</sup>` : `[^${key}]`;
+                    result += this.inHtmlTable ? `<sup data-footnote-ref="${escapeHtml(key)}">${escapeHtml(this.getNoteMark(note))}</sup>` : `[^${key}]`;
                 }
             }
         }
 
         return result;
+    }
+
+    /**
+     * A quote paragraph followed by another paragraph of the same quote (see quoteGroups) ends in a `>`
+     * line instead of a blank one, so the two read back as one quote of two paragraphs: `> a`, `>`, `> b`.
+     */
+    private joinQuote(node: OfficeContentNode, next: OfficeContentNode | undefined, written: string): string {
+        if (this.inOneLine || !sameQuote(node, next) || !written.startsWith('> ') || !written.endsWith('\n\n')) return written;
+        const quoted = (n: OfficeContentNode) => this.getSemanticMapping(n)?.tag === 'blockquote';
+        return quoted(node) && quoted(next!) ? `${trimEndChars(written, '\n')}\n>\n` : written;
     }
 
     /**
@@ -1527,13 +1679,18 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
      */
     private assignListDepths(siblings: OfficeContentNode[]): void {
         let previous = -1;
+        // Whether the item before was written as HTML (see writesItemAsHtml).
+        let previousHtml = false;
         for (const node of siblings) {
             if (node.type === 'list') {
                 const depth = Math.min(clampRepeat((node.metadata as ListMetadata | undefined)?.indentation || 0, 64), previous + 1);
                 this.listDepths.set(node, depth);
                 previous = depth;
+                previousHtml = this.holdsDisclosure(node) || (depth > 0 && previousHtml);
+                if (previousHtml) this.htmlItems.add(node);
             } else if (!isStandingNote(node)) {
                 previous = -1;
+                previousHtml = false;
             }
         }
     }
@@ -1615,7 +1772,7 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
         if (!f || !this.config.includeFormatting) return '';
         const html = this.resolvedFallbackToHtml;
         return JSON.stringify([
-            f.font === 'monospace', !!f.bold, !!f.italic, !!f.strikethrough, f.backgroundColor ?? null,
+            f.font === 'monospace', !!f.keyboard, !!f.bold, !!f.italic, !!f.strikethrough, f.backgroundColor ?? null,
             html.textFormatting && [!!f.underline, !!f.subscript, !!f.superscript],
             html.inlineFormatting && [f.color ?? null, f.size ?? null],
         ]);
@@ -1631,8 +1788,9 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
             return '\n' + await this.renderTableAsHtml(node) + '\n';
         }
 
-        // If table is complex, nested, or uses merges, fallback to HTML for high fidelity if allowed
-        const isComplex = this.hasNestedTable(node) || this.hasColspanOrRowspan(node);
+        // If table is complex, nested, uses merges or holds a disclosure (a block a pipe-table cell cannot
+        // hold, which an HTML cell does), fallback to HTML for high fidelity if allowed
+        const isComplex = this.hasNestedTable(node) || this.hasColspanOrRowspan(node) || this.holdsDisclosure(node);
         if (this.resolvedFallbackToHtml.tables && isComplex) {
             return '\n' + await this.renderTableAsHtml(node) + '\n';
         }
@@ -1790,6 +1948,59 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
         return `\n${tableOutput}\n`;
     }
 
+    /** Whether a disclosure stands among a node's descendants (not its notes), each node asked once. */
+    private holdsDisclosure(node: OfficeContentNode, depth = 0): boolean {
+        let known = this.disclosureHolders.get(node);
+        if (known === undefined) {
+            known = false;
+            for (const child of node.children ?? []) {
+                if (child.type === 'disclosure' || (depth < MAX_DISCLOSURE_SEARCH_DEPTH && this.holdsDisclosure(child, depth + 1))) { known = true; break; }
+            }
+            this.disclosureHolders.set(node, known);
+        }
+        return known;
+    }
+
+    /**
+     * Whether a list item is written as an HTML list (see listItemAsHtml): one holding a disclosure, a block
+     * a Markdown item's one line cannot hold, and a nested item after one (a Markdown item cannot nest
+     * under HTML), where Markdown blocks go (not in a pipe-table cell, a definition or another item's line;
+     * an HTML cell writes its items as HTML already).
+     */
+    private writesItemAsHtml(node: OfficeContentNode): boolean {
+        return node.type === 'list' && !this.inOneLine && this.inHtmlTable === 0 && (this.htmlItems.has(node) || this.holdsDisclosure(node));
+    }
+
+    /**
+     * A list item holding a disclosure, as an HTML block of its own: its content as an HTML table cell's
+     * is written (a disclosure as `<details>` with its `<summary>`, whatever the summary holds), in a `<ul>`
+     * or `<ol start>` of its own (a task's in the editor's task list), nested in a `<ul>` for each level of
+     * its depth. The HTML parser reads it back as that item, its depth, number and task box, the disclosure in it. Written in the item's one
+     * line, the disclosure was its summary and body as text, which read back as no disclosure.
+     */
+    private async listItemAsHtml(node: OfficeContentNode): Promise<string> {
+        const meta = node.metadata as ListMetadata | undefined;
+        let content = '';
+        this.inHtmlTable++;
+        try {
+            for (const child of paragraphsSplitAtBlocks(this.optimizeNodes(node.children ?? []))) {
+                content += await this.processNodeRecursive(child, (n, co) => this.htmlCellNode(n, co));
+            }
+        } finally {
+            this.inHtmlTable--;
+        }
+        const depth = this.listDepths.get(node) ?? clampRepeat(meta?.indentation || 0, 64);
+        // A task item as the HTML reader reads one back (the editor's task list), any other as an HTML cell's item.
+        let item: string;
+        if (meta?.isTask) {
+            const { attr, extra } = this.htmlIds(meta);
+            item = `<ul data-type="taskList"><li data-checked="${meta.checked ? 'true' : 'false'}"${attr}>${extra}${content}</li></ul>`;
+        } else item = await this.htmlCellNode(node, content);
+        // (Nothing in it can end the HTML block: its lines are closed up, and blank lines stand around it.)
+        item = closedUpLines(item);
+        return `\n${'<ul>'.repeat(depth)}${item}${'</ul>'.repeat(depth)}\n\n`;
+    }
+
     private hasNestedTable(node: OfficeContentNode): boolean {
         if (!node.children) return false;
         for (const child of node.children) {
@@ -1817,6 +2028,68 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
     }
 
     /**
+     * What of a picture is written, the one place that decides it (both writers, Markdown and an HTML
+     * cell's, ask it, and nothing else does): undefined for nothing; else its image's source (undefined
+     * when no image is written), its recognized text when written (after the image in 'image+ocr-text';
+     * in its place in 'ocr-text-only', and in 'image-only' over maxInlineImageBytes), and its caption,
+     * written in every image mode (8.6.0 wrote a figure's caption as a paragraph whatever the mode, and
+     * the text writer does), so a captioned picture is a figure (see isFigure) whatever the mode.
+     * Inlining the image as a data: URI is counted (inlineWithinBudget), so each picture asks once.
+     */
+    private pictureParts(node: OfficeContentNode, inHtml: boolean): { src?: string; ocr: string; caption?: string } | undefined {
+        const mode = this.imageMode();
+        const meta = node.metadata as ImageMetadata | undefined;
+        const caption = captionOf(node);
+        const ocr = (node.text || '').trim();
+        if (mode === 'none') return caption ? { ocr: '', caption } : undefined;
+        if (mode === 'ocr-text-only') return ocr || caption ? { ocr, caption } : undefined;
+        let src = meta?.url || meta?.attachmentName || '';
+        const attachment = !meta?.url && meta?.attachmentName ? this.getAttachment(meta.attachmentName) : undefined;
+        if (attachment) {
+            const bytes = base64ByteLength(attachment.data);
+            if (bytes <= this.config.maxInlineImageBytes) {
+                if (this.inlineWithinBudget(bytes, meta!.attachmentName)) src = `data:${attachment.mimeType || 'image/png'};base64,${attachment.data}`;
+            } else {
+                // Over the cap the picture cannot travel (a multi-MB line overflows downstream Markdown
+                // parsers): surfaced, and in 'image-only' its recognized text, the readable content of a
+                // scanned page, takes its place, as maxInlineImageBytes documents ('image+ocr-text' writes
+                // both already). An HTML cell's picture without a caption keeps its name, as in 8.6.0.
+                this.warn(OfficeWarningType.IMAGE_NOT_INLINED, { name: meta!.attachmentName, bytes, limit: this.config.maxInlineImageBytes });
+                if (ocr && mode === 'image-only' && (caption || !inHtml)) return { ocr, caption };
+            }
+        }
+        return { src, ocr: mode === 'image+ocr-text' ? ocr : '', caption };
+    }
+
+    /** A picture's <img>, with its link, and its id unless `withId` is false, as HtmlGenerator writes it. */
+    private imgHtml(meta: ImageMetadata | undefined, src: string, withId = true): string {
+        const esc = (value: string) => this.escapeInHtmlBlock(value);
+        const attr = withId ? this.htmlIds(meta).attr : '';
+        const img = `<img src="${sanitizeImageUrl(src)}" alt="${esc(meta?.altText || '')}"${meta?.title ? ` title="${esc(meta.title)}"` : ''}${attr}>`;
+        if (!meta?.link) return img;
+        const internal = meta.linkType !== 'external';
+        if (internal && this.config.ignoreInternalLinks) return img;
+        const target = internal && meta.link.startsWith('#') && (this.config.generateIds || this.resolvedFallbackToHtml.anchors) ? `#${this.slugify(meta.link.slice(1))}` : meta.link;
+        return `<a href="${sanitizeUrl(target)}"${meta.linkTitle ? ` title="${esc(meta.linkTitle)}"` : ''}>${img}</a>`;
+    }
+
+    /**
+     * A captioned picture's ids as anchors, written before its <img> (in its <figure>, where they cannot
+     * join a line of text before it): on the <img> an id was lost where the picture is inlined (the HTML
+     * reader drops a data: picture's id, ledger). They read back as the picture's.
+     */
+    private figureAnchors(meta: ImageMetadata | undefined): string {
+        if (!this.resolvedFallbackToHtml.anchors || this.config.ignoreInternalLinks) return '';
+        return this.anchorSlugs(meta?.anchorIds || []).map(id => `<a id="${escapeHtml(id)}"></a>`).join('');
+    }
+
+    /** A captioned picture whose image is written, as a <figure>: the picture, its recognized text, its caption. */
+    private figureHtml(meta: ImageMetadata | undefined, parts: { src?: string; ocr: string; caption?: string }): string {
+        const esc = (value: string) => this.escapeInHtmlBlock(value);
+        return `<figure>${this.figureAnchors(meta)}${this.imgHtml(meta, parts.src ?? '', false)}${parts.ocr ? `<pre class="ocr-text">${esc(parts.ocr)}</pre>` : ''}<figcaption>${esc(parts.caption ?? '')}</figcaption></figure>`;
+    }
+
+    /**
      * Renders a complex table as HTML since Markdown doesn't support nested tables or rowspans.
      */
     /**
@@ -1841,7 +2114,8 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                 const f = n.formatting;
                 const html = this.resolvedFallbackToHtml;
                 if (this.config.includeFormatting && f) {
-                    if (f.font === 'monospace') text = `<code>${text}</code>`;
+                    if (f.keyboard) text = `<kbd>${text}</kbd>`;
+                    else if (f.font === 'monospace') text = `<code>${text}</code>`;
                     if (f.bold && !this.inImplicitBold) text = `<b>${text}</b>`;
                     if (f.italic) text = `<i>${text}</i>`;
                     if (f.underline && html.textFormatting) text = `<u>${text}</u>`;
@@ -1866,7 +2140,12 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
             }
             case 'break':
                 if ((n.metadata as BreakMetadata | undefined)?.breakType === 'section' || typeof (n.metadata as BreakMetadata | undefined)?.section === 'number') return '';
-                return (n.metadata as BreakMetadata | undefined)?.breakType === 'page' || (n.metadata as BreakMetadata | undefined)?.breakType === 'thematic' ? '<hr>' : '<br>';
+                if ((n.metadata as BreakMetadata | undefined)?.breakType === 'page' || (n.metadata as BreakMetadata | undefined)?.breakType === 'thematic') {
+                    // (Its ids as the HTML writer's <hr> has them: an anchor before a block in a disclosure marks it.)
+                    const { attr, extra } = this.htmlIds(n.metadata);
+                    return `${extra}<hr${attr}>`;
+                }
+                return '<br>';
             case 'code': {
                 const meta = n.metadata as CodeMetadata | undefined;
                 const code = n.text || '';
@@ -1877,22 +2156,27 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                 return `${extra}<pre${attr}><code${lang}>${esc(code)}</code></pre>`;
             }
             case 'image': {
-                const mode = this.imageMode();
                 const meta = n.metadata as ImageMetadata | undefined;
-                const ocr = esc((n.text || '').trim());
-                if (mode === 'none') return '';
-                if (mode === 'ocr-text-only') return ocr;
-                let src = meta?.url || meta?.attachmentName || '';
-                const attachment = !meta?.url && meta?.attachmentName ? this.getAttachment(meta.attachmentName) : undefined;
-                if (attachment) {
-                    const bytes = base64ByteLength(attachment.data);
-                    if (bytes <= this.config.maxInlineImageBytes) { if (this.inlineWithinBudget(bytes, meta!.attachmentName)) src = `data:${attachment.mimeType || 'image/png'};base64,${attachment.data}`; }
-                    else this.warn(OfficeWarningType.IMAGE_NOT_INLINED, { name: meta!.attachmentName, bytes, limit: this.config.maxInlineImageBytes });
+                const parts = this.pictureParts(n, true);
+                if (!parts) return '';
+                const ocr = esc(parts.ocr);
+                // A picture without a caption: in its line, its recognized text after it or in its place.
+                if (parts.caption === undefined) {
+                    if (parts.src === undefined) return ocr;
+                    const img = this.imgHtml(meta, parts.src);
+                    return this.htmlIds(meta).extra + (ocr ? `${img}<br>${ocr}` : img);
                 }
-                const { attr, extra } = this.htmlIds(meta);
-                let img = `<img src="${sanitizeImageUrl(src)}" alt="${esc(meta?.altText || '')}"${meta?.title ? ` title="${esc(meta.title)}"` : ''}${attr}>`;
-                if (meta?.link) img = link(meta.link, meta.linkType, meta.linkTitle, img);
-                return extra + (mode === 'image+ocr-text' && ocr ? `${img}<br>${ocr}` : img);
+                const img = parts.src === undefined ? '' : this.imgHtml(meta, parts.src, false);
+                const anchors = this.figureAnchors(meta);
+                // A captioned picture is a figure (see the image case of generate). A heading holds no
+                // block: there its lines are the heading's, as in a Markdown heading, set apart by line breaks.
+                if (this.inHeading > 0) {
+                    const lines = pictureLines(img && anchors + img, ocr && (img ? ocr : anchors + ocr), esc(parts.caption), img || ocr ? '' : anchors).join('<br>');
+                    return `${this.previousOutputChar ? '<br>' : ''}${lines}${this.nextSibling ? '<br>' : ''}`;
+                }
+                if (img) return this.figureHtml(meta, parts);
+                // No image written: its recognized text, then its caption, each a paragraph.
+                return `<p>${anchors}${ocr || esc(parts.caption)}</p>${ocr ? `<p>${esc(parts.caption)}</p>` : ''}`;
             }
             case 'paragraph': {
                 const { attr, extra } = this.htmlIds(n.metadata);
@@ -1914,11 +2198,15 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                 const shown = label === undefined || label.trim() === `${number}.` ? '' : ` style="list-style-type: ${cssListMarker(label)}"`;
                 return `<ol${number > 1 ? ` start="${number}"` : ''}${shown}><li${attr}>${extra}${co}</li></ol>`;
             }
-            case 'table': return await this.renderTableAsHtml(n);
+            case 'table': {
+                const { attr, extra } = this.htmlIds(n.metadata);
+                return `${extra}${(await this.renderTableAsHtml(n)).replace(/^<table/, `<table${attr}`)}`;
+            }
             case 'embed': {
                 const meta = n.metadata as EmbedMetadata | undefined;
                 const url = meta?.url || (meta?.videoId ? `https://youtu.be/${meta.videoId}` : '');
-                return url ? link(url, 'external', undefined, esc(meta?.label || url)) : co;
+                // (A block: in a paragraph of its own, never run into the text before it.)
+                return url ? `<p>${link(url, 'external', undefined, esc(meta?.label || url))}</p>` : co;
             }
             case 'comment':
                 if (isSourceComment(n)) return `<!--${closedUpLines(sanitizeCommentText(n.text || ''))}-->`;
@@ -1934,11 +2222,40 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
             case 'header':
             case 'footer':
             case 'slideMaster':
-            case 'admonition':
+                return co;
+            // As HtmlGenerator writes them, with their ids: written as their content alone, a term, its
+            // description and the text around them ran together, and an admonition lost its kind.
+            case 'admonition': {
+                const meta = n.metadata as AdmonitionMetadata | undefined;
+                const rawType = String(meta?.admonitionType || 'note').toLowerCase();
+                const type = MD_ADMONITION_TYPES.has(rawType) ? rawType : 'note';
+                const { attr, extra } = this.htmlIds(meta);
+                // (Its end tag after its content on one line: a line of a lone `</div>`, after a nested table's
+                // last line, ends the Markdown block there, and the rest of the item is read as Markdown.)
+                const body = withoutTrailingLineEnds(co);
+                // A title, which the HTML reader has no place for, is its bold first line (as the fenced syntaxes
+                // write it), on a line of its own as the paragraph it reads back as is written.
+                const title = meta?.title ? `<p><b>${esc(foldLines(meta.title))}</b></p>${body ? '\n' : ''}` : '';
+                return `${extra}<div class="admonition admonition-${type}" data-type="${type}"${attr}>${title}${body}</div>`;
+            }
             case 'definitionList':
             case 'definitionTerm':
-            case 'definitionDescription':
-                return co;
+            case 'definitionDescription': {
+                const tag = n.type === 'definitionList' ? 'dl' : n.type === 'definitionTerm' ? 'dt' : 'dd';
+                const { attr, extra } = this.htmlIds(n.metadata);
+                return `${extra}<${tag}${attr}>${co}</${tag}>`;
+            }
+            case 'disclosure': {
+                const meta = n.metadata as DisclosureMetadata | undefined;
+                const { attr, extra } = this.htmlIds(meta);
+                return `${extra}<details${attr}${meta?.open ? ' open' : ''}>${co}</details>`;
+            }
+            case 'summary':
+                // A summary that is no disclosure's (built by hand) is a block of its own, as a browser shows a
+                // <summary> outside a <details>: written as one, it ran into the text around it.
+                if (!this.disclosureSummaries.has(n)) return `<div>${withoutTrailingLineEnds(co)}</div>`;
+                // (A lone plain paragraph as the summary's line, as HtmlGenerator writes it: a <p> in it puts the line under the marker.)
+                return `<summary>${summaryLine(n) && co.startsWith('<p>') && co.endsWith('</p>') ? co.slice(3, -4) : co}</summary>`;
         }
     }
 
@@ -2001,7 +2318,7 @@ export class MarkdownGenerator extends BaseGenerator<'md'> {
                 // Cell content as HTML, which is what the cell is (a Markdown renderer shows an HTML
                 // block as it is, and the parser reads it with the HTML parser): the markup
                 // HtmlGenerator writes for each inline construct, so nothing in a cell is dropped.
-                for (const child of this.optimizeNodes(node.children)) {
+                for (const child of paragraphsSplitAtBlocks(this.optimizeNodes(node.children))) {
                     content += await this.processNodeRecursive(child, (n, co) => this.htmlCellNode(n, co));
                 }
                 // (Whatever made it, the blocks of a cell standing apart or an onNode string: nothing in it can end the block.)

@@ -1,4 +1,4 @@
-import { AdmonitionMetadata, CellMetadata, CodeMetadata, CommentMetadata, EmbedMetadata, FullOfficeParserConfig, HeadingMetadata, ImageMetadata, ListMetadata, OfficeAttachment, OfficeContentNode, OfficeErrorType, OfficeMetadata, OfficeParserAST, ParagraphMetadata, ParagraphSpacing, TableMetadata, TextFormatting, TextMetadata } from '../types.js';
+import { AdmonitionMetadata, CellMetadata, CodeMetadata, CommentMetadata, DisclosureMetadata, EmbedMetadata, FullOfficeParserConfig, HeadingMetadata, ImageMetadata, ListMetadata, NoteMetadata, OfficeAttachment, OfficeContentNode, OfficeErrorType, OfficeMetadata, OfficeParserAST, ParagraphMetadata, ParagraphSpacing, TableMetadata, TextFormatting, TextMetadata } from '../types.js';
 import { anchorMark, isAnchorMark, resolveAnchorMarks } from '../utils/anchorUtils.js';
 import { createAST } from '../utils/astUtils.js';
 import { isSourceComment } from '../utils/commentUtils.js';
@@ -9,6 +9,7 @@ import { iframeAllowed, isCssLength, isSafeHtmlAttributeName, isVideoId } from '
 import { setOwn } from '../utils/lookupUtils.js';
 import { cellSpan, MAX_COL_SPAN, MAX_ROW_SPAN } from '../utils/numberUtils.js';
 import { appendAll } from '../utils/nodeListUtils.js';
+import { doctypeSubsetEnd } from '../utils/doctypeSubset.js';
 import { textDecoder } from '../utils/encodingUtils.js';
 import { lengthToPt } from '../utils/officeGenUtils.js';
 import { cssColorHex } from '../utils/colorUtils.js';
@@ -139,7 +140,7 @@ const isSheetChrome = (node: HtmlNode): boolean => node.type === 'element' && (n
     && (node.attributes?.class || '').split(/\s+/).some(name => SHEET_CHROME_CLASSES.has(name));
 
 /** Node types that are blocks, wherever they stand: a caption holding one is not wrapped in a paragraph. */
-const BLOCK_NODE_TYPES = new Set<string>(['paragraph', 'heading', 'list', 'table', 'chart', 'embed', 'admonition', 'definitionList']);
+const BLOCK_NODE_TYPES = new Set<string>(['paragraph', 'heading', 'list', 'table', 'chart', 'embed', 'admonition', 'disclosure', 'definitionList']);
 
 /** Whether `node` is a block: one of BLOCK_NODE_TYPES, a code block or display equation, or a rule or page break. */
 const isBlockNode = (node: OfficeContentNode): boolean => BLOCK_NODE_TYPES.has(node.type)
@@ -317,6 +318,23 @@ const markedBefore = (ids: string[], nodes: OfficeContentNode[]): OfficeContentN
     }
     nodes.unshift(anchorMark(ids));
     return nodes;
+};
+
+/**
+ * A run of inline content read among blocks (a disclosure's, its summary's, a caption's) as a paragraph,
+ * added to `blocks`, `keep` saying whether it holds anything; the named anchors ending it (all it holds,
+ * when it holds nothing else) stand among the blocks after it, where they mark the next block, as the
+ * body's runs are read (see flushInlineRun) and as HtmlGenerator writes a block's ids. Read as a paragraph,
+ * a heading's generated id written before it in a disclosure was an empty paragraph, one more each save.
+ */
+const pushRun = (blocks: OfficeContentNode[], run: OfficeContentNode[], preserveWhitespace: boolean, keep: (node: OfficeContentNode) => boolean): void => {
+    let end = run.length;
+    while (end > 0 && (isAnchorMark(run[end - 1]) || (run[end - 1].type === 'text' && !run[end - 1].text?.trim() && !run[end - 1].notes?.length && !run[end - 1].comments?.length))) end--;
+    const marks = run.slice(end).filter(isAnchorMark);
+    const head = marks.length ? run.slice(0, end) : run;
+    const kept = preserveWhitespace ? head : trimBlockEdges(collapseSpacesAcrossNodes(head));
+    if (kept.some(keep)) blocks.push({ type: 'paragraph', children: kept });
+    for (const mark of marks) blocks.push(mark);
 };
 
 /** Holds a list item's place at the start of its nested lists until the item itself is built. */
@@ -848,6 +866,9 @@ const parseHtmlTree = (html: string, config: FullOfficeParserConfig, preserveCom
         closeTo(target.parent!);
     };
 
+    // Nothing but white space, comments, processing instructions and declarations read yet (the
+    // document's prolog), and no DOCTYPE: only a DOCTYPE read here may carry an internal subset.
+    let prolog = true;
     while (cursor < html.length) {
         const tagStart = html.indexOf('<', cursor);
 
@@ -860,6 +881,7 @@ const parseHtmlTree = (html: string, config: FullOfficeParserConfig, preserveCom
         if (tagStart > cursor) {
             const text = html.substring(cursor, tagStart);
             if (text) pushText(text);
+            if (prolog && /[^\t\n\f\r \uFEFF]/.test(text)) prolog = false;
         }
         cursor = tagStart;
 
@@ -883,13 +905,24 @@ const parseHtmlTree = (html: string, config: FullOfficeParserConfig, preserveCom
                 const end = html.indexOf(']]>', tagStart + 9);
                 const text = html.substring(tagStart + 9, end === -1 ? html.length : end);
                 if (text) pushText(text.replace(/&/g, '&amp;'));
+                prolog = false;
                 cursor = end === -1 ? html.length : end + 3;
                 continue;
             }
             // A declaration or processing instruction (`<!DOCTYPE html>`, `<?xml ...?>`, Word's conditional
             // markers `<![if !supportLists]>` and `<![endif]>`): markup read as nothing, as a browser reads
             // it, and what stands between the markers is kept.
-            const end = html.indexOf('>', tagStart + 2);
+            let end = html.indexOf('>', tagStart + 2);
+            // An XML DOCTYPE (an XHTML page) may carry an internal subset in brackets, whose entity values
+            // can hold `>`: read as XML only for the document's DOCTYPE, in its prolog, and only when the
+            // subset is well formed (see doctypeSubsetEnd). Any other declaration ends at its first `>`, as
+            // HTML has it: searched for a `[` to the end of the document, and then for a `]` anywhere after
+            // it, each declaration cost the rest of the document, and a `[` swallowed the page.
+            if (prolog && end !== -1 && /^<!doctype/i.test(html.substring(tagStart, tagStart + 9))) {
+                prolog = false;
+                const subsetEnd = doctypeSubsetEnd(html, tagStart);
+                if (subsetEnd !== -1) end = subsetEnd - 1;
+            }
             cursor = end === -1 ? html.length : end + 1;
             continue;
         }
@@ -904,10 +937,12 @@ const parseHtmlTree = (html: string, config: FullOfficeParserConfig, preserveCom
         } else if (!isAsciiLetter(next)) {
             // A `<` that starts no tag (`a < b`, `<5`) is text.
             pushText('<');
+            prolog = false;
             cursor = tagStart + 1;
             continue;
         }
 
+        prolog = false;
         // Scan for the tag's closing '>', skipping any that appear inside a quoted attribute value.
         // Browsers do NOT escape '>' inside attribute values on serialization, so a literal '>' there
         // (e.g. a mermaid diagram's `-->` in data-mermaid) must not be read as the tag end. The scan
@@ -964,6 +999,11 @@ const parseHtmlTree = (html: string, config: FullOfficeParserConfig, preserveCom
 /** What a container whose parts are HTML (an EPUB's chapters) tells the reading of each part. */
 export interface HtmlPartContext {
     /**
+     * The HTML stands in a disclosure's summary or body (a piece of a Markdown disclosure): a `<summary>` in
+     * it is no disclosure's summary, and is a block of its own, as one in a `<details>` is.
+     */
+    inDisclosure?: boolean;
+    /**
      * The name of the attachment a picture's `src` shows, when the container holds that picture as
      * a file of its own; undefined for any other source. The container makes the attachment, once
      * however many pictures show it: an EPUB's images were written into each chapter as data, a copy
@@ -977,6 +1017,13 @@ export interface HtmlPartContext {
      * chapter's first data picture were both renamed.
      */
     attachmentName?: (proposed: string) => string;
+    /**
+     * The id of the next quote the part reads (see ParagraphMetadata.quoteId), given by the container
+     * that reads several parts into one document (Markdown's HTML blocks, an EPUB's chapters, a DOCX's
+     * imported HTML), so no two of its quotes share one; a part read alone numbers its own. Numbered
+     * from 1 in every part, two quotes of two parts that met were written as one.
+     */
+    quoteId?: () => string;
 }
 
 /** The first picture a `srcset` names (`a.png 1x, b.png 2x` names a.png), for an <img> with no `src`. */
@@ -1219,8 +1266,45 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
     let inTableHead = 0;
     const hasToken = (value: string | undefined, token: string): boolean => !!value && value.split(/\s+/).includes(token);
     /** A note's back-link to its reference: this library's, GitHub's, Pandoc's and markdown-it's. */
+    /** The quotes read so far (each `<blockquote>`'s paragraphs share an id, see ParagraphMetadata.quoteId). */
+    let quoteCount = 0;
+    /**
+     * What each figure's caption was read as, by its `<figcaption>` (see the figure branch): the figure
+     * registers its caption before reading its content, and the figcaption branch records its paragraph.
+     */
+    const figureCaptions = new Map<HtmlNode, OfficeContentNode[]>();
+    /**
+     * Each `<details>`'s summary (its first `<summary>` child, or null), found once per details: looked up
+     * again for each `<summary>` in it, a details of n children and n summaries took n^2 steps.
+     */
+    const detailsSummaries = new WeakMap<HtmlNode, HtmlNode | null>();
+    const summaryOfDetails = (details: HtmlNode): HtmlNode | null => {
+        let summary = detailsSummaries.get(details);
+        if (summary === undefined) {
+            summary = details.children.find(c => c.type === 'element' && c.tagName === 'summary') ?? null;
+            detailsSummaries.set(details, summary);
+        }
+        return summary;
+    };
+    /** The nearest `<details>` each element is in (or null), each element's found once (see enclosingDetails). */
+    const detailsAround = new WeakMap<HtmlNode, HtmlNode | null>();
+    const enclosingDetails = (node: HtmlNode): HtmlNode | null => {
+        const path: HtmlNode[] = [];
+        let found: HtmlNode | null = null;
+        for (let up = node.parent; up; up = up.parent) {
+            const known = detailsAround.get(up);
+            if (known !== undefined) { found = known; break; }
+            if (up.type === 'element' && up.tagName === 'details') { found = up; break; }
+            path.push(up);
+        }
+        for (const element of path) detailsAround.set(element, found);
+        return found;
+    };
+    /** The ids of note references and of the elements holding them (an EPUB's `<sup id="calledF1">`), which a back-link targets. */
+    const noteReferenceIds = new Set<string>();
     const isFootnoteBackLink = (node: HtmlNode): boolean => node.tagName === 'a' && (
         (node.attributes?.href || '').startsWith('#footnote-ref-') || node.attributes?.['data-footnote-backref'] !== undefined
+        || ((node.attributes?.href || '').startsWith('#') && noteReferenceIds.has(node.attributes!.href!.slice(1)))
         || node.attributes?.role === 'doc-backlink' || hasToken(node.attributes?.class, 'footnote-back') || hasToken(node.attributes?.class, 'footnote-backref'));
     /** Whether `link` is marked as a reference to a note (`inMarkedSup`: it is all a `<sup class="footnote-ref">` holds). */
     const isNoteReferenceLink = (link: HtmlNode, inMarkedSup: boolean): boolean => link.tagName === 'a' && (inMarkedSup
@@ -1374,6 +1458,8 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
             if (tagName === 'sub') newFormatting.subscript = true;
             if (tagName === 'sup') newFormatting.superscript = true;
             if (tagName === 'code') newFormatting.font = 'monospace';
+            // Keyboard input: its own mark, and monospace for every format with no such mark.
+            if (tagName === 'kbd') { newFormatting.keyboard = true; newFormatting.font = 'monospace'; }
             if (tagName === 'mark') {
                 // <mark> is a highlight. Use its data-color when present (an inline
                 // background-color style, read below, still wins); a bare <mark> falls back to the
@@ -1518,6 +1604,13 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
                         // and attach nothing. The orphan sweep below is likewise skipped.
                         if (config.ignoreNotes) continue;
                         const noteNode = noteFor(key);
+                        // The mark the reference shows (`1`, `*`), read at its first reference; the key is
+                        // internal. A pair of brackets around it (`[1]`) is the reference's look, not its mark.
+                        const meta = noteNode.metadata as NoteMetadata;
+                        if (meta.mark === undefined) {
+                            const shown = decodeEntities(preformattedText(child)).replace(/\s+/g, ' ').trim().replace(/^\[(.+)\]$|^\((.+)\)$/, '$1$2').trim();
+                            if (shown) meta.mark = shown;
+                        }
                         if (kids.length > 0) {
                             const target = kids[kids.length - 1];
                             if (!target.notes) target.notes = [];
@@ -1746,12 +1839,14 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
             if (tagName === 'blockquote') {
                 const kids = parseChildren(node, newFormatting, listContext);
                 const isBlock = (t: string) => t === 'paragraph' || t === 'heading' || t === 'list';
+                // The quote's paragraphs share its id: `<blockquote><p>a</p><p>b</p></blockquote>` is one quote.
+                const quoteId = part.quoteId ? part.quoteId() : `html-quote-${++quoteCount}`;
                 if (!kids.some(k => isBlock(k.type))) {
-                    return { type: 'paragraph', metadata: { style: 'Quote', ...(anchorIds.length > 0 && { anchorIds }) } as any, children: kids };
+                    return { type: 'paragraph', metadata: { style: 'Quote', quoteId, ...(anchorIds.length > 0 && { anchorIds }) } as any, children: kids };
                 }
                 kids.forEach(k => {
                     // A block quoted already (a quote in a quote) is not given the style again.
-                    if (isBlock(k.type) && (k.metadata as any)?.style !== 'Quote') k.metadata = { ...(k.metadata as any), style: 'Quote' };
+                    if (isBlock(k.type) && (k.metadata as any)?.style !== 'Quote') k.metadata = { ...(k.metadata as any), style: 'Quote', ...(k.type === 'paragraph' ? { quoteId } : {}) };
                 });
                 // The quote's id is the first of what it holds, where HtmlGenerator writes a quoted
                 // paragraph's id (on its <blockquote>).
@@ -1786,6 +1881,117 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
             // save. Any other caption, a <figcaption> and a table's <caption> (which the table's branch puts
             // before it), is a block of its own, which must not run into the picture before it.
             const isClass = (name: string) => (node.attributes?.class || '').split(/\s+/).includes(name);
+            // A <details>: a disclosure, its <summary> (the first) its first child, a `summary` node holding what
+            // the summary holds (a line of text, formatting, links, pictures, notes, breaks, headings, tables,
+            // nested disclosures), then the rest its blocks. In each, a run of loose inline content is a
+            // paragraph, and a block element (another <summary>, a <div>) stands apart from the text around it.
+            // Read as its text before, the collapsing was lost; its summary read as text lost all but its text.
+            // A <summary> that is no disclosure's summary, in a disclosure (one after its first, or in a piece of
+            // a Markdown disclosure): a block of its own, as a browser shows it, never run into the text around it.
+            if (tagName === 'summary' && (part.inDisclosure || (() => {
+                const details = enclosingDetails(node);
+                return !!details && summaryOfDetails(details) !== node;
+            })())) {
+                const kids = parseChildren(node, newFormatting, listContext);
+                const blocks: OfficeContentNode[] = [];
+                let run: OfficeContentNode[] = [];
+                const flush = () => {
+                    pushRun(blocks, run, !!config.preserveXmlWhitespace, c => c.type !== 'text' || !!c.text?.trim() || !!c.notes?.length);
+                    run = [];
+                };
+                for (const kid of kids) { if (isBlockNode(kid)) { flush(); blocks.push(kid); } else run.push(kid); }
+                flush();
+                return blocks;
+            }
+            if (tagName === 'details') {
+                const summaryElement = summaryOfDetails(node) ?? undefined;
+                const blocksOf = (children: HtmlNode[], holder: HtmlNode): OfficeContentNode[] => {
+                    const blocks: OfficeContentNode[] = [];
+                    let run: OfficeContentNode[] = [];
+                    const flush = () => {
+                        pushRun(blocks, run, !!config.preserveXmlWhitespace, c => c.type !== 'text' || !!c.text?.trim() || !!c.notes?.length);
+                        run = [];
+                    };
+                    // Each run of inline children read at once (as one text: white space between them joins),
+                    // each block element on its own.
+                    let inline: HtmlNode[] = [];
+                    const read = (group: HtmlNode[]) => {
+                        if (!group.length) return;
+                        for (const kid of parseChildren({ ...holder, children: group }, newFormatting, listContext)) {
+                            if (isBlockNode(kid)) { flush(); blocks.push(kid); } else run.push(kid);
+                        }
+                    };
+                    for (const child of children) {
+                        if (child.type === 'element' && BLOCK_LEVEL_TAGS.has(child.tagName!)) {
+                            read(inline);
+                            inline = [];
+                            flush();
+                            read([child]);
+                            flush();
+                        } else inline.push(child);
+                    }
+                    read(inline);
+                    flush();
+                    return blocks;
+                };
+                let summary = summaryElement ? blocksOf(summaryElement.children, summaryElement) : [];
+                // A summary holding only named anchors is empty, as one holding nothing is (none is kept), and
+                // its anchors are the disclosure's: a summary has no ids (see resolveAnchorMarks).
+                const ids = [...anchorIds];
+                if (summary.every(isAnchorMark)) {
+                    const seen = new Set(ids);
+                    for (const mark of summary) for (const id of (mark.metadata as { anchorIds?: string[] }).anchorIds ?? []) if (!seen.has(id)) { seen.add(id); ids.push(id); }
+                    summary = [];
+                }
+                const body = blocksOf(node.children.filter(c => c !== summaryElement), node);
+                const meta: DisclosureMetadata = {
+                    ...(node.attributes?.open !== undefined ? { open: true } : {}),
+                    ...(ids.length ? { anchorIds: ids } : {}),
+                };
+                // No text of its own, as a quote or an admonition has none: its blocks hold its text. A copy of
+                // its summary and body, made again at every level of nesting, was 200 times the input, and a
+                // writer gave a disclosure with no body its summary again as content.
+                return { type: 'disclosure', metadata: meta, children: summary.length ? [{ type: 'summary', children: summary }, ...body] : body };
+            }
+            // A figure of one picture and its caption: the caption is the picture's (ImageMetadata.caption),
+            // not a paragraph after it. A caption of more than text (a link, formatting, a block) stays a
+            // paragraph after the picture, where nothing of it is lost; so does one under a figure of
+            // several pictures, or of none.
+            if (tagName === 'figure') {
+                // Read once, as any container is (its caption a paragraph, by the figcaption branch below),
+                // and the caption then taken from that paragraph: read again on the way to the generic
+                // branch, a figure's content was read twice at every level of nesting (2^depth times, each
+                // picture decoded and each quote numbered again every time).
+                const captions = node.children.filter(c => c.type === 'element' && c.tagName === 'figcaption');
+                const captionElement = captions.length === 1 ? captions[0] : undefined;
+                if (captionElement) figureCaptions.set(captionElement, []);
+                const all = parseChildren(node, newFormatting, listContext);
+                if (!captionElement) return all;
+                const read = figureCaptions.get(captionElement) ?? [];
+                figureCaptions.delete(captionElement);
+                // A caption of plain text is one paragraph of plain text runs.
+                const paragraph = read.length === 1 && read[0].type === 'paragraph' && !read[0].metadata ? read[0] : undefined;
+                const caption = paragraph?.children ?? [];
+                // (An alignment the figure's runs have, from the figure or a block around it, is the line's, not
+                // the caption's own: a caption in a centred block or a list item is still the picture's.)
+                const plain = caption.every(c => c.type === 'text' && !c.notes?.length && !c.comments?.length && !c.metadata
+                    && !Object.entries(c.formatting ?? {}).some(([key, v]) => v !== undefined && v !== false && v !== ''
+                        && !(key === 'alignment' && v === newFormatting.alignment)));
+                const text = plainTextOf(caption).replace(/\s+/g, ' ').trim();
+                if (!paragraph || !plain || !text) return all;
+                const kids = all.filter(kid => kid !== paragraph);
+                if (kids.length === all.length) return all;
+                const images: OfficeContentNode[] = [];
+                for (const kid of kids) {
+                    if (kid.type === 'image') images.push(kid);
+                    else for (const inner of kid.children ?? []) if (inner.type === 'image') images.push(inner);
+                }
+                // A picture captioned already (by a figure inside this one) keeps its caption, and this
+                // figure's caption stays the paragraph it was read as: the outer one overwrote the inner.
+                if (images.length !== 1 || (images[0].metadata as ImageMetadata | undefined)?.caption) return all;
+                (images[0].metadata = (images[0].metadata ?? {}) as ImageMetadata).caption = text;
+                return markedBefore(anchorIds, kids);
+            }
             if (tagName === 'figcaption' || tagName === 'caption' || (tagName === 'div' && isClass('caption'))) {
                 const caption = parseChildren(node, newFormatting, listContext);
                 if (!caption.some(c => c.type !== 'text' || c.text?.trim())) return [];
@@ -1794,13 +2000,17 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
                 if (writersLabel) return [];
                 // Blocks in it stay blocks (a <p> cannot hold a <p>); each run of inline content (text, a
                 // line break, inline math, a picture) is a paragraph.
-                if (!caption.some(isBlockNode)) return { type: 'paragraph', children: caption };
+                if (!caption.some(isBlockNode)) {
+                    const paragraph: OfficeContentNode = { type: 'paragraph', children: caption };
+                    // A figure's own caption: the figure takes it from here (see the figure branch).
+                    figureCaptions.get(node)?.push(paragraph);
+                    return paragraph;
+                }
                 const parts: OfficeContentNode[] = [];
                 let run: OfficeContentNode[] = [];
                 const flush = () => {
                     // Each run's edges trimmed, as a block's are (a space before the block it stood by stayed).
-                    const children = config.preserveXmlWhitespace ? run : trimBlockEdges(collapseSpacesAcrossNodes(run));
-                    if (children.some(c => c.type !== 'text' || c.text?.trim())) parts.push({ type: 'paragraph', children });
+                    pushRun(parts, run, !!config.preserveXmlWhitespace, c => c.type !== 'text' || !!c.text?.trim());
                     run = [];
                 };
                 for (const child of caption) {
@@ -1834,7 +2044,7 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
                 const children = parseChildren(node, newFormatting, listContext);
 
                 // If it's a div and contains block elements, return children directly
-                const hasBlockElements = children.some(c => ['paragraph', 'table', 'heading', 'list', 'image', 'chart', 'code', 'embed', 'admonition', 'definitionList'].includes(c.type));
+                const hasBlockElements = children.some(c => ['paragraph', 'table', 'heading', 'list', 'image', 'chart', 'code', 'embed', 'admonition', 'disclosure', 'definitionList'].includes(c.type));
                 // A div of blocks is read through; its id marks its first block (HtmlGenerator puts a
                 // picture's there, and a page's section or sheet is linked to by it).
                 if (tagName === 'div' && hasBlockElements) {
@@ -2361,8 +2571,14 @@ export const parseHtml = async (buffer: Buffer, config: FullOfficeParserConfig, 
         const scan = (n: HtmlNode, depth: number, inSection: boolean): void => {
             for (const child of n.children) {
                 if (child.type !== 'element') continue;
-                const href = referenceLinkOf(child)?.attributes?.href;
-                if (href?.startsWith('#')) cited.add(href.slice(1));
+                const link = referenceLinkOf(child);
+                const href = link?.attributes?.href;
+                if (href?.startsWith('#')) {
+                    cited.add(href.slice(1));
+                    // A link in the note back to this reference (EPUB's `<a href="#calledF1">1</a>`, the mark
+                    // repeated at the note's start) is its back-link, not its text.
+                    for (const id of [link!.attributes?.id, child.attributes?.id]) if (id) noteReferenceIds.add(id);
+                }
                 let within = inSection;
                 if (!inSection && isFootnotesSection(child)) { sections.push(child); within = true; }
                 else if (!inSection && noteKind(child)) notes.push(child);
