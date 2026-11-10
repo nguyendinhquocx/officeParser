@@ -4,6 +4,7 @@ import { BaseGenerator } from './BaseGenerator.js';
 import { clampRepeat, median } from '../utils/numberUtils.js';
 import { base64ByteLength } from '../utils/officeGenUtils.js';
 import { trimRepeated } from '../utils/textUtils.js';
+import { droppedHyphen } from '../utils/lineJoins.js';
 
 /** A letter of a right-to-left script (Hebrew, Arabic, Syriac, Thaana, N'Ko and their presentation forms). */
 const RTL_LETTER = /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/;
@@ -311,8 +312,11 @@ export class TextGenerator extends BaseGenerator<'text'> {
             if (typeof ov === 'string') {
                 return n.bounds && ov ? place({ text: ov, x: n.bounds.x, y: n.bounds.y, w: n.bounds.width, h: n.bounds.height }) : -1;
             }
-            if (n.type === 'text' && n.bounds && (n.text || '').length) {
-                const own = place({ text: n.text!, x: n.bounds.x, y: n.bounds.y, w: n.bounds.width, h: n.bounds.height });
+            // (A run the parser took a word's hyphen off, joining the word across a line, is written with it
+            // again, a hyphen that was a run of its own in its own place: the page's lines are kept. See droppedHyphen.)
+            const hyphen = droppedHyphen(n);
+            if (n.type === 'text' && n.bounds && ((n.text || '').length || hyphen)) {
+                const own = place({ text: hyphen ? (n.text || '') + '-' : n.text!, x: n.bounds.x, y: n.bounds.y, w: n.bounds.width, h: n.bounds.height });
                 let first = own;
                 for (const c of n.children || []) first = firstRead(first, await collect(c));
                 return first;

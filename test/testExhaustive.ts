@@ -17,13 +17,19 @@ import { excelShownText } from '../src/utils/excelFormat';
 import { fillPageNumber, pageNumberText } from '../src/utils/pageNumbers';
 import { guardShaping } from '../src/generators/pdf/nativePdfEngine';
 import { OfficeTemplate } from '../src/OfficeTemplate';
+import { readTag } from '../src/template/templateTags';
+import { pictureKindOf, pictureKindOfBase64 } from '../src/utils/imageUtils';
+import { getWarningMessage } from '../src/utils/errorUtils';
+import { markDroppedHyphen } from '../src/utils/lineJoins';
+import { runHyphenBreakGenerator } from './helpers/hyphenBreakGenerator';
 import { OfficeConverter } from '../src/OfficeConverter';
 import { zipSync, strToU8, unzipSync, unzlibSync, strFromU8 } from 'fflate';
 import { PDFDict, PDFDocument, PDFHexString, PDFName, PDFOperator, PDFRawStream, StandardFonts, TextAlignment, degrees, rgb } from 'pdf-lib';
 import * as assert from 'assert';
 import * as path from 'path';
 import * as fs from 'fs';
-import type { ImageMetadata, OfficeContentNode, OfficeParserAST, ShapeMetadata } from '../src/types';
+import type { ImageMetadata, OfficeContentNode, OfficeParserAST, ShapeMetadata, SheetMetadata } from '../src/types';
+import { OfficeWarningType } from '../src/types';
 import { parseXmlString } from '../src/utils/xmlUtils';
 import { decodeWindows1252, textDecoder } from '../src/utils/encodingUtils';
 import { ocrTestHooks, performOcr, terminateOcr } from '../src/utils/ocrUtils';
@@ -5390,6 +5396,581 @@ async function testXlsxShownText(): Promise<void> {
     assert.ok(['01.10.2026', '€120.00', '19%', '7'].every(t => printed.includes(t)) && !printed.includes('0.19'), `the PDF prints what the sheet shows; got ${JSON.stringify(printed)}`);
 }
 
+async function testExcelSheetOrder(): Promise<void> {
+    const ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+    const sheet = (value: number) => strToU8(`<worksheet ${ns}><sheetData><row r="1"><c r="A1"><v>${value}</v></c></row></sheetData></worksheet>`);
+    const xlsx = Buffer.from(zipSync({
+        '[Content_Types].xml': strToU8('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>'),
+        'xl/workbook.xml': strToU8(`<workbook ${ns}><sheets><sheet name="Chart" sheetId="3" r:id="rId3"/><sheet name="First" sheetId="2" r:id="rId2"/><sheet name="Hidden" sheetId="1" state="hidden" r:id="rId1"/></sheets></workbook>`),
+        'xl/_rels/workbook.xml.rels': strToU8('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/><Relationship Id="rId2" Target="/xl/worksheets/sheet2.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/><Relationship Id="rId3" Target="chartsheets/sheet1.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet"/></Relationships>'),
+        'xl/chartsheets/sheet1.xml': strToU8(`<chartsheet ${ns}/>`),
+        'xl/worksheets/sheet4.xml': sheet(4),
+        'xl/worksheets/sheet1.xml': sheet(1),
+        'xl/worksheets/sheet3.xml': sheet(3),
+        'xl/worksheets/sheet2.xml': sheet(2),
+    }));
+
+    const ast = await OfficeParser.parseOffice(xlsx, { fileType: 'xlsx' });
+    assert.deepStrictEqual(ast.content.map(node => {
+        const metadata = node.metadata as SheetMetadata;
+        return [metadata.sheetName, metadata.hidden, node.children?.[0]?.children?.[0]?.text];
+    }), [
+        ['First', undefined, '2'],
+        ['Hidden', true, '1'],
+        ['sheet4.xml', undefined, '4'],
+        ['sheet3.xml', undefined, '3'],
+    ]);
+}
+
+/**
+ * Parts for the XLSX packages of the sheet identity and chart sheet tests: worksheets of inline strings,
+ * chart sheets naming a drawing, drawings of charts and pictures, charts, and relationships parts.
+ */
+const sheetParts = (() => {
+    const ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+    const rel = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+    const cells = (texts: string[]) => texts.map((t, i) => `<row r="${i + 1}"><c r="A${i + 1}" t="inlineStr"><is><t>${t}</t></is></c></row>`).join('');
+    return {
+        zip: (files: Record<string, string | Uint8Array>) => Buffer.from(zipSync(Object.fromEntries(Object.entries(files).map(([k, v]) => [k, typeof v === 'string' ? strToU8(v) : v])))),
+        types: '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>',
+        /** A workbook of `<sheet>` elements: [name, relationship id, hidden?]. */
+        workbook: (sheets: [string, string, boolean?][]) => `<?xml version="1.0"?><workbook ${ns}><sheets>${sheets.map(([name, id, hidden], i) => `<sheet name="${name}" sheetId="${i + 1}"${hidden ? ' state="hidden"' : ''} r:id="${id}"/>`).join('')}</sheets></workbook>`,
+        /** A relationships part: [id, type (the last segment of its URI), target]. */
+        rels: (list: [string, string, string][]) => `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${list.map(([id, type, target]) => `<Relationship Id="${id}" Type="${rel}/${type}" Target="${target}"/>`).join('')}</Relationships>`,
+        worksheet: (texts: string[], extra = '') => `<?xml version="1.0"?><worksheet ${ns}><sheetData>${cells(texts)}</sheetData>${extra}</worksheet>`,
+        chartsheet: (extra = '<drawing r:id="rId1"/>') => `<?xml version="1.0"?><chartsheet ${ns}><sheetViews><sheetView workbookViewId="0"/></sheetViews><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/><pageSetup orientation="landscape"/>${extra}</chartsheet>`,
+        drawing: (inner: string) => `<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="${rel}">${inner}</xdr:wsDr>`,
+        /** A drawing's frame holding the chart its relationship `id` names. */
+        frame: (id: string) => `<xdr:absoluteAnchor><xdr:pos x="0" y="0"/><xdr:ext cx="8000000" cy="5000000"/><xdr:graphicFrame><xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="${id}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:absoluteAnchor>`,
+        /** A drawing's picture of the media its relationship `id` names. */
+        picture: (id: string, descr: string) => `<xdr:oneCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="100" cy="100"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="3" name="Picture" descr="${descr}"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="${id}"/></xdr:blipFill><xdr:spPr/></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>`,
+        /** A column chart titled `title` of the values given. */
+        chart: (title: string, values: number[] = [1, 2]) => `<?xml version="1.0"?><c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:bodyPr/><a:p><a:r><a:t>${title}</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:barDir val="col"/><c:ser><c:idx val="0"/><c:order val="0"/><c:val><c:numRef><c:numCache><c:ptCount val="${values.length}"/>${values.map((v, i) => `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`).join('')}</c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>`,
+        png: Buffer.from(TINY_PNG_B64, 'base64'),
+        /** Each sheet node as [name, hidden, its children as `row:<first cell>` (`+comment` when it has one), `image:<attachment>/<alt>` or `chart:<attachment>`]. */
+        shape: (ast: OfficeParserAST) => ast.content.map(sheet => [(sheet.metadata as SheetMetadata).sheetName, (sheet.metadata as SheetMetadata).hidden, (sheet.children || []).map(child =>
+            child.type === 'row' ? `row:${child.children?.[0]?.text}${child.children?.[0]?.comments?.length ? '+comment' : ''}`
+                : `${child.type}:${(child.metadata as any)?.attachmentName}${(child.metadata as any)?.altText ? '/' + (child.metadata as any).altText : ''}`)]),
+    };
+})();
+
+/**
+ * The package of issue #141: a worksheet and a chart sheet stored as `worksheets/sheet1.xml` and
+ * `chartsheets/sheet1.xml`, with the chart sheet second in tab order (hidden when `hidden`) and its chart
+ * drawn from the worksheet's figures.
+ */
+const chartSheetBesideWorksheet = (hidden: boolean): Buffer => sheetParts.zip({
+    '[Content_Types].xml': sheetParts.types,
+    'xl/workbook.xml': sheetParts.workbook([['Sheet1', 'rId1'], ['Chart1', 'rId2', hidden]]),
+    'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', 'worksheets/sheet1.xml'], ['rId2', 'chartsheet', 'chartsheets/sheet1.xml']]),
+    'xl/worksheets/sheet1.xml': sheetParts.worksheet(['Month', 'January', 'February', 'VISIBLE-ROW']),
+    'xl/chartsheets/sheet1.xml': sheetParts.chartsheet(),
+    'xl/chartsheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', '../drawings/drawing1.xml']]),
+    'xl/drawings/drawing1.xml': sheetParts.drawing(sheetParts.frame('rId1')),
+    'xl/drawings/_rels/drawing1.xml.rels': sheetParts.rels([['rId1', 'chart', '../charts/chart1.xml']]),
+    'xl/charts/chart1.xml': sheetParts.chart('Monthly', [3, 4]),
+});
+
+/**
+ * Issue #141: a chart sheet stored under the same file number as a worksheet (`chartsheets/sheet1.xml`
+ * beside `worksheets/sheet1.xml`) gave the worksheet its name, and since 8.3.0 its hidden state, so a hidden
+ * chart sheet left the worksheet out of a PDF. The workbook's tabs are matched to parts by full path, so
+ * the worksheet keeps its own name and visibility, and the PDF prints it again as v8.2.0 did.
+ */
+async function testExcelChartSheetKeepsWorksheetIdentity(): Promise<void> {
+    const rows = ['row:Month', 'row:January', 'row:February', 'row:VISIBLE-ROW'];
+    for (const hidden of [false, true]) {
+        for (const extractAttachments of [false, true]) {
+            const ast = await OfficeParser.parseOffice(chartSheetBesideWorksheet(hidden), { fileType: 'xlsx', extractAttachments } as any) as OfficeParserAST;
+            assert.deepStrictEqual(sheetParts.shape(ast)[0], ['Sheet1', undefined, rows], `hidden ${hidden}, extractAttachments ${extractAttachments}: the worksheet keeps its name and visibility`);
+        }
+    }
+    const ast = await OfficeParser.parseOffice(chartSheetBesideWorksheet(true), { fileType: 'xlsx' } as any) as OfficeParserAST;
+    const pdf = (await ast.to('pdf', { pdfConfig: { engine: 'native' } } as any)).value as Uint8Array;
+    const back = await OfficeParser.parseOffice(Buffer.from(pdf), { fileType: 'pdf', ocr: false, pdfParserConfig: { separateProcess: false } } as any) as OfficeParserAST;
+    const printed = String((await back.to('text')).value);
+    assert.deepStrictEqual(printed.split(/\s+/).filter(Boolean), ['Month', 'January', 'February', 'VISIBLE-ROW'], `a hidden chart sheet leaves the worksheet in the PDF; got ${JSON.stringify(printed)}`);
+}
+
+/**
+ * A worksheet's and a drawing's relationships are followed to the parts they name, resolved from the
+ * part's own folder, rather than rebuilt from a file name: absolute targets (`/xl/drawings/drawing1.xml`)
+ * placed no picture or chart and attached no comment, a stray copy of a sheet part elsewhere in the
+ * package took the real sheet's relationships, and a stray drawing relationships part was read as the
+ * real drawing's.
+ */
+async function testExcelRelationshipsByPartPath(): Promise<void> {
+    const absolute = sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['Data', 'rId1']]),
+        'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', '/xl/worksheets/sheet1.xml']]),
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['data'], '<drawing r:id="rId1"/>'),
+        'xl/worksheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', '/xl/drawings/drawing1.xml'], ['rId2', 'comments', '/xl/comments1.xml']]),
+        'xl/comments1.xml': '<?xml version="1.0"?><comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>A</author></authors><commentList><comment ref="A1" authorId="0"><text><t>NOTE</t></text></comment></commentList></comments>',
+        'xl/drawings/drawing1.xml': sheetParts.drawing(sheetParts.picture('rId2', 'ALT') + sheetParts.frame('rId1')),
+        'xl/drawings/_rels/drawing1.xml.rels': sheetParts.rels([['rId1', 'chart', '/xl/charts/chart1.xml'], ['rId2', 'image', '/xl/media/image1.png']]),
+        'xl/charts/chart1.xml': sheetParts.chart('Absolute', [5, 6]),
+        'xl/media/image1.png': sheetParts.png,
+    });
+    const plain = await OfficeParser.parseOffice(absolute, { fileType: 'xlsx' } as any) as OfficeParserAST;
+    assert.deepStrictEqual(sheetParts.shape(plain), [['Data', undefined, ['row:data+comment']]], 'absolute targets: the comment is attached');
+    const withAttachments = await OfficeParser.parseOffice(absolute, { fileType: 'xlsx', extractAttachments: true } as any) as OfficeParserAST;
+    assert.deepStrictEqual(sheetParts.shape(withAttachments), [['Data', undefined, ['row:data+comment', 'image:image1.png/ALT', 'chart:chart1.xml']]], 'absolute targets: the picture, with its alt text, and the chart are placed');
+    const chartNode = withAttachments.content[0].children!.find(c => c.type === 'chart')!;
+    assert.strictEqual(chartNode.text, withAttachments.attachments.find(a => a.name === 'chart1.xml')!.chartData!.rawTexts.join('\n'), 'absolute targets: the chart node carries its chart\'s text');
+    assert.strictEqual(withAttachments.attachments.find(a => a.name === 'image1.png')!.altText, 'ALT', 'absolute targets: the picture\'s attachment carries its alt text');
+
+    // A stray copy of the sheet part and of the drawing's relationships part, stored before the real ones
+    // (the stray drawing relationships part names another chart under the real one's id).
+    const stray = (listed: boolean) => sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['Data', 'rId1']]),
+        ...(listed ? { 'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', 'worksheets/sheet1.xml']]) } : {}),
+        'backup/xl/worksheets/sheet1.xml': sheetParts.worksheet(['stray'], '<drawing r:id="rId1"/>'),
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['data'], '<drawing r:id="rId1"/>'),
+        'xl/worksheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', '../drawings/drawing1.xml']]),
+        'xl/drawings/drawing1.xml': sheetParts.drawing(sheetParts.frame('rId1')),
+        'xl/drawings/_rels/drawing1.xml.rels': sheetParts.rels([['rId1', 'chart', '../charts/chart1.xml']]),
+        'backup/xl/drawings/_rels/drawing1.xml.rels': sheetParts.rels([['rId1', 'chart', '../charts/chart2.xml']]),
+        'xl/charts/chart1.xml': sheetParts.chart('Real', [7, 8]),
+        'xl/charts/chart2.xml': sheetParts.chart('Stray', [9, 10]),
+    });
+    for (const listed of [true, false]) {
+        const ast = await OfficeParser.parseOffice(stray(listed), { fileType: 'xlsx', extractAttachments: true } as any) as OfficeParserAST;
+        const shape = sheetParts.shape(ast);
+        const real = shape.find(sheet => (sheet[2] as string[])[0] === 'row:data');
+        const copy = shape.find(sheet => (sheet[2] as string[])[0] === 'row:stray');
+        assert.deepStrictEqual([real?.[2], copy?.[2]], [['row:data', 'chart:chart1.xml'], ['row:stray']], `listed ${listed}: the real sheet keeps its drawing and the drawing its own chart; got ${JSON.stringify(shape)}`);
+    }
+}
+
+/**
+ * A relationship whose target names its part other than to the letter of the spec still finds the part, as
+ * in v8.7.0: a target written from the package root (`xl/worksheets/sheet1.xml`), one missing its `../`
+ * (`comments1.xml`, `charts/chart1.xml`), a bare file name, or a folder or file name in another case
+ * (`Worksheets/Sheet1.xml`, `../Charts/chart1.xml`). A file name alone finds a part only in the folder its
+ * kind of part lives in, or when no other part in the package has that name, so the worksheet and chart
+ * sheet of issue #141, both `sheet1.xml`, keep their own tabs, and an external picture never takes one of
+ * the package's images.
+ */
+async function testExcelRelationshipTargetsNotToTheLetter(): Promise<void> {
+    const parse = async (buffer: Buffer, extractAttachments: boolean) => await OfficeParser.parseOffice(buffer, { fileType: 'xlsx', extractAttachments } as any) as OfficeParserAST;
+    const note = '<?xml version="1.0"?><comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>A</author></authors><commentList><comment ref="A1" authorId="0"><text><t>NOTE</t></text></comment></commentList></comments>';
+    // One worksheet with a comment and a drawing of a picture and a chart, under the targets given.
+    const sheetWith = (t: { sheet: string; drawing: string; comments: string; chart: string; media: string }, extra: Record<string, string | Uint8Array> = {}) => sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['Data', 'rId1']]),
+        'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', t.sheet]]),
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['data'], '<drawing r:id="rId1"/>'),
+        'xl/worksheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', t.drawing], ['rId2', 'comments', t.comments]]),
+        'xl/comments1.xml': note,
+        'xl/drawings/drawing1.xml': sheetParts.drawing(sheetParts.picture('rId2', 'ALT') + sheetParts.frame('rId1')),
+        'xl/drawings/_rels/drawing1.xml.rels': sheetParts.rels([['rId1', 'chart', t.chart], ['rId2', 'image', t.media]]),
+        'xl/charts/chart1.xml': sheetParts.chart('Sloppy', [5, 6]),
+        'xl/media/image1.png': sheetParts.png,
+        ...extra,
+    });
+    const standard = { sheet: 'worksheets/sheet1.xml', drawing: '../drawings/drawing1.xml', comments: '../comments1.xml', chart: '../charts/chart1.xml', media: '../media/image1.png' };
+
+    // Each variant reads the tab's name, its comment, picture and chart, as v8.7.0 did. (A picture is placed
+    // only from a target naming a `media/` folder, so a bare file name or a cased `Media/` places none, as before.)
+    const variants: [string, typeof standard, boolean][] = [
+        ['the workbook target from the package root', { ...standard, sheet: 'xl/worksheets/sheet1.xml' }, true],
+        ['every target from the package root', { sheet: 'xl/worksheets/sheet1.xml', drawing: 'xl/drawings/drawing1.xml', comments: 'xl/comments1.xml', chart: 'xl/charts/chart1.xml', media: 'xl/media/image1.png' }, true],
+        ['drawing and comments without ../', { ...standard, drawing: 'drawings/drawing1.xml', comments: 'comments1.xml' }, true],
+        ['chart and picture without ../', { ...standard, chart: 'charts/chart1.xml', media: 'media/image1.png' }, true],
+        ['bare file names', { sheet: 'sheet1.xml', drawing: 'drawing1.xml', comments: 'comments1.xml', chart: 'chart1.xml', media: 'image1.png' }, false],
+        ['folders in another case', { sheet: 'Worksheets/sheet1.xml', drawing: '../Drawings/drawing1.xml', comments: '../Comments1.xml', chart: '../Charts/chart1.xml', media: '../media/image1.png' }, true],
+        ['file names in another case', { sheet: 'worksheets/Sheet1.xml', drawing: '../drawings/Drawing1.xml', comments: '../COMMENTS1.xml', chart: '../charts/Chart1.xml', media: '../media/Image1.png' }, true],
+    ];
+    for (const [name, targets, picture] of variants) {
+        const xlsx = sheetWith(targets);
+        assert.deepStrictEqual(sheetParts.shape(await parse(xlsx, false)), [['Data', undefined, ['row:data+comment']]], `${name}: the tab's name and the comment`);
+        const placed = sheetParts.shape(await parse(xlsx, true));
+        assert.deepStrictEqual(placed, [['Data', undefined, ['row:data+comment', ...(picture ? ['image:image1.png/ALT'] : []), 'chart:chart1.xml']]], `${name}: the picture and the chart are placed; got ${JSON.stringify(placed)}`);
+    }
+
+    // Issue #141's package, its targets written from the root, bare or in another case: the worksheet keeps its
+    // name and visibility, the hidden chart sheet its own (a bare `sheet1.xml` names both, and each tab's
+    // relationship type says which folder its part is in).
+    const rows = ['row:Month', 'row:January', 'row:February', 'row:VISIBLE-ROW'];
+    const issue141 = (worksheet: string, chartsheet: string, drawing = '../drawings/drawing1.xml') => sheetParts.zip({
+        ...unzipSync(chartSheetBesideWorksheet(true)),
+        'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', worksheet], ['rId2', 'chartsheet', chartsheet]]),
+        'xl/chartsheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', drawing]]),
+    });
+    for (const [name, xlsx] of [
+        ['from the package root', issue141('xl/worksheets/sheet1.xml', 'xl/chartsheets/sheet1.xml')],
+        ['bare file names', issue141('sheet1.xml', 'sheet1.xml')],
+        ['in another case', issue141('Worksheets/Sheet1.xml', 'ChartSheets/sheet1.xml', '../Drawings/drawing1.xml')],
+    ] as const) {
+        assert.deepStrictEqual(sheetParts.shape(await parse(xlsx, false)), [['Sheet1', undefined, rows]], `#141 ${name}: the worksheet keeps its name and visibility`);
+        assert.deepStrictEqual(sheetParts.shape(await parse(xlsx, true)), [['Sheet1', undefined, rows], ['Chart1', true, ['chart:chart1.xml']]], `#141 ${name}: the chart sheet keeps its name, hidden state and chart`);
+    }
+    // A tab of no known sheet type naming `sheet1.xml` from elsewhere picks neither part.
+    const untyped = sheetParts.zip({
+        ...unzipSync(chartSheetBesideWorksheet(true)),
+        'xl/workbook.xml': sheetParts.workbook([['Sheet1', 'rId1'], ['Odd', 'rId2', true]]),
+        'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', 'worksheets/sheet1.xml'], ['rId2', 'customsheet', 'other/sheet1.xml']]),
+    });
+    const untypedShape = sheetParts.shape(await parse(untyped, true));
+    assert.ok(!JSON.stringify(untypedShape).includes('Odd'), `a file name two parts share names neither; got ${JSON.stringify(untypedShape)}`);
+    assert.deepStrictEqual(untypedShape[0], ['Sheet1', undefined, rows], 'and the worksheet keeps its name and visibility');
+
+    // Two parts sharing a file name, neither in the folder the target's kind of part lives in: neither is
+    // taken by name. One part of the name is.
+    const notes = (parts: string[]) => sheetWith({ ...standard, comments: 'notes/comments7.xml' }, Object.fromEntries(parts.map(p => [p, note])));
+    assert.deepStrictEqual(sheetParts.shape(await parse(notes(['a/xl/comments7.xml', 'b/xl/comments7.xml']), false)), [['Data', undefined, ['row:data']]], 'two comments parts of one name: neither is attached');
+    assert.deepStrictEqual(sheetParts.shape(await parse(notes(['a/xl/comments7.xml']), false)), [['Data', undefined, ['row:data']]], 'a comments part of that name outside xl/ is a stray copy: not attached');
+    const graphs = sheetWith({ ...standard, chart: '../graphs/chart7.xml' }, { 'a/xl/charts/chart7.xml': sheetParts.chart('A'), 'b/xl/charts/chart7.xml': sheetParts.chart('B') });
+    assert.deepStrictEqual(sheetParts.shape(await parse(graphs, true)), [['Data', undefined, ['row:data+comment', 'image:image1.png/ALT']]], 'two charts of one name: neither is placed');
+    const strayChart = sheetWith({ ...standard, chart: '../graphs/chart1.xml' }, { 'backup/xl/charts/chart1.xml': sheetParts.chart('Stray') });
+    const strayShape = await parse(strayChart, true);
+    assert.deepStrictEqual(sheetParts.shape(strayShape), [['Data', undefined, ['row:data+comment', 'image:image1.png/ALT', 'chart:chart1.xml']]], 'a chart named from the wrong folder is the one in the charts folder');
+    assert.strictEqual(strayShape.content[0].children!.find(c => c.type === 'chart')!.text, '5\n6', 'and not its stray copy');
+
+    // An external picture (by its scheme, or TargetMode="External") never takes the package's image of its name.
+    const external = sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['Data', 'rId1']]),
+        'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', 'worksheets/sheet1.xml']]),
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['data'], '<drawing r:id="rId1"/>'),
+        'xl/worksheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', '../drawings/drawing1.xml']]),
+        'xl/drawings/drawing1.xml': sheetParts.drawing(sheetParts.picture('rId1', 'WEB') + sheetParts.picture('rId3', 'LINKED') + sheetParts.picture('rId2', 'INT')),
+        'xl/drawings/_rels/drawing1.xml.rels': sheetParts.rels([['rId1', 'image', 'https://example.com/media/image1.png'], ['rId2', 'image', '../media/image1.png']])
+            .replace('</Relationships>', '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png" TargetMode="External"/></Relationships>'),
+        'xl/media/image1.png': sheetParts.png,
+    });
+    const pictures = (await parse(external, true)).content[0].children!.filter(c => (c.metadata as any)?.attachmentName === 'image1.png').map(c => (c.metadata as any).altText);
+    assert.deepStrictEqual(pictures, ['INT'], `only the internal picture is the package's image; got ${JSON.stringify(pictures)}`);
+
+    // Linear time: lookups that fall through every step. Sheets named from the package root, each with
+    // relationships to a missing part whose file name half as many parts share; and one sheet of many missing,
+    // long targets.
+    const many = (n: number) => sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook(Array.from({ length: n }, (_, i) => [`S${i + 1}`, `rId${i + 1}`] as [string, string])),
+        'xl/_rels/workbook.xml.rels': sheetParts.rels(Array.from({ length: n }, (_, i) => [`rId${i + 1}`, 'worksheet', `xl/worksheets/sheet${i + 1}.xml`] as [string, string, string])),
+        ...Object.fromEntries(Array.from({ length: n }, (_, i) => [
+            [`xl/worksheets/sheet${i + 1}.xml`, sheetParts.worksheet([`r${i + 1}`])],
+            [`xl/worksheets/_rels/sheet${i + 1}.xml.rels`, sheetParts.rels(Array.from({ length: 10 }, (_, j) => [`rId${j + 1}`, 'comments', 'nothere/shared.xml'] as [string, string, string]))],
+            ...(i % 2 ? [[`dup${i}/shared.xml`, '<x/>']] : []),
+        ]).flat()),
+    });
+    const wide = (m: number) => sheetWith(standard, {
+        'xl/worksheets/_rels/sheet1.xml.rels': sheetParts.rels(Array.from({ length: m }, (_, j) => [`rId${j + 1}`, j % 2 ? 'comments' : 'drawing', `../${'Deep/'.repeat(40)}missing${j}.xml`] as [string, string, string])),
+    });
+    const timed = async (xlsx: Buffer) => { const started = performance.now(); await parse(xlsx, true); return performance.now() - started; };
+    for (const [name, shape, n] of [['sheets named from the root', many, 2000], ['missing long targets', wide, 40000]] as const) {
+        const [large, quarter] = [shape(n), shape(n / 4)];
+        const named = sheetParts.shape(await parse(large, false));
+        if (shape === many) assert.ok(named.length === n && named.every((s, i) => s[0] === `S${i + 1}`), `${name}: every tab keeps its name`);
+        let small = await timed(quarter);
+        let big = await timed(large);
+        if (big > 8 * small + 250) {
+            small = Math.max(small, await timed(quarter));
+            big = Math.min(big, await timed(large));
+        }
+        assert.ok(big <= 8 * small + 250, `${name}: ${n} in ${big.toFixed(0)} ms, ${n / 4} in ${small.toFixed(0)} ms`);
+    }
+}
+
+/**
+ * A fallback by file name takes only a part of the kind the relationship names, in that kind's folder:
+ * a missing worksheet's tab never takes the chart sheet of the same file name (nor the reverse), and a
+ * stray copy elsewhere in the package (`old/xl/comments1.xml`) is never attached.
+ */
+async function testExcelFallbackTakesOnlyItsKind(): Promise<void> {
+    const parse = async (buffer: Buffer, extractAttachments: boolean) => await OfficeParser.parseOffice(buffer, { fileType: 'xlsx', extractAttachments } as any) as OfficeParserAST;
+    const note = '<?xml version="1.0"?><comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>A</author></authors><commentList><comment ref="A1" authorId="0"><text><t>NOTE</t></text></comment></commentList></comments>';
+    const both = sheetParts.rels([['rId1', 'worksheet', 'worksheets/sheet1.xml'], ['rId2', 'chartsheet', 'chartsheets/sheet1.xml']]);
+    const chartPart = {
+        'xl/chartsheets/sheet1.xml': sheetParts.chartsheet(),
+        'xl/chartsheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', '../drawings/drawing1.xml']]),
+        'xl/drawings/drawing1.xml': sheetParts.drawing(sheetParts.frame('rId1')),
+        'xl/drawings/_rels/drawing1.xml.rels': sheetParts.rels([['rId1', 'chart', '../charts/chart1.xml']]),
+        'xl/charts/chart1.xml': sheetParts.chart('CT'),
+    };
+    // The worksheet part is missing: its tab (hidden) reads nothing and takes not the chart sheet.
+    const noWorksheet = sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['Data', 'rId1', true], ['Chart1', 'rId2']]),
+        'xl/_rels/workbook.xml.rels': both,
+        ...chartPart,
+    });
+    const tabs = sheetParts.shape(await parse(noWorksheet, true));
+    assert.deepStrictEqual(tabs.find(t => t[0] === 'Chart1'), ['Chart1', undefined, ['chart:chart1.xml']], `the chart sheet keeps its own tab; got ${JSON.stringify(tabs)}`);
+    assert.ok(!tabs.some(t => t[0] === 'Data' && (t[2] as string[]).length > 0), `the missing worksheet's tab does not take the chart; got ${JSON.stringify(tabs)}`);
+    // The chart sheet part is missing: the worksheet keeps its tab, its rows and its visibility.
+    const noChartsheet = sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['Chart1', 'rId2', true], ['Data', 'rId1']]),
+        'xl/_rels/workbook.xml.rels': both,
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['VISIBLE']),
+    });
+    const shape = sheetParts.shape(await parse(noChartsheet, false));
+    assert.ok(shape.some(s => s[0] === 'Data' && s[1] === undefined && (s[2] as string[]).includes('row:VISIBLE')), `the worksheet keeps its tab and visibility; got ${JSON.stringify(shape)}`);
+    assert.ok(!shape.some(s => s[0] === 'Chart1' && (s[2] as string[]).includes('row:VISIBLE')), 'the missing chart sheet\'s tab does not take the worksheet');
+
+    // Stray copies elsewhere in the package are not attached.
+    const withSheet = (comments: string, extra: Record<string, string | Uint8Array>) => sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['Data', 'rId1']]),
+        'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', 'worksheets/sheet1.xml']]),
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['data'], '<drawing r:id="rId1"/>'),
+        'xl/worksheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', '../drawings/drawing1.xml'], ['rId2', 'comments', comments]]),
+        'xl/drawings/drawing1.xml': sheetParts.drawing(sheetParts.picture('rId1', 'PIC')),
+        'xl/drawings/_rels/drawing1.xml.rels': sheetParts.rels([['rId1', 'image', '../media/image7.png']]),
+        ...extra,
+    });
+    assert.deepStrictEqual(sheetParts.shape(await parse(withSheet('../comments1.xml', { 'old/xl/comments1.xml': note }), false)), [['Data', undefined, ['row:data']]], 'a stray old/xl/comments1.xml is never attached');
+    assert.deepStrictEqual(sheetParts.shape(await parse(withSheet('../comments1.xml', { 'xl/comments1.xml': note }), false)), [['Data', undefined, ['row:data+comment']]], 'the comments part in xl/ is');
+    assert.deepStrictEqual(sheetParts.shape(await parse(withSheet('comments1.xml', { 'xl/comments1.xml': note }), false)), [['Data', undefined, ['row:data+comment']]], 'a target missing its ../ still finds it');
+    assert.deepStrictEqual(sheetParts.shape(await parse(withSheet('../comments1.xml', { 'xl/media/x/image7.png': sheetParts.png }), true)), [['Data', undefined, ['row:data']]], 'an image kept in a subfolder of media is not taken for xl/media/image7.png');
+    assert.deepStrictEqual(sheetParts.shape(await parse(withSheet('../comments1.xml', { 'xl/media/image7.png': sheetParts.png }), true)), [['Data', undefined, ['row:data', 'image:image7.png/PIC']]], 'the image in xl/media is placed');
+    const strayDrawing = sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['Data', 'rId1']]),
+        'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', 'worksheets/sheet1.xml']]),
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['data'], '<drawing r:id="rId1"/>'),
+        'xl/worksheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', '../drawings/drawing5.xml']]),
+        'old/xl/drawings/drawing5.xml': sheetParts.drawing(sheetParts.picture('rId1', 'STRAY')),
+        'old/xl/drawings/_rels/drawing5.xml.rels': sheetParts.rels([['rId1', 'image', '../media/image1.png']]),
+        'xl/media/image1.png': sheetParts.png,
+    });
+    assert.deepStrictEqual(sheetParts.shape(await parse(strayDrawing, true)), [['Data', undefined, ['row:data']]], 'a stray drawing outside xl/ is never read');
+}
+
+/**
+ * A fallback never takes a part another relationship names more closely. A sheet whose own part is
+ * missing does not take the sheet, comments or drawing that another sheet names exactly, whichever tab is
+ * read first. Two relationships that both miss and fall back to one part are a tie: the first tab keeps it.
+ */
+async function testExcelFallbackNeverTakesNamedPart(): Promise<void> {
+    const parse = async (buffer: Buffer, extractAttachments: boolean) => await OfficeParser.parseOffice(buffer, { fileType: 'xlsx', extractAttachments, onWarning: () => {} } as any) as OfficeParserAST;
+    const note = '<?xml version="1.0"?><comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>A</author></authors><commentList><comment ref="A1" authorId="0"><text><t>NOTE</t></text></comment></commentList></comments>';
+    const two = sheetParts.rels([['rId1', 'worksheet', 'worksheets/sheet1.xml'], ['rId2', 'worksheet', 'worksheets/sheet2.xml']]);
+    const orders: [string, string, boolean?][][] = [[['A', 'rId1'], ['B', 'rId2']], [['B', 'rId2'], ['A', 'rId1']]];
+    const byName = (shape: ReturnType<typeof sheetParts.shape>, name: string) => shape.find(s => s[0] === name);
+    for (const order of orders) {
+        const label = order.map(t => t[0]).join(',');
+        // B names old/sheet1.xml, a part the package lacks, while A names worksheets/sheet1.xml exactly.
+        const sheets = sheetParts.zip({
+            '[Content_Types].xml': sheetParts.types,
+            'xl/workbook.xml': sheetParts.workbook(order as [string, string, boolean?][]),
+            'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', 'worksheets/sheet1.xml'], ['rId2', 'worksheet', 'old/sheet1.xml']]),
+            'xl/worksheets/sheet1.xml': sheetParts.worksheet(['a']),
+        });
+        const shape = sheetParts.shape(await parse(sheets, false));
+        assert.deepStrictEqual(byName(shape, 'A'), ['A', undefined, ['row:a']], `sheet, tabs ${label}: A keeps its own sheet; got ${JSON.stringify(shape)}`);
+        assert.ok(!(byName(shape, 'B')?.[2] as string[] | undefined)?.length, `sheet, tabs ${label}: B does not take A's sheet; got ${JSON.stringify(shape)}`);
+
+        // The same for a comments part: B names ../old/comments1.xml, A names ../comments1.xml.
+        const comments = (target: string) => sheetParts.zip({
+            '[Content_Types].xml': sheetParts.types,
+            'xl/workbook.xml': sheetParts.workbook(order as [string, string, boolean?][]),
+            'xl/_rels/workbook.xml.rels': two,
+            'xl/worksheets/sheet1.xml': sheetParts.worksheet(['a']),
+            'xl/worksheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId2', 'comments', '../comments1.xml']]),
+            'xl/worksheets/sheet2.xml': sheetParts.worksheet(['b']),
+            'xl/worksheets/_rels/sheet2.xml.rels': sheetParts.rels([['rId2', 'comments', target]]),
+            'xl/comments1.xml': note,
+        });
+        const withNote = sheetParts.shape(await parse(comments('../old/comments1.xml'), false));
+        assert.deepStrictEqual(byName(withNote, 'A'), ['A', undefined, ['row:a+comment']], `comments, tabs ${label}: A keeps its comment; got ${JSON.stringify(withNote)}`);
+        assert.deepStrictEqual(byName(withNote, 'B'), ['B', undefined, ['row:b']], `comments, tabs ${label}: B takes none; got ${JSON.stringify(withNote)}`);
+
+        // And for a drawing, with its picture and chart.
+        const drawings = (target: string) => sheetParts.zip({
+            '[Content_Types].xml': sheetParts.types,
+            'xl/workbook.xml': sheetParts.workbook(order as [string, string, boolean?][]),
+            'xl/_rels/workbook.xml.rels': two,
+            'xl/worksheets/sheet1.xml': sheetParts.worksheet(['a'], '<drawing r:id="rId1"/>'),
+            'xl/worksheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', '../drawings/drawing1.xml']]),
+            'xl/worksheets/sheet2.xml': sheetParts.worksheet(['b'], '<drawing r:id="rId1"/>'),
+            'xl/worksheets/_rels/sheet2.xml.rels': sheetParts.rels([['rId1', 'drawing', target]]),
+            'xl/drawings/drawing1.xml': sheetParts.drawing(sheetParts.picture('rId1', 'PIC') + sheetParts.frame('rId2')),
+            'xl/drawings/_rels/drawing1.xml.rels': sheetParts.rels([['rId1', 'image', '../media/image1.png'], ['rId2', 'chart', '../charts/chart1.xml']]),
+            'xl/media/image1.png': sheetParts.png,
+            'xl/charts/chart1.xml': sheetParts.chart('CH', [7, 8]),
+        });
+        const withDrawing = sheetParts.shape(await parse(drawings('../drawings/old/drawing1.xml'), true));
+        assert.deepStrictEqual(byName(withDrawing, 'A'), ['A', undefined, ['row:a', 'image:image1.png/PIC', 'chart:chart1.xml']], `drawing, tabs ${label}: A keeps its picture and chart; got ${JSON.stringify(withDrawing)}`);
+        assert.deepStrictEqual(byName(withDrawing, 'B'), ['B', undefined, ['row:b']], `drawing, tabs ${label}: B takes none; got ${JSON.stringify(withDrawing)}`);
+    }
+
+    // Both relationships miss and fall back to the one part: a tie, the first tab keeps it.
+    for (const order of orders) {
+        const tie = sheetParts.zip({
+            '[Content_Types].xml': sheetParts.types,
+            'xl/workbook.xml': sheetParts.workbook(order as [string, string, boolean?][]),
+            'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', 'old/sheet1.xml'], ['rId2', 'worksheet', 'older/sheet1.xml']]),
+            'xl/worksheets/sheet1.xml': sheetParts.worksheet(['a']),
+        });
+        const shape = sheetParts.shape(await parse(tie, false));
+        const holders = shape.filter(s => (s[2] as string[]).includes('row:a')).map(s => s[0]);
+        assert.deepStrictEqual(holders, [order[0][0]], `a tie: the first tab (${order[0][0]}) keeps the part; got ${JSON.stringify(shape)}`);
+    }
+
+    // Many relationships to missing parts stay linear: a packages of 20000 sheets answers in a few seconds.
+    const many = 20000;
+    const ids = Array.from({ length: many }, (_, i) => i + 1);
+    const big = sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook(ids.map(i => [`S${i}`, `rId${i}`] as [string, string])),
+        'xl/_rels/workbook.xml.rels': sheetParts.rels(ids.map(i => [`rId${i}`, 'worksheet', `old/sheet${i}.xml`] as [string, string, string])),
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['a']),
+    });
+    const started = Date.now();
+    await parse(big, false);
+    assert.ok(Date.now() - started < 20000, `${many} relationships to missing parts are read in linear time; took ${Date.now() - started} ms`);
+}
+
+/**
+ * Each relationships part is read and charged to the element budget once, and only relationships a reader
+ * follows claim a part: a workbook of hyperlinks needs the elements it holds (not twice as many), and a
+ * hyperlink, an unreferenced workbook relationship or a sheet's background picture never blocks the
+ * fallback of a relationship that names a part its reader follows.
+ */
+async function testExcelRelationshipsReadOnce(): Promise<void> {
+    const parse = async (buffer: Buffer, cfg: Record<string, unknown>) => await OfficeParser.parseOffice(buffer, { fileType: 'xlsx', onWarning: () => {}, ...cfg } as any) as OfficeParserAST;
+    const note = '<?xml version="1.0"?><comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>A</author></authors><commentList><comment ref="A1" authorId="0"><text><t>NOTE</t></text></comment></commentList></comments>';
+    const one = sheetParts.rels([['rId1', 'worksheet', 'worksheets/sheet1.xml']]);
+
+    // One sheet of 1000 hyperlinks: the smallest maxXmlElements that parses is what the XML holds
+    // (1009 in v8.7.0), whether or not attachments are read.
+    const n = 1000;
+    const links = Array.from({ length: n }, (_, i) => i + 1);
+    const hyperlinks = `<hyperlinks>${links.map(i => `<hyperlink ref="A${i}" r:id="rId${i}"/>`).join('')}</hyperlinks>`;
+    const linked = sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['Links', 'rId1']]),
+        'xl/_rels/workbook.xml.rels': one,
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(links.map(i => `link${i}`), hyperlinks),
+        'xl/worksheets/_rels/sheet1.xml.rels': `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${links.map(i => `<Relationship Id="rId${i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/${i}" TargetMode="External"/>`).join('')}</Relationships>`,
+    });
+    for (const extractAttachments of [false, true]) {
+        const parses = async (maxXmlElements: number) => { try { await parse(linked, { extractAttachments, decompressionLimits: { maxXmlElements } }); return true; } catch { return false; } };
+        let lo = 1, hi = 10 * n;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (await parses(mid)) hi = mid; else lo = mid + 1; }
+        assert.strictEqual(lo, 1009, `${n} hyperlinks (extractAttachments ${extractAttachments}): the smallest maxXmlElements that parses is the 1009 v8.7.0 needed; got ${lo}`);
+    }
+
+    // A hyperlink naming a comments part exactly does not block the comments relationship's fallback.
+    const hyperlinkNamesComments = sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['A', 'rId1']]),
+        'xl/_rels/workbook.xml.rels': one,
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['a'], '<hyperlinks><hyperlink ref="A1" r:id="rId3"/></hyperlinks>'),
+        'xl/worksheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId2', 'comments', 'comments1.xml'], ['rId3', 'hyperlink', '../comments1.xml']]),
+        'xl/comments1.xml': note,
+    });
+    assert.deepStrictEqual(sheetParts.shape(await parse(hyperlinkNamesComments, {})), [['A', undefined, ['row:a+comment']]], 'a hyperlink naming the comments part does not block its fallback');
+
+    // An unreferenced workbook relationship naming a sheet exactly does not block the tab's fallback.
+    const unreferenced = sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['A', 'rId1']]),
+        'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', 'xl/worksheets/sheet1.xml'], ['rId9', 'worksheet', 'worksheets/sheet1.xml']]),
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['a']),
+    });
+    assert.deepStrictEqual(sheetParts.shape(await parse(unreferenced, {})), [['A', undefined, ['row:a']]], 'a workbook relationship no tab names does not block a tab\'s fallback');
+
+    // A sheet's background picture naming the picture exactly does not block the drawing picture's fallback.
+    const background = sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['A', 'rId1']]),
+        'xl/_rels/workbook.xml.rels': one,
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['a'], '<drawing r:id="rId1"/><picture r:id="rId2"/>'),
+        'xl/worksheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', '../drawings/drawing1.xml'], ['rId2', 'image', '../media/image1.png']]),
+        'xl/drawings/drawing1.xml': sheetParts.drawing(sheetParts.picture('rId1', 'PIC')),
+        'xl/drawings/_rels/drawing1.xml.rels': sheetParts.rels([['rId1', 'image', 'media/image1.png']]),
+        'xl/media/image1.png': sheetParts.png,
+    });
+    assert.deepStrictEqual(sheetParts.shape(await parse(background, { extractAttachments: true })), [['A', undefined, ['row:a', 'image:image1.png/PIC']]], 'a sheet background picture does not block the drawing picture\'s fallback');
+
+    // A relationship a reader follows still claims its part: A's exact sheet is not taken by B's fallback.
+    const claimed = sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['B', 'rId2'], ['A', 'rId1']]),
+        'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', 'worksheets/sheet1.xml'], ['rId2', 'worksheet', 'old/sheet1.xml']]),
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['a']),
+    });
+    const claimedShape = sheetParts.shape(await parse(claimed, {}));
+    assert.deepStrictEqual(claimedShape.find(s => s[0] === 'A'), ['A', undefined, ['row:a']], 'A keeps the sheet it names exactly');
+    assert.ok(!(claimedShape.find(s => s[0] === 'B')?.[2] as string[] | undefined)?.length, 'B does not take it');
+}
+
+/**
+ * Issue #142: a chart moved to a chart sheet of its own reached the attachments but not the content, so
+ * the text, chunks and every writer left it out. With extractAttachments, a chart sheet is a sheet node in
+ * its tab's place holding its drawing's charts and pictures, under its name and hidden state; without it,
+ * the content is as before.
+ */
+async function testExcelChartSheetPlacedInItsTab(): Promise<void> {
+    const parse = async (buffer: Buffer, extractAttachments = true) => await OfficeParser.parseOffice(buffer, { fileType: 'xlsx', extractAttachments } as any) as OfficeParserAST;
+    const rows = ['row:Month', 'row:January', 'row:February', 'row:VISIBLE-ROW'];
+
+    // The issue's package: the chart sheet second in tab order, its chart's text on the chart node.
+    for (const hidden of [false, true]) {
+        const ast = await parse(chartSheetBesideWorksheet(hidden));
+        assert.deepStrictEqual(sheetParts.shape(ast), [['Sheet1', undefined, rows], ['Chart1', hidden || undefined, ['chart:chart1.xml']]], `hidden ${hidden}: the chart sheet is placed after the worksheet, under its name`);
+        const chartNode = ast.content[1].children![0];
+        assert.strictEqual(chartNode.text, ast.attachments.find(a => a.name === 'chart1.xml')!.chartData!.rawTexts.join('\n'), `hidden ${hidden}: the chart node carries its chart's text`);
+        const setup = (ast.content[1].metadata as SheetMetadata).pageSetup;
+        assert.ok((setup?.width ?? 0) > (setup?.height ?? 0), `hidden ${hidden}: the chart sheet's own page setup (landscape) is read; got ${JSON.stringify(setup)}`);
+    }
+
+    // Without extractAttachments, the chart sheet adds nothing: the content is that of the package without it.
+    const withoutChartSheet = sheetParts.zip(Object.fromEntries(Object.entries(unzipSync(chartSheetBesideWorksheet(false))).filter(([name]) => !name.startsWith('xl/chartsheets/'))));
+    assert.deepStrictEqual(JSON.stringify((await parse(chartSheetBesideWorksheet(false), false)).content), JSON.stringify((await parse(withoutChartSheet, false)).content), 'without extractAttachments the content is unchanged');
+
+    // A hidden chart sheet first in tab order: placed first, hidden, and printed only with printHidden.
+    const chartFirst = (hidden: boolean, picture: boolean, worksheetExtra = '', extra: Record<string, string | Uint8Array> = {}) => sheetParts.zip({
+        '[Content_Types].xml': sheetParts.types,
+        'xl/workbook.xml': sheetParts.workbook([['Chart1', 'rId2', hidden], ['Data', 'rId1']]),
+        'xl/_rels/workbook.xml.rels': sheetParts.rels([['rId1', 'worksheet', 'worksheets/sheet1.xml'], ['rId2', 'chartsheet', 'chartsheets/sheet1.xml']]),
+        'xl/worksheets/sheet1.xml': sheetParts.worksheet(['data'], worksheetExtra),
+        'xl/chartsheets/sheet1.xml': sheetParts.chartsheet(),
+        'xl/chartsheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', '../drawings/drawing1.xml']]),
+        'xl/drawings/drawing1.xml': sheetParts.drawing(sheetParts.frame('rId1') + (picture ? sheetParts.picture('rId2', 'LOGO') : '')),
+        'xl/drawings/_rels/drawing1.xml.rels': sheetParts.rels([['rId1', 'chart', '../charts/chart1.xml'], ...(picture ? [['rId2', 'image', '../media/image1.png'] as [string, string, string]] : [])]),
+        'xl/charts/chart1.xml': sheetParts.chart('OnChartSheet', [11, 12]),
+        ...(picture ? { 'xl/media/image1.png': sheetParts.png } : {}),
+        ...extra,
+    });
+    const hiddenFirst = await parse(chartFirst(true, false));
+    assert.deepStrictEqual(sheetParts.shape(hiddenFirst), [['Chart1', true, ['chart:chart1.xml']], ['Data', undefined, ['row:data']]], 'a hidden chart sheet first in tab order is placed first, hidden');
+    for (const printHidden of [false, true]) {
+        const pdf = (await hiddenFirst.to('pdf', { pdfConfig: { engine: 'native', printHidden } } as any)).value as Uint8Array;
+        const back = await OfficeParser.parseOffice(Buffer.from(pdf), { fileType: 'pdf', ocr: false, pdfParserConfig: { separateProcess: false } } as any) as OfficeParserAST;
+        const printed = String((await back.to('text')).value);
+        if (printHidden) assert.ok(printed.includes('Chart1') && printed.includes('OnChartSheet') && printed.indexOf('OnChartSheet') < printed.indexOf('Data'), `printHidden prints the hidden chart sheet, first; got ${JSON.stringify(printed)}`);
+        else assert.deepStrictEqual(printed.split(/\s+/).filter(Boolean), ['data'], `the PDF leaves the hidden chart sheet out; got ${JSON.stringify(printed)}`);
+    }
+
+    // Its HTML tabs and its chunks follow the tabs.
+    const visibleFirst = await parse(chartFirst(false, false));
+    const html = String((await visibleFirst.to('html')).value);
+    const tabs = [...html.matchAll(/class="spreadsheet-tab"[^>]*>([^<]*)/g)].map(m => m[1]);
+    assert.deepStrictEqual(tabs, ['Chart1', 'Data'], `the HTML tabs follow the workbook's; got ${JSON.stringify(tabs)}`);
+    // The sheets the chunks name, in order (a sheet of several rows gives several chunks).
+    const chunkSheets = async (ast: OfficeParserAST) => ((await ast.to('chunks', { chunksConfig: { splitBy: 'sheet' } } as any)).value as any[])
+        .map(c => c.metadata?.sheetName).filter((name, i, names) => name !== names[i - 1]);
+    assert.deepStrictEqual(await chunkSheets(visibleFirst), ['Chart1', 'Data'], 'the chunks follow the workbook\'s tabs');
+    assert.deepStrictEqual(await chunkSheets(await parse(chartSheetBesideWorksheet(false))), ['Sheet1', 'Chart1'], 'the issue\'s chart sheet is chunked after its worksheet');
+
+    // A chart sheet whose drawing holds a picture as well: the picture, then the chart.
+    const withPicture = await parse(chartFirst(false, true));
+    assert.deepStrictEqual(sheetParts.shape(withPicture)[0], ['Chart1', undefined, ['image:image1.png/LOGO', 'chart:chart1.xml']], 'a chart sheet\'s picture is placed beside its chart');
+
+    // A drawing a worksheet names too: placed once, on the first tab naming it.
+    const shared = await parse(chartFirst(false, false, '<drawing r:id="rId1"/>', {
+        'xl/worksheets/_rels/sheet1.xml.rels': sheetParts.rels([['rId1', 'drawing', '../drawings/drawing1.xml']]),
+    }));
+    assert.deepStrictEqual(sheetParts.shape(shared), [['Chart1', undefined, ['chart:chart1.xml']], ['Data', undefined, ['row:data']]], 'a drawing shared with a worksheet is placed once, at the first tab');
+}
+
 /**
  * A sheet is printed as a spreadsheet prints it: a merged range is one cell (XLSX keeps its covered cells,
  * empty, and they were drawn as boxes under the merged one's text, which was wrapped to its first column),
@@ -8565,7 +9146,7 @@ async function testPresentationWriters(): Promise<void> {
             { type: 'paragraph', children: [{ type: 'image', metadata: { attachmentName: 'odd', altText: 'Odd' } }] }] } as any;
     const headedOut = await OfficeGenerator.generate(headed, 'pptx');
     const headedParts = Object.keys(unzipSync(new Uint8Array(headedOut.value as Uint8Array)));
-    assert.ok(headedParts.includes('ppt/media/image1.png') && headedParts.filter(p => p.startsWith('ppt/media/')).every(p => /^ppt\/media\/image\d+\.[a-z]+$/.test(p)) && headedOut.messages.some((m: any) => /kind PPTX output does not hold/.test(m.details?.reason ?? '')), `pptx: a heading's picture is written, a type no picture has reported; got ${headedParts}`);
+    assert.ok(headedParts.includes('ppt/media/image1.png') && headedParts.filter(p => p.startsWith('ppt/media/')).every(p => /^ppt\/media\/image\d+\.[a-z]+$/.test(p)) && headedOut.messages.some((m: any) => /^PPTX output does not take /.test(m.details?.reason ?? '')), `pptx: a heading's picture is written, a type no picture has reported; got ${headedParts}`);
     // EMF and WMF pictures are held, with their content types.
     const emf = new Uint8Array(88); emf[0] = 1; emf.set([0x20, 0x45, 0x4d, 0x46], 40);
     const emfOut = unzipSync(new Uint8Array((await OfficeGenerator.generate({ type: 'docx', metadata: {}, attachments: [{ type: 'image', name: 'a.emf', mimeType: 'image/x-emf', extension: 'emf', data: Buffer.from(emf).toString('base64') }], content: [{ type: 'image', metadata: { attachmentName: 'a.emf' } }] } as any, 'pptx')).value as Uint8Array));
@@ -11258,6 +11839,408 @@ function abortWhenOcrListens(): { signal: AbortSignal; listened: () => boolean }
 }
 
 /**
+ * A word the PDF parser joined across a line break, taking off the hyphen that divided it (#145): the
+ * writers that keep the page's lines (layout text, PPTX, ODP) write the hyphen at the break again, as
+ * 7.x did and pdftotext does, while flowing text holds the word whole. A dash after a space, a second
+ * hyphen and a hyphen after a digit divide no word, and keep their place in every output.
+ */
+async function testPdfHyphenAtLineBreak(): Promise<void> {
+    // A PDF of pages, each a content stream; F1 Helvetica, F2 Helvetica-Bold.
+    const pdfOf = (pages: string[]): Buffer => {
+        const objs = ['<< /Type /Catalog /Pages 2 0 R >>', `<< /Type /Pages /Kids [${pages.map((_, i) => `${5 + i * 2} 0 R`).join(' ')}] /Count ${pages.length} >>`,
+            '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>'];
+        pages.forEach((c, i) => {
+            objs.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${6 + i * 2} 0 R >>`);
+            objs.push(`<< /Length ${Buffer.byteLength(c, 'latin1')} >>\nstream\n${c}\nendstream`);
+        });
+        let pdf = '%PDF-1.4\n';
+        const offsets = objs.map((o, i) => { const at = Buffer.byteLength(pdf, 'latin1'); pdf += `${i + 1} 0 obj\n${o}\nendobj\n`; return at; });
+        const xref = Buffer.byteLength(pdf, 'latin1');
+        pdf += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n${offsets.map(o => `${String(o).padStart(10, '0')} 00000 n \n`).join('')}`;
+        pdf += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+        return Buffer.from(pdf, 'latin1');
+    };
+    const lines = (x: number, y: number, texts: string[], lead = 14, font = 'F1', size = 12) =>
+        `BT /${font} ${size} Tf ${x} ${y} Td ${texts.map((l, i) => `${i ? `0 -${lead} Td ` : ''}(${l}) Tj`).join(' ')} ET`;
+    const read = (pages: string[], more: any = {}) => OfficeParser.parseOffice(pdfOf(pages), { fileType: 'pdf', ocr: false, pdfParserConfig: { separateProcess: false, ...more } } as any) as Promise<OfficeParserAST>;
+    const layout = async (ast: OfficeParserAST) => String((await ast.to('text')).value);
+    const flat = async (ast: OfficeParserAST) => String((await ast.to('text', { textConfig: { preserveLayout: false } } as any)).value);
+    const paragraphs = (ast: OfficeParserAST) => collectAllNodes(ast).filter(n => n.type === 'paragraph').map(n => n.text);
+
+    // The issue's page: two lines of Helvetica, "agree-" at the end of the first.
+    const issuePage = lines(72, 700, ['The committee reached an agree-', 'ment after a long debate.']);
+    const issue = await read([issuePage]);
+    assert.strictEqual(await layout(issue), 'The committee reached an agree-\nment after a long debate.', `#145: layout text keeps the hyphen at the break; got ${JSON.stringify(await layout(issue))}`);
+    assert.deepStrictEqual(paragraphs(issue), ['The committee reached an agreement after a long debate.'], 'the paragraph holds the word whole');
+    assert.strictEqual((await flat(issue)).trim(), 'The committee reached an agreement after a long debate.', 'flat text holds the word whole');
+    const md = String((await issue.to('md')).value);
+    assert.ok(md.includes('agreement') && !md.includes('agree-'), `Markdown holds the word whole; got ${JSON.stringify(md)}`);
+    assert.ok(!collectAllNodes(issue).some(n => n.type === 'text' && (n.text || '').endsWith('-')), 'the AST is as before: the run gave its hyphen up');
+
+    // Not merged: the line ends in the hyphen and a space, and the layout is the page's.
+    const unmerged = await read([issuePage], { mergeHyphenatedWords: false });
+    assert.strictEqual(await layout(unmerged), 'The committee reached an agree-\nment after a long debate.', 'mergeHyphenatedWords false: layout text as before');
+    assert.deepStrictEqual(paragraphs(unmerged), ['The committee reached an agree- ment after a long debate.'], 'mergeHyphenatedWords false: the paragraph as before');
+
+    // A compound broken at its hyphen: the page shows the hyphen, so layout text does.
+    const compound = await layout(await read([lines(72, 700, ['It is a fact that is well-', 'known to the whole committee.'])]));
+    assert.strictEqual(compound, 'It is a fact that is well-\nknown to the whole committee.', `a compound keeps its hyphen at the break; got ${JSON.stringify(compound)}`);
+
+    // Two columns, each with a word divided at a line end: each column's line ends in its hyphen, the columns apart.
+    const columns = await layout(await read([`${lines(72, 700, ['Left column text with an agree-', 'ment that wraps across lines', 'and goes on for a while longer.'])} ${lines(330, 700, ['Right column text that has a', 'deve-', 'lopment in it too, and more.'])}`]));
+    const columnRows = columns.split('\n').map(l => l.split(/ {3,}/));
+    assert.deepStrictEqual(columnRows.map(r => r[0]), ['Left column text with an agree-', 'ment that wraps across lines', 'and goes on for a while longer.'], `the left column's lines; got ${JSON.stringify(columns)}`);
+    assert.deepStrictEqual(columnRows.map(r => r[1]), ['Right column text that has a', 'deve-', 'lopment in it too, and more.'], `the right column's lines; got ${JSON.stringify(columns)}`);
+
+    // A ruled table: a cell's divided word keeps its hyphen in its cell.
+    const rules = '0.5 w 72 700 m 372 700 l S 72 650 m 372 650 l S 72 600 m 372 600 l S 72 600 m 72 700 l S 222 600 m 222 700 l S 372 600 m 372 700 l S';
+    const tableAst = await read([`${rules} ${lines(76, 685, ['Cell with agree-', 'ment inside'], 12, 'F1', 10)} ${lines(226, 685, ['Second', 'cell'], 12, 'F1', 10)} ${lines(76, 635, ['Row two', 'left'], 12, 'F1', 10)} ${lines(226, 635, ['Row two deve-', 'lopment'], 12, 'F1', 10)}`]);
+    const cells = collectAllNodes(tableAst).filter(n => n.type === 'cell').map(n => n.text);
+    assert.deepStrictEqual(cells, ['Cell with agreement inside', 'Second cell', 'Row two left', 'Row two development'], `the cells hold their words whole; got ${JSON.stringify(cells)}`);
+    const tableRows = (await layout(tableAst)).split('\n').filter(Boolean).map(l => l.split(/ {3,}/));
+    assert.deepStrictEqual(tableRows, [['Cell with agree-', 'Second'], ['ment inside', 'cell'], ['Row two', 'Row two deve-'], ['left', 'lopment']], `each cell keeps its lines and their hyphens; got ${JSON.stringify(tableRows)}`);
+
+    // A bold run, and a hyphen drawn as a run of its own in another font.
+    const bold = await layout(await read([`BT /F1 12 Tf 72 700 Td (The committee reached an ) Tj /F2 12 Tf (agree-) Tj ET ${lines(72, 686, ['ment after a long debate.'], 14, 'F2')}`]));
+    assert.strictEqual(bold, 'The committee reached an agree-\nment after a long debate.', `a bold run keeps its hyphen; got ${JSON.stringify(bold)}`);
+    const ownRun = await read([`BT /F1 12 Tf 72 700 Td (The committee reached an agree) Tj /F2 12 Tf (-) Tj ET ${lines(72, 686, ['ment after a long debate.'])}`]);
+    assert.strictEqual(await layout(ownRun), 'The committee reached an agree-\nment after a long debate.', `a hyphen in a run of its own is written once; got ${JSON.stringify(await layout(ownRun))}`);
+    assert.deepStrictEqual(paragraphs(ownRun), ['The committee reached an agreement after a long debate.'], 'and the word is whole');
+
+    // Dashes that divide no word: kept in the paragraph and in layout text.
+    for (const [first, second, joined] of [
+        ['Items one to four -', 'the rest come later in the day.', 'Items one to four - the rest come later in the day.'],
+        ['The committee reached nothing--', 'the debate went on all night.', 'The committee reached nothing-- the debate went on all night.'],
+        ['The trial measured COVID-19-', 'related outcomes in the clinic.', 'The trial measured COVID-19- related outcomes in the clinic.'],
+    ]) {
+        const dashed = await read([lines(72, 700, [first, second])]);
+        assert.deepStrictEqual(paragraphs(dashed), [joined], `"${first}" keeps every dash in the paragraph; got ${JSON.stringify(paragraphs(dashed))}`);
+        assert.strictEqual(await layout(dashed), `${first}\n${second}`, `"${first}" keeps every dash in layout text`);
+    }
+
+    // Joins without a space that are no hyphen's: stacked short glyphs, a subscript, Chinese and Japanese.
+    const stacked = await layout(await read(['BT /F1 10 Tf 300 700 Td (Su) Tj 0 -11 Td (n) Tj ET BT /F1 10 Tf 400 700 Td (1) Tj 0 -11 Td (1) Tj ET BT /F1 12 Tf 72 500 Td (Ordinary prose line that sits apart from the rest of it.) Tj ET']));
+    assert.ok(!stacked.includes('-'), `stacked glyphs take no hyphen; got ${JSON.stringify(stacked)}`);
+    const lowered = await layout(await read(['BT /F1 12 Tf 72 700 Td (The value of x) Tj -8 Ts /F1 7 Tf (i) Tj 0 Ts /F1 12 Tf ( is given) Tj ET']));
+    assert.ok(!lowered.includes('-'), `a subscript after a letter takes no hyphen; got ${JSON.stringify(lowered)}`);
+    const readFile = (name: string) => OfficeParser.parseOffice(fs.readFileSync(path.join(__dirname, 'files', 'pdf', name)), { fileType: 'pdf', ocr: false, pdfParserConfig: { separateProcess: false } } as any) as Promise<OfficeParserAST>;
+    assert.ok(!(await layout(await readFile('cjk_wrapped_chrome.pdf'))).includes('-'), 'wrapped Chinese and Japanese lines take no hyphen');
+
+    // PPTX and ODP keep a page's lines too: the first line ends in the hyphen.
+    const pptx = strFromU8(unzipSync(new Uint8Array((await issue.to('pptx')).value as Uint8Array))['ppt/slides/slide1.xml']);
+    assert.ok(/<a:t>The committee reached an agree-<\/a:t><\/a:r><a:br\b[^]*?<a:t>ment after a long debate\.<\/a:t>/.test(pptx), `PPTX: the first line ends in the hyphen; got ${JSON.stringify(pptx.match(/<a:t>[^<]*<\/a:t>/g))}`);
+    const odp = strFromU8(unzipSync(new Uint8Array((await issue.to('odp')).value as Uint8Array))['content.xml']);
+    assert.ok(/>The committee reached an agree-<\/text:span><text:line-break\/><text:span[^>]*>ment after a long debate\.</.test(odp), 'ODP: the first line ends in the hyphen');
+    const unmergedPptx = strFromU8(unzipSync(new Uint8Array((await unmerged.to('pptx')).value as Uint8Array))['ppt/slides/slide1.xml']);
+    assert.ok(unmergedPptx.includes('<a:t>The committee reached an agree-</a:t>') && !unmergedPptx.includes('agree--'), 'PPTX of an unmerged page: one hyphen');
+
+    // A pdfLaTeX page of two narrow columns: the line-end hyphens pdftotext -layout prints, in its order.
+    const latex = await layout(await readFile('two_columns_narrow_latex.pdf'));
+    const pdftotext = 'Mean- presen- sum- infor- ques- time- avail- af- dead- ques- time- com- quar- quar- bet- en- with- discus- intro- re- orga- di- sub- accord- of- in- in- facil- correc- meet- comple- intro-'.split(' ');
+    assert.deepStrictEqual(latex.match(/\p{L}+-(?= |$)/gmu), pdftotext, 'a pdfLaTeX page: the hyphens at its line ends are the ones pdftotext prints');
+
+    // Linear: a paragraph of many lines each divided at a hyphen, and one of many runs on a line, in layout
+    // text and PPTX, each at n against n / 4.
+    const run = (text: string, x: number, y: number, width: number) => ({ type: 'text', text, formatting: { font: 'Helvetica', size: '12pt' }, bounds: { x, y, width, height: 11, baseline: y + 9 } });
+    const pageOf = (runs: any[], height: number) => ({ type: 'pdf', metadata: { pages: 1, pageSetup: { width: 612, height } }, attachments: [], content: [{ type: 'page', metadata: { pageNumber: 1, pageWidth: 612, pageHeight: height }, children: [{ type: 'paragraph', text: runs.map(r => r.text).join(''), children: runs }] }] } as any);
+    // (Each run but the last marked as the parser marks a run it took a hyphen off; unmarked, a run is written as it reads.)
+    const divided = (k: number, marked = true) => pageOf(Array.from({ length: k }, (_, i) => {
+        const r = run(i ? 'ment agree' : 'agree', 72, 20 + i * 14, 60);
+        if (marked && i < k - 1) markDroppedHyphen(r as OfficeContentNode);
+        return r;
+    }), 40 + k * 14);
+    assert.strictEqual(String((await OfficeGenerator.generate(divided(3), 'text')).value), 'agree-\nment agree-\nment agree', 'a page of divided lines');
+    assert.strictEqual(String((await OfficeGenerator.generate(divided(3, false), 'text')).value), 'agree\nment agree\nment agree', 'a hand-built page of lines, unmarked: written as it reads, as 8.7.0 did');
+    assert.strictEqual(String((await OfficeGenerator.generate(JSON.parse(JSON.stringify(divided(3))), 'text')).value), 'agree\nment agree\nment agree', 'a JSON copy: written as it reads, as 8.7.0 did');
+    const oneLine = (k: number) => pageOf(Array.from({ length: k }, (_, i) => run('w ', 72 + i * 0.05, 20, 0.05)), 100);
+    const timed = async (work: () => Promise<unknown>) => { const started = performance.now(); await work(); return performance.now() - started; };
+    const n = 10000;
+    for (const [name, shape] of [['divided lines', divided], ['runs on one line', oneLine]] as const) {
+        for (const format of ['text', 'pptx'] as const) {
+            const [large, quarter] = [shape(n), shape(n / 4)];
+            let small = await timed(() => OfficeGenerator.generate(quarter, format));
+            let big = await timed(() => OfficeGenerator.generate(large, format));
+            if (big > 8 * small + 250) {
+                small = Math.max(small, await timed(() => OfficeGenerator.generate(quarter, format)));
+                big = Math.min(big, await timed(() => OfficeGenerator.generate(large, format)));
+            }
+            assert.ok(big <= 8 * small + 250, `${name} to ${format}: ${n} in ${big.toFixed(0)} ms, ${n / 4} in ${small.toFixed(0)} ms`);
+        }
+    }
+    console.log('✓ PDF hyphen at a line break');
+}
+
+/**
+ * The hyphen layout text, PPTX and ODP write back at a line break is the one the PDF parser took off where it
+ * joined a word across the line, and only that one (#145): a superscript with a subscript set under it, or a
+ * subscript kerned back under its letter, is no line break and takes no hyphen, as in 8.7.0. A letter whose
+ * accent is a character of its own (e and U+0301) before a hyphen is joined as any letter is.
+ */
+async function testPdfHyphenOnlyWhereTakenOff(): Promise<void> {
+    // A PDF of pages, each a content stream, each turned by `rotate`; F1 Helvetica, F2 Helvetica-Bold, F3
+    // Helvetica with a ToUnicode map reading 0xE9 as e and U+0301.
+    const pdfOf = (pages: string[], rotate = 0): Buffer => {
+        const cmap = '/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /X def 1 begincodespacerange <00> <FF> endcodespacerange 1 beginbfchar <E9> <00650301> endbfchar endcmap CMapName currentdict /CMap defineresource pop end end';
+        const fonts = 3 + pages.length * 2;
+        const objs = ['<< /Type /Catalog /Pages 2 0 R >>', `<< /Type /Pages /Kids [${pages.map((_, i) => `${3 + i * 2} 0 R`).join(' ')}] /Count ${pages.length} >>`];
+        pages.forEach((c, i) => {
+            objs.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate ${rotate} /Resources << /Font << /F1 ${fonts} 0 R /F2 ${fonts + 1} 0 R /F3 ${fonts + 2} 0 R >> >> /Contents ${4 + i * 2} 0 R >>`);
+            objs.push(`<< /Length ${Buffer.byteLength(c, 'latin1')} >>\nstream\n${c}\nendstream`);
+        });
+        objs.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>',
+            `<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /ToUnicode ${fonts + 3} 0 R >>`, `<< /Length ${cmap.length} >>\nstream\n${cmap}\nendstream`);
+        let pdf = '%PDF-1.4\n';
+        const offsets = objs.map((o, i) => { const at = Buffer.byteLength(pdf, 'latin1'); pdf += `${i + 1} 0 obj\n${o}\nendobj\n`; return at; });
+        const xref = Buffer.byteLength(pdf, 'latin1');
+        pdf += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n${offsets.map(o => `${String(o).padStart(10, '0')} 00000 n \n`).join('')}`;
+        pdf += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+        return Buffer.from(pdf, 'latin1');
+    };
+    const read = (pages: string[], more: any = {}, rotate = 0) => OfficeParser.parseOffice(pdfOf(pages, rotate), { fileType: 'pdf', ocr: false, pdfParserConfig: { separateProcess: false, ...more } } as any) as Promise<OfficeParserAST>;
+    const slides = async (ast: OfficeParserAST, format: 'pptx' | 'odp') => {
+        const zip = unzipSync(new Uint8Array((await OfficeGenerator.generate(ast, format)).value as unknown as Uint8Array));
+        const xml = format === 'pptx' ? strFromU8(zip['ppt/slides/slide1.xml']).replace(/<a:br[^>]*\/?>(<\/a:br>)?/g, '\n').replace(/<\/a:p>/g, '\n')
+            : strFromU8(zip['content.xml']).replace(/<text:line-break\/>/g, '\n').replace(/<\/text:p>/g, '\n');
+        return xml.replace(/<[^>]+>/g, '').trim();
+    };
+    const written = async (ast: OfficeParserAST) => ({ layout: String((await OfficeGenerator.generate(ast, 'text')).value), pptx: await slides(ast, 'pptx'), odp: await slides(ast, 'odp') });
+    const paragraphs = (ast: OfficeParserAST) => collectAllNodes(ast).filter(n => n.type === 'paragraph').map(n => n.text);
+
+    // A superscript with a subscript under it, and a subscript kerned under its letter: 8.7.0's lines in each writer, no hyphen.
+    for (const [name, page, layout, deck] of [
+        ['x with n over i', 'BT /F1 12 Tf 72 700 Td (The sum x) Tj ET BT /F1 8 Tf 128.02 704 Td (n) Tj ET BT /F1 8 Tf 128.02 697 Td (i) Tj ET BT /F1 12 Tf 132.47 700 Td ( is large and goes on.) Tj ET',
+            'The sum xn is large and goes on.\n         i', 'The sum xn\ni is large and goes on.'],
+        ['T with ab over cd', 'BT /F1 12 Tf 72 700 Td (The tensor T) Tj ET BT /F1 8 Tf 140.03 705 Td (ab) Tj ET BT /F1 8 Tf 140.03 697 Td (cd) Tj ET BT /F1 12 Tf 148.93 700 Td ( is symmetric here.) Tj ET',
+            'The tensor Tab is symmetric here.\n            cd', 'The tensor Tab\ncd is symmetric here.'],
+        ['x with n over i, then a second line', 'BT /F1 12 Tf 72 700 Td (Then the sum x) Tj ET BT /F1 8 Tf 141.36 704 Td (n) Tj ET BT /F1 8 Tf 141.36 697 Td (i) Tj ET BT /F1 12 Tf 145.81 700 Td ( is large and the rest of the line goes on) Tj ET BT /F1 12 Tf 72 686 Td (and a second line follows it here.) Tj ET',
+            'Then the sum xn is large and the rest of the line goes on\n              i\nand a second line follows it here.', 'Then the sum xn\ni is large and the rest of the line goes on\nand a second line follows it here.'],
+        ['x with i kerned under it', 'BT /F1 12 Tf 72 700 Td (The value x) Tj ET BT /F1 8 Tf 133.728 696 Td (i) Tj ET BT /F1 12 Tf 135.504 700 Td ( is large and goes on.) Tj ET',
+            'The value x is large and goes on.\n           i', 'The value x\ni is large and goes on.'],
+    ]) {
+        const out = await written(await read([page]));
+        assert.deepStrictEqual(out, { layout, pptx: deck, odp: deck }, `${name}: written as 8.7.0 wrote it, no hyphen; got ${JSON.stringify(out)}`);
+    }
+
+    // An accent written as a character of its own before the hyphen: the word is joined, and the hyphen is written back at the break.
+    const acute = String.fromCodePoint(0x301);
+    const accentPage = 'BT /F3 12 Tf 72 700 Td (The committee reached a d\\351-) Tj 0 -14 Td (cision after a long debate on it.) Tj ET';
+    const accented = await read([accentPage]);
+    const joined = `The committee reached a de${acute}cision after a long debate on it.`;
+    assert.deepStrictEqual(paragraphs(accented), [joined], `a decomposed accent: the paragraph holds the word whole; got ${JSON.stringify(paragraphs(accented))}`);
+    assert.strictEqual(String((await accented.to('text', { textConfig: { preserveLayout: false } } as any)).value).trim(), joined, 'a decomposed accent: flat text holds the word whole');
+    const accentLines = `The committee reached a de${acute}-\ncision after a long debate on it.`;
+    assert.deepStrictEqual(await written(accented), { layout: accentLines, pptx: accentLines, odp: accentLines }, 'a decomposed accent: the hyphen at the break in layout text, PPTX and ODP');
+    assert.deepStrictEqual(paragraphs(await read([accentPage], { mergeHyphenatedWords: false })), [`The committee reached a de${acute}- cision after a long debate on it.`], 'a decomposed accent, mergeHyphenatedWords false: as before');
+
+    // Every word joined at a hyphen is written as the page draws it, as with mergeHyphenatedWords false: a
+    // hyphen of a run of its own after a superscript, one in a subscript, a bold one, and the accent.
+    const issuePage = 'BT /F1 12 Tf 72 700 Td (The committee reached an agree-) Tj 0 -14 Td (ment after a long debate.) Tj ET';
+    for (const [name, page, paragraph] of [
+        ['the issue', issuePage, 'The committee reached an agreement after a long debate.'],
+        ['a hyphen after a superscript', 'BT /F1 12 Tf 72 700 Td (The committee reached an agree) Tj /F1 8 Tf 4.2 Ts (n) Tj /F1 12 Tf 0 Ts (-) Tj ET BT /F1 12 Tf 72 686 Td (ment after a long debate.) Tj ET', 'The committee reached an agreenment after a long debate.'],
+        ['a hyphen in a subscript', 'BT /F1 12 Tf 72 700 Td (The committee reached an agree) Tj /F1 8 Tf -3 Ts (i-) Tj /F1 12 Tf 0 Ts ET BT /F1 12 Tf 72 686 Td (ment after a long debate.) Tj ET', 'The committee reached an agreeiment after a long debate.'],
+        ['a bold hyphen of its own', 'BT /F1 12 Tf 72 700 Td (The committee reached an agree) Tj /F2 12 Tf (-) Tj ET BT /F1 12 Tf 72 686 Td (ment after a long debate.) Tj ET', 'The committee reached an agreement after a long debate.'],
+        ['a decomposed accent', accentPage, joined],
+    ]) {
+        const merged = await read([page]);
+        assert.deepStrictEqual(paragraphs(merged), [paragraph], `${name}: the word is joined; got ${JSON.stringify(paragraphs(merged))}`);
+        const [on, off] = [await written(merged), await written(await read([page], { mergeHyphenatedWords: false }))];
+        assert.deepStrictEqual(on, off, `${name}: written as the page draws it`);
+    }
+    const afterSuperscript = await written(await read(['BT /F1 12 Tf 72 700 Td (The committee reached an agree) Tj /F1 8 Tf 4.2 Ts (n) Tj /F1 12 Tf 0 Ts (-) Tj ET BT /F1 12 Tf 72 686 Td (ment after a long debate.) Tj ET']));
+    assert.strictEqual(afterSuperscript.layout, 'The committee reached an agreen-\nment after a long debate.', 'a hyphen after a superscript is on the main line');
+
+    // A page turned upside down: its line keeps the hyphen (8.7.1's first try took it for no break).
+    const upsideDown = String((await (await read([issuePage], {}, 180)).to('text')).value);
+    assert.ok(upsideDown.split('\n').map(l => l.trim()).includes('The committee reached an agree-'), `/Rotate 180: the line keeps its hyphen; got ${JSON.stringify(upsideDown)}`);
+
+    // A JSON copy of a parsed page carries no mark: it is written as it reads, as 8.7.0 wrote it, in every writer.
+    const copied = await written(JSON.parse(JSON.stringify(await read([issuePage]))));
+    const asRead = 'The committee reached an agree\nment after a long debate.';
+    assert.deepStrictEqual(copied, { layout: asRead, pptx: asRead, odp: asRead }, `a JSON copy: written as it reads; got ${JSON.stringify(copied)}`);
+    console.log('✓ PDF hyphen written back only where the parser took one off');
+}
+
+/**
+ * Generated PDFs of words divided at line ends among raised, lowered, stacked and kerned runs, columns, ruled
+ * tables, Hebrew and Han (test/helpers/hyphenBreakGenerator.ts): the runs the parser marks are the hyphens it
+ * took off, and layout text, PPTX and ODP write back those and no others, line by line as with
+ * mergeHyphenatedWords false. No stray hyphen, none missing.
+ */
+async function testPdfHyphenBreaksGenerated(): Promise<void> {
+    const [count, seed] = [300, 1];
+    const started = Date.now();
+    const result = await runHyphenBreakGenerator(count, seed);
+    console.log(`  hyphen breaks: docs=${result.docs} distinct PDFs=${result.distinctPdfs} merges written=${result.mergesWritten} marks=${result.marks} hyphens taken off=${result.hyphensRemoved} marked run shapes=${result.distinctMarkedShapes} stray=${result.stray} missing=${result.missing} other=${result.other} flowed=${result.flowJoined} in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+    assert.deepStrictEqual({ lostMarks: result.lostMarks, stray: result.stray, missing: result.missing, other: result.other }, { lostMarks: 0, stray: 0, missing: 0, other: 0 }, `Hyphen breaks (seed ${seed}): ${JSON.stringify(result.examples)}`);
+    const shapes = ['end:hyphen', 'end:ownRun', 'end:decomposed', 'end:soft', 'end:supThenHyphen', 'end:subHyphen', 'end:capital', 'end:digit', 'end:hyphen:heb', 'end:hyphen:han', 'sup', 'sub', 'stack', 'subKern', 'stackKern', 'kernTJ', 'bold', 'block:single', 'block:columns', 'block:table', 'block:heb', 'block:han'];
+    assert.ok(result.distinctPdfs === count && result.marks > count && result.distinctMarkedShapes >= 4 && shapes.every(s => (result.features[s] ?? 0) > 0), `Hyphen breaks cover the shapes: ${JSON.stringify(result)}`);
+    console.log('✓ PDF hyphen breaks generated, no stray hyphen and none missing');
+}
+
+/**
+ * A condition written with an operator of another language (`|`, `&`, `||`, `&&`, `===`, `!==`, `=>`, `=<`,
+ * `=!`, `<>`) is refused with the operator as it was typed and what to write instead, not with the
+ * character found doubled or the `=` it starts with blamed.
+ */
+async function testTemplateMistypedOperators(): Promise<void> {
+    const W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+    const docx = (text: string): Buffer => Buffer.from(zipSync({
+        '[Content_Types].xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'),
+        'word/document.xml': strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document ${W}><w:body><w:p><w:r><w:t xml:space="preserve">${text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</w:t></w:r></w:p></w:body></w:document>`),
+    }));
+    const data = { a: 1, b: 2, answer: 'YES' };
+    const refusal = async (tag: string) => {
+        let error: any;
+        try { await OfficeTemplate.render(docx(`${tag}T{{ endif }}`), { data }); } catch (e) { error = e; }
+        assert.strictEqual(error?.officeIssue?.code, 'TEMPLATE_SYNTAX', `${tag} is refused; got ${error}`);
+        assert.strictEqual(error.officeIssue.details?.reason, 'unreadable', `${tag}: reason unreadable`);
+        assert.ok(String(error.message).includes(tag), `${tag}: the message names the tag; got ${error.message}`);
+        return { detail: String(error.officeIssue.details.detail), message: String(error.message) };
+    };
+    for (const [tag, typed, write] of [
+        ['{{ if a && b }}', '&&', 'and'], ['{{ if a || b }}', '||', 'or'], ['{{ if a & b }}', '&', 'and'],
+        ['{{ if a === b }}', '===', '=='], ['{{ if a !== b }}', '!==', '!='], ['{{ if a <> 1 }}', '<>', '!='],
+        ['{{ if a => 1 }}', '=>', '>='], ['{{ if a =< 1 }}', '=<', '<='], ['{{ if a =! 1 }}', '=!', '!='],
+    ]) {
+        const { detail } = await refusal(tag);
+        assert.ok(detail.startsWith(`uses ${typed};`), `${tag}: the operator is named as typed; got ${detail}`);
+        assert.ok(new RegExp(`(write|use) ${write.replace(/[|=!<>]/g, '\\$&')} to`).test(detail), `${tag}: says to write ${write}; got ${detail}`);
+        assert.ok(!detail.includes('single ='), `${tag}: no single = is blamed; got ${detail}`);
+    }
+    // && names and alone, || or alone.
+    assert.ok(!(await refusal('{{ if a && b }}')).detail.includes(' or '), '&& does not name or');
+    assert.ok(!(await refusal('{{ if a || b }}')).detail.includes(' and '), '|| does not name and');
+    // A single bar: a filter where a condition takes none.
+    for (const tag of ['{{ if (answer | lower) == "yes" }}', '{{ if a | b }}']) {
+        const { detail, message } = await refusal(tag);
+        assert.ok(detail.startsWith('uses |,') && detail.includes('filter') && !detail.includes('||'), `${tag}: the single bar is named, as a filter; got ${detail}`);
+        assert.ok(message.includes('cannot be read: it uses |,'), `${tag}: the message reads whole; got ${message}`);
+    }
+    // An else if's condition is read alike (inside blocks that pair, it stays text as typed).
+    const elseIf = readTag('else if a | b');
+    assert.ok(elseIf?.ok === false && elseIf.reason.startsWith('uses |,') && !elseIf.reason.includes('||'), `an else if with a single bar names it; got ${JSON.stringify(elseIf)}`);
+    // What a condition does take is unchanged: a filter on a field, a bar inside a string.
+    const rendered = async (text: string) => {
+        const xml = strFromU8(unzipSync(new Uint8Array(await OfficeTemplate.render(docx(text), { data }) as Uint8Array))['word/document.xml']);
+        return xml.slice(xml.indexOf('<w:body>')).replace(/<[^>]+>/g, '');
+    };
+    assert.strictEqual(await rendered('{{ answer | lower }}'), 'yes', 'a filter on a field still fills');
+    assert.strictEqual(await rendered('{{ if answer == "x|y" }}T{{ else }}F{{ endif }}'), 'F', 'a bar inside a string is text');
+    assert.strictEqual(await rendered('{{ if a <= 1 and b >= 2 and a != b }}T{{ else }}F{{ endif }}'), 'T', 'the operators a condition takes still read');
+    console.log('✓ Template mistyped operators');
+}
+
+/**
+ * A picture a writer leaves out (IMAGE_PROCESSING_FAILED) is reported by its name and why: the kind its
+ * bytes are (EMF, WMF, TIFF, WebP, XML that is no picture, damaged data) and the output that does not
+ * take it, in a whole sentence. The words of the PDF parser's own use of the code, a picture pdf.js
+ * decoded whose pixels could not be read, stay as they are.
+ */
+async function testPicturesLeftOutNamed(): Promise<void> {
+    const emf = new Uint8Array(88); new DataView(emf.buffer).setUint32(0, 1, true); new DataView(emf.buffer).setUint32(4, 88, true); emf.set([0x20, 0x45, 0x4d, 0x46], 40);
+    const wmf = new Uint8Array([0xd7, 0xcd, 0xc6, 0x9a, ...new Array(40).fill(0)]);
+    const tiff = new Uint8Array([0x49, 0x49, 0x2a, 0x00, 8, 0, 0, 0, 0, 0]);
+    const webp = new Uint8Array([...Buffer.from('RIFF'), 20, 0, 0, 0, ...Buffer.from('WEBPVP8 '), ...new Array(12).fill(0)]);
+    const xml = new Uint8Array(Buffer.from('<?xml version="1.0"?><root/>'));
+    // A PNG cut off inside its header (its size read, 1 x 1), and a JPEG of a few bytes.
+    const brokenPng = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1, 0, 0, 0, 1]);
+    const brokenJpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0, 1, 2, 3]);
+    const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64');
+    const pictures: [string, string, Uint8Array][] = [['image1.emf', 'image/x-emf', emf], ['image2.wmf', 'image/x-wmf', wmf], ['image3.tiff', 'image/tiff', tiff],
+        ['image4.webp', 'image/webp', webp], ['item1.xml', 'image/png', xml], ['broken.png', 'image/png', brokenPng], ['broken.jpg', 'image/jpeg', brokenJpeg]];
+    const docOf = (names: string[], attachments: any[]) => ({ type: 'docx', metadata: {}, content: names.map(name => ({ type: 'paragraph', children: [{ type: 'image', metadata: { attachmentName: name, altText: `Alt of ${name}` } }] })), attachments } as any);
+    const all = docOf(pictures.map(([name]) => name), pictures.map(([name, mimeType, bytes]) => ({ type: 'image', name, mimeType, extension: name.split('.').pop(), data: b64(bytes) })));
+    const leftOut = async (ast: any, format: string, config: any = {}) => {
+        const result = await OfficeGenerator.generate(ast, format as any, { ...config, onWarning: () => {} } as any);
+        return new Map(((result.messages ?? []) as any[]).filter(m => m.code === 'IMAGE_PROCESSING_FAILED').map(m => [m.details?.name as string, String(m.message)]));
+    };
+    const sentence = (message: string | undefined, name: string, why: string, where: string) => {
+        assert.ok(message, `${where}: ${name} is reported`);
+        assert.ok(message!.startsWith(`Picture '${name}' was left out of the output: `) && message!.includes(why), `${where}: ${name} says ${why}; got ${message}`);
+        assert.ok(!message!.includes('ImageBitmap'), `${where}: ${name} is not said to come from an ImageBitmap; got ${message}`);
+    };
+
+    // The native PDF engine: each kind it does not embed by name, XML as no picture, damaged data as such.
+    const native = await leftOut(all, 'pdf', { pdfConfig: { engine: 'native' } });
+    for (const [name, kind] of [['image1.emf', 'EMF'], ['image2.wmf', 'WMF'], ['image3.tiff', 'TIFF'], ['image4.webp', 'WebP']]) {
+        sentence(native.get(name), name, `the native PDF engine does not embed ${kind} pictures (it embeds PNG, JPEG, GIF, BMP and SVG)`, 'native PDF');
+    }
+    sentence(native.get('item1.xml'), 'item1.xml', 'its data is XML, not a picture', 'native PDF');
+    sentence(native.get('broken.png'), 'broken.png', 'its PNG data could not be read', 'native PDF');
+    sentence(native.get('broken.jpg'), 'broken.jpg', 'its JPEG data could not be read', 'native PDF');
+    assert.ok(native.get('image1.emf')!.endsWith('Its alternative text, where it has one, stands in its place.'), 'native PDF: the message says what stands in its place');
+    const badGif = await leftOut(docOf(['bad.gif'], [{ type: 'image', name: 'bad.gif', mimeType: 'image/gif', extension: 'gif', data: b64(new Uint8Array([...Buffer.from('GIF89a'), 1, 0, 1, 0, 0, 0, 0, 0x2c, 9, 9])) }]), 'pdf', { pdfConfig: { engine: 'native' } });
+    sentence(badGif.get('bad.gif'), 'bad.gif', 'its GIF data could not be read', 'native PDF');
+
+    // DOCX, ODT and LaTeX: an EMF or a WMF picture, which none of them takes, named with the output.
+    for (const [format, label] of [['docx', 'DOCX'], ['odt', 'ODT'], ['tex', 'LaTeX']]) {
+        const named = await leftOut(all, format);
+        sentence(named.get('image1.emf'), 'image1.emf', `${label} output does not take EMF pictures`, label);
+        sentence(named.get('image2.wmf'), 'image2.wmf', `${label} output does not take WMF pictures`, label);
+    }
+    // A type named but data that is no base64: DOCX and ODT say it could not be decoded.
+    const undecodable = docOf(['bad.png', 'bad.png'], [{ type: 'image', name: 'bad.png', mimeType: 'image/png', extension: 'png', data: '%%%' }]);
+    for (const [format, label] of [['docx', 'DOCX'], ['odt', 'ODT']]) sentence((await leftOut(undecodable, format)).get('bad.png'), 'bad.png', 'its data could not be decoded', label);
+    // An unknown type with no name to go by.
+    sentence((await leftOut(docOf(['blob'], [{ type: 'image', name: 'blob', mimeType: 'application/octet-stream', data: b64(new Uint8Array([1, 2, 3, 4, 5, 6])) }]), 'docx')).get('blob'), 'blob', 'DOCX output does not take pictures of its kind', 'DOCX');
+
+    // PPTX and ODP: a WebP picture, and a picture whose attachment is missing.
+    for (const [format, label, takes] of [['pptx', 'PPTX', 'PNG, JPEG, GIF, BMP, TIFF, EMF and WMF'], ['odp', 'ODP', 'PNG, JPEG, GIF, BMP, TIFF, EMF, WMF and SVG']]) {
+        const deck = await leftOut(docOf(['image4.webp', 'gone.png'], [{ type: 'image', name: 'image4.webp', mimeType: 'image/webp', extension: 'webp', data: b64(webp) }]), format);
+        sentence(deck.get('image4.webp'), 'image4.webp', `${label} output does not take WebP pictures (it takes ${takes})`, label);
+        sentence(deck.get('gone.png'), 'gone.png', 'missing attachment', label);
+    }
+
+    // The kinds, read from the bytes first.
+    assert.deepStrictEqual([emf, wmf, tiff, webp, xml, brokenPng].map(bytes => pictureKindOf(bytes)), ['EMF', 'WMF', 'TIFF', 'WebP', 'XML', 'PNG'], 'each kind by its signature');
+    assert.strictEqual(pictureKindOf(new Uint8Array(Buffer.from('<?xml version="1.0"?>\n<!-- drawn -->\n<svg xmlns="http://www.w3.org/2000/svg"/>'))), 'SVG', 'an SVG by its element');
+    assert.deepStrictEqual([pictureKindOf(new Uint8Array(0), 'image/x-emf'), pictureKindOf(new Uint8Array(0), undefined, 'jpg'), pictureKindOf(new Uint8Array(0))], ['EMF', 'JPEG', 'unknown'], 'else by its type or extension');
+    assert.strictEqual(pictureKindOfBase64(b64(emf)), 'EMF', 'base64 is read from its start');
+    assert.strictEqual(pictureKindOfBase64('%%% not base64 %%%', 'image/tiff'), 'TIFF', 'data that is no base64 is named by its type');
+
+    // A media type, an extension or a name of any length or characters: the kind is named only when it is a
+    // short word (else "pictures of its kind"), and the name is shown to 80 characters (the details hold it whole).
+    const plainText = b64(new Uint8Array(Buffer.from('plain text, no picture')));
+    const long = 100000;
+    for (const [label, attachment, kind] of [
+        ['a long media type', { name: 'a.bin', mimeType: `image/${'z'.repeat(long)}`, extension: 'png!' }, 'pictures of its kind'],
+        ['a long extension', { name: 'a.bin', mimeType: 'application/octet-stream', extension: 'q'.repeat(long) }, 'pictures of its kind'],
+        ['an extension with a line break', { name: 'a.bin', mimeType: 'application/octet-stream', extension: 'x\ny' }, 'pictures of its kind'],
+        ['a long name', { name: `${'n'.repeat(long)}.heic`, mimeType: 'image/heic', extension: 'heic' }, 'HEIC pictures'],
+    ] as const) {
+        const doc = docOf([attachment.name], [{ type: 'image', ...attachment, data: plainText }]);
+        for (const [format, config] of [['pdf', { pdfConfig: { engine: 'native' } }], ['docx', {}], ['odt', {}], ['pptx', {}], ['odp', {}], ['tex', {}]] as const) {
+            const result = await OfficeGenerator.generate(doc, format as any, { ...config, onWarning: () => {} } as any);
+            const reported = ((result.messages ?? []) as any[]).find(m => m.code === 'IMAGE_PROCESSING_FAILED');
+            assert.ok(reported && String(reported.message).length < 300 && String(reported.message).includes(kind), `${label}, ${format}: a message under 300 characters naming ${kind}; got ${String(reported?.message).slice(0, 200)} (${String(reported?.message).length} characters)`);
+            assert.strictEqual(reported.details?.name, attachment.name, `${label}, ${format}: the details hold the name whole`);
+        }
+    }
+    assert.deepStrictEqual([pictureKindOf(new Uint8Array(0), undefined, 'x\ny'), pictureKindOf(new Uint8Array(0), `image/${'z'.repeat(17)}`), pictureKindOf(new Uint8Array(0), `image/${'z'.repeat(16)}`)],
+        ['unknown', 'unknown', 'Z'.repeat(16)], 'a kind is a word of 1 to 16 characters');
+    assert.deepStrictEqual([pictureKindOf(new Uint8Array(0), 'image/heic'), pictureKindOf(new Uint8Array(0), 'image/x-icon'), pictureKindOf(new Uint8Array(0), 'image/svg+xml')], ['HEIC', 'ICON', 'SVG'], 'the kinds named before are named still');
+    const shown = getWarningMessage(OfficeWarningType.IMAGE_PROCESSING_FAILED, { name: 'n'.repeat(200), reason: 'why' });
+    assert.ok(shown.startsWith(`Picture '${'n'.repeat(77)}...' was left out`), `a name over 80 characters is shown to 77 and ...; got ${shown.slice(0, 120)}`);
+    assert.ok(getWarningMessage(OfficeWarningType.IMAGE_PROCESSING_FAILED, { name: 'n'.repeat(80), reason: 'why' }).startsWith(`Picture '${'n'.repeat(80)}' was left out`), 'a name of 80 characters is shown whole');
+    // A name cut inside a surrogate pair (an emoji at code units 75 and 76, or 76 and 77) is cut whole, in both messages.
+    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    for (const at of [74, 75, 76, 77]) {
+        const name = `${'n'.repeat(at)}\u{1F600}${'tail'.repeat(5)}`;
+        const picture = getWarningMessage(OfficeWarningType.IMAGE_PROCESSING_FAILED, { name, reason: 'why' });
+        const option = getWarningMessage(OfficeWarningType.INVALID_CONFIG_VALUE, { option: 'o', value: name, expected: 'e', fallback: 1 });
+        assert.ok(!loneSurrogate.test(picture) && !loneSurrogate.test(option), `an emoji at code unit ${at} is not split by the cut`);
+        assert.ok(picture.includes('...') && option.includes('...'), `a long name at ${at} is still cut`);
+    }
+    assert.ok(getWarningMessage(OfficeWarningType.IMAGE_PROCESSING_FAILED, { name: `${'n'.repeat(75)}\u{1F600}`, reason: 'why' }).includes('\u{1F600}'), 'a name of 77 units with an emoji is shown whole');
+
+    // The PDF parser's own use: no picture named, the ImageBitmap it could not read.
+    assert.strictEqual(getWarningMessage(OfficeWarningType.IMAGE_PROCESSING_FAILED), "A PDF picture's pixels could not be read from the ImageBitmap pdf.js decoded it into:", 'the parser\'s words are kept');
+    assert.strictEqual(getWarningMessage(OfficeWarningType.IMAGE_PROCESSING_FAILED, { reason: 'why' }), 'A picture was left out of the output: why.', 'a picture with no name');
+    console.log('✓ Pictures left out named');
+}
+
+/**
  * Cancellation: once a parse's signal has fired it rejects with AbortError and never resolves, in
  * every format that runs OCR, even when the abort lands while an image is being recognized (which
  * was taken for a failed recognition, so the parse resolved without the text). An OCR timeout is
@@ -12959,6 +13942,14 @@ async function runTests(): Promise<void> {
         ['WordParagraphMark', testWordParagraphMarkFormatting],
         ['WordRunCharacters', testWordRunCharacters],
         ['ExcelDates', testExcelDates],
+        ['ExcelSheetOrder', testExcelSheetOrder],
+        ['ExcelChartSheetKeepsWorksheetIdentity', testExcelChartSheetKeepsWorksheetIdentity],
+        ['ExcelRelationshipsByPartPath', testExcelRelationshipsByPartPath],
+        ['ExcelRelationshipTargetsNotToTheLetter', testExcelRelationshipTargetsNotToTheLetter],
+        ['ExcelFallbackTakesOnlyItsKind', testExcelFallbackTakesOnlyItsKind],
+        ['ExcelFallbackNeverTakesNamedPart', testExcelFallbackNeverTakesNamedPart],
+        ['ExcelRelationshipsReadOnce', testExcelRelationshipsReadOnce],
+        ['ExcelChartSheetPlacedInItsTab', testExcelChartSheetPlacedInItsTab],
         ['GeneratedOutput', testGeneratedOutput],
         ['ODG', testOdg],
         ['ODFComments', testOdfComments],
@@ -13103,6 +14094,11 @@ async function runTests(): Promise<void> {
         ['A summary of many anchors is linear and keeps each id once', testDisclosureSummaryAnchorsLinear],
         ['Many ids waiting before a disclosure are all written', testMarkdownManyAnchorsBeforeDisclosure],
         ['Many captions in a nested paragraph are all written', testNestedParagraphCaptionsMany],
+        ['PDF hyphen at a line break', testPdfHyphenAtLineBreak],
+        ['PDF hyphen written back only where the parser took one off', testPdfHyphenOnlyWhereTakenOff],
+        ['PDF hyphen breaks generated', testPdfHyphenBreaksGenerated],
+        ['Template mistyped operators', testTemplateMistypedOperators],
+        ['Pictures left out named', testPicturesLeftOutNamed],
         ['Cancellation', testCancellation],
     ];
 

@@ -20,6 +20,20 @@
     const changesStored = () => { try { return localStorage.getItem(CHANGES_KEY); } catch { return null; } };
     root.classList.toggle('changes-hidden', changesStored() === 'hidden');
 
+    // ── A post's text width: the reader's choice, kept for every post and set before the first paint ──
+    const WIDTH_KEY = 'blog-width';
+    const WIDTH = { min: 640, max: 1280, step: 20, default: 760 };
+    const validWidth = value => {
+        const n = Number(value);
+        return Number.isFinite(n) && n >= WIDTH.min && n <= WIDTH.max ? Math.round(n / WIDTH.step) * WIDTH.step : null;
+    };
+    const storedWidth = () => { try { return validWidth(localStorage.getItem(WIDTH_KEY)); } catch { return null; } };
+    const applyWidth = width => {
+        if (width === null || width === WIDTH.default) root.style.removeProperty('--article-width');
+        else root.style.setProperty('--article-width', `${width}px`);
+    };
+    applyWidth(storedWidth());
+
     const wireThemeToggle = () => {
         const button = document.getElementById('theme-toggle');
         const icon = document.getElementById('theme-icon');
@@ -459,6 +473,93 @@
             figure.classList.add('demo-live');
             draw();
         },
+
+        /**
+         * A workbook's tabs, the key each reader files a tab's name under, and the sheets it returns
+         * (`data-workbook`: the tabs as xl/workbook.xml lists them, and for each reader its keys and its real
+         * output). A tab chosen lights its key and the sheets that came of it; "As a PDF prints it" marks
+         * the hidden sheets a PDF leaves out.
+         */
+        workbook(figure) {
+            let data;
+            try { data = JSON.parse(figure.dataset.workbook || '{}'); } catch { return; }
+            const versions = Object.keys(data.readers || {});
+            if (!data.tabs?.length || !versions.length) return;
+            const state = { version: versions[0], pdf: false, focus: null };
+            const grid = el('div', { class: 'demo-wb' });
+            const note = el('div', { class: 'demo-result', 'aria-live': 'polite' });
+            const draw = () => {
+                const reader = data.readers[state.version];
+                const lit = names => state.focus !== null && names.includes(state.focus);
+                const keyCount = new Map();
+                for (const tab of data.tabs) keyCount.set(reader.keys[tab.name], (keyCount.get(reader.keys[tab.name]) || 0) + 1);
+                const tabs = el('div', { class: 'demo-wb-col' }, el('div', { class: 'demo-wb-head' }, 'Tabs in xl/workbook.xml'),
+                    ...data.tabs.map(tab => el('button', {
+                        type: 'button', class: `demo-wb-tab${lit([tab.name]) ? ' demo-wb-lit' : ''}`, 'aria-pressed': String(state.focus === tab.name),
+                        onclick: () => { state.focus = state.focus === tab.name ? null : tab.name; draw(); },
+                    }, el('span', { class: 'demo-wb-name' }, tab.name), el('code', {}, `${tab.id} → ${tab.target}`), tab.hidden ? el('span', { class: 'demo-wb-badge' }, 'hidden') : null)));
+                const keys = el('div', { class: 'demo-wb-col' }, el('div', { class: 'demo-wb-head' }, reader.keyedBy),
+                    ...data.tabs.map(tab => {
+                        const lost = reader.lost?.[tab.name];
+                        return el('div', { class: `demo-wb-key${keyCount.get(reader.keys[tab.name]) > 1 ? ' demo-wb-clash' : ''}${lit([tab.name]) ? ' demo-wb-lit' : ''}` },
+                            el('code', {}, reader.keys[tab.name]), el('span', { class: 'demo-wb-why' }, lost ? `${tab.name}'s entry, written over by ${lost}` : `${tab.name}${tab.hidden ? ', hidden' : ''}`));
+                    }));
+                const sheets = el('div', { class: 'demo-wb-col' }, el('div', { class: 'demo-wb-head' }, 'Sheets returned, in order'),
+                    ...reader.sheets.map(sheet => {
+                        const leftOut = state.pdf && sheet.hidden;
+                        return el('div', { class: `demo-wb-sheet${lit(sheet.from) ? ' demo-wb-lit' : ''}${leftOut ? ' demo-wb-out' : ''}` },
+                            el('div', { class: 'demo-wb-sheet-head' }, el('span', { class: 'demo-wb-name' }, sheet.name), sheet.hidden ? el('span', { class: 'demo-wb-badge' }, 'hidden') : null, leftOut ? el('span', { class: 'demo-wb-badge demo-wb-badge-out' }, 'not printed') : null),
+                            el('code', { class: 'demo-wb-part' }, sheet.part),
+                            el('div', { class: 'demo-wb-body' }, ...sheet.content.map(line => el('div', {}, line))));
+                    }));
+                glide(grid, () => grid.replaceChildren(tabs, keys, sheets));
+                note.replaceChildren(el('span', {}, state.pdf ? reader.pdf : reader.note));
+            };
+            const controls = el('div', { class: 'demo-controls' },
+                segmented('Reader', versions.map(v => [v, data.readers[v].label]), state.version, value => { state.version = value; draw(); }),
+                el('label', { class: 'demo-check' }, el('input', { type: 'checkbox', onchange: event => { state.pdf = event.target.checked; draw(); } }), 'As a PDF prints it'));
+            figure.querySelector('.demo-fallback')?.remove();
+            figure.prepend(controls, grid, note);
+            figure.classList.add('demo-live');
+            draw();
+        },
+
+        /**
+         * How a relationship's target finds its part (`data-locate`: the package's parts, and for each target
+         * the real locator's answer, with the steps it takes: the exact path, the path but for case, and the
+         * file name in its kind's folder, each a hit, a miss, refused or not needed).
+         */
+        locate(figure) {
+            let data;
+            try { data = JSON.parse(figure.dataset.locate || '{}'); } catch { return; }
+            if (!data.cases?.length || !data.parts?.length) return;
+            const state = { at: 0 };
+            const STEP = ['The part at the resolved path', 'The same path, ignoring case', 'Its file name, in the folder of its kind'];
+            const body = el('div', { class: 'demo-locate', 'aria-live': 'polite' });
+            const picks = el('div', { class: 'demo-picks', role: 'radiogroup', 'aria-label': 'Target' });
+            const pickButtons = data.cases.map((c, i) => el('button', {
+                type: 'button', role: 'radio', 'aria-checked': String(i === state.at),
+                onclick: () => { state.at = i; for (const [j, b] of pickButtons.entries()) b.setAttribute('aria-checked', String(j === i)); draw(); },
+            }, el('span', { class: 'demo-pick-tab' }, c.tab), el('code', {}, c.target)));
+            picks.append(...pickButtons);
+            const draw = () => {
+                const c = data.cases[state.at];
+                const said = (s, i) => s.status === 'hit' ? `found ${s.part}`
+                    : s.status === 'refused' ? `${s.part} is ${s.by}'s, named exactly, so not taken`
+                    : s.status === 'skipped' ? 'not needed'
+                    : i === 2 && s.looked ? `no ${s.looked}` : 'no such part';
+                body.replaceChildren(
+                    el('pre', { class: 'demo-locate-rel' }, el('code', {}, `<sheet name="${c.tab}" r:id="${c.id}"/>\n<Relationship Id="${c.id}" Type="…/${c.kind}" Target="${c.target}"/>`)),
+                    el('div', { class: 'demo-locate-resolved' }, el('span', {}, 'Resolved from xl/:'), el('code', {}, c.resolved)),
+                    el('ol', { class: 'demo-steps' }, ...c.steps.map((s, i) => el('li', { class: `demo-step demo-step-${s.status}` }, el('span', { class: 'demo-step-what' }, STEP[i]), el('span', { class: 'demo-step-said' }, said(s, i))))),
+                    el('ul', { class: 'demo-parts', 'aria-label': 'The package' }, ...data.parts.map(part => el('li', { class: part === c.found ? 'demo-part-found' : c.steps.some(s => s.status === 'refused' && s.part === part) ? 'demo-part-refused' : '' }, el('code', {}, part)))),
+                    el('div', { class: 'demo-result' }, el('span', {}, 'Sheets read:'), ...c.tabs.map(t => el('span', { class: 'demo-copied' }, t))));
+            };
+            figure.querySelector('.demo-fallback')?.remove();
+            figure.prepend(el('div', { class: 'demo-controls' }, picks), body);
+            figure.classList.add('demo-live');
+            draw();
+        },
     };
 
     const wireDemos = () => {
@@ -548,8 +649,54 @@
         }
     };
 
+    /**
+     * The text width control in a post's header: a button that opens a panel with a slider. Moving
+     * the slider widens or narrows the post at once; the choice is kept for every post (where the
+     * browser allows it, else for this page). Escape or a click elsewhere closes the panel.
+     */
+    const wireWidthControl = () => {
+        const control = document.getElementById('width-control');
+        if (!control) return;
+        const toggle = document.getElementById('width-toggle');
+        const panel = document.getElementById('width-panel');
+        const range = document.getElementById('width-range');
+        const shown = document.getElementById('width-value');
+        const reset = document.getElementById('width-reset');
+        const paint = width => {
+            range.value = String(width);
+            shown.textContent = `${width} px`;
+            reset.disabled = width === WIDTH.default;
+        };
+        const choose = width => {
+            applyWidth(width);
+            paint(width);
+            try {
+                if (width === WIDTH.default) localStorage.removeItem(WIDTH_KEY);
+                else localStorage.setItem(WIDTH_KEY, String(width));
+            } catch { /* the choice lasts for this page */ }
+        };
+        const open = isOpen => {
+            panel.hidden = !isOpen;
+            toggle.setAttribute('aria-expanded', String(isOpen));
+        };
+        paint(storedWidth() ?? WIDTH.default);
+        control.hidden = false;
+        toggle.addEventListener('click', () => {
+            const isOpen = panel.hidden;
+            open(isOpen);
+            if (isOpen) range.focus();
+        });
+        range.addEventListener('input', () => choose(validWidth(range.value) ?? WIDTH.default));
+        reset.addEventListener('click', () => { choose(WIDTH.default); range.focus(); });
+        document.addEventListener('click', event => { if (!panel.hidden && !control.contains(event.target)) open(false); });
+        document.addEventListener('keydown', event => {
+            if (event.key === 'Escape' && !panel.hidden) { open(false); toggle.focus(); }
+        });
+    };
+
     const start = () => {
         wireThemeToggle();
+        wireWidthControl();
         wireRevisionToggle();
         wireListFilter();
         wireDemos();
