@@ -1,10 +1,10 @@
 /**
  * Word Document (DOCX) Parser
- * 
+ *
  * **DOCX Format Overview:**
  * DOCX is the default format for Microsoft Word documents since Office 2007.
  * It's based on the Office Open XML (OOXML) standard (ECMA-376, ISO/IEC 29500).
- * 
+ *
  * **File Structure:**
  * DOCX files are ZIP archives containing:
  * - `word/document.xml` - Main document content
@@ -14,7 +14,7 @@
  * - `word/media/*` - Embedded images and media
  * - `docProps/core.xml` - Document metadata
  * - `[Content_Types].xml` - MIME type mappings
- * 
+ *
  * **XML Structure (word/document.xml):**
  * ```xml
  * <w:document>
@@ -61,14 +61,16 @@
  */
 
 import { attachmentLookup, contentWeigher, takeRepeats } from '../utils/repeatUtils.js';
-import { BreakMetadata, CellMetadata, CodeMetadata, CommentMetadata, FullOfficeParserConfig, HeaderFooterMetadata, ImageMetadata, ShapeMetadata, PageNumberFormat, IndentationMetadata, ListMetadata, NoteMetadata, OfficeAttachment, OfficeContentNode, OfficeErrorType, OfficeIssue, OfficeParserAST, OfficeWarningType, PageSetup, ParagraphSpacing, TableMetadata, TextFormatting, TextMetadata } from '../types.js';
+import { BreakMetadata, CellMetadata, ChartMetadata, CodeMetadata, CommentMetadata, FullOfficeParserConfig, HeaderFooterMetadata, ImageMetadata, ShapeMetadata, PageNumberFormat, IndentationMetadata, ListMetadata, NoteMetadata, OfficeAttachment, OfficeContentNode, OfficeErrorType, OfficeIssue, OfficeParserAST, OfficeWarningType, PageSetup, ParagraphSpacing, TableMetadata, TextFormatting, TextMetadata } from '../types.js';
 import { MAX_PAGE_PT } from '../utils/pageLimits.js';
 import { lengthToPt, titlePagesTakeHiddenFirsts } from '../utils/officeGenUtils.js';
 import { fieldSwitchFormat, pageNumberStartOf, wordPageNumberFormat } from '../utils/pageNumbers.js';
 import { createAST } from '../utils/astUtils.js';
 import { checkAbortSignal, getOfficeError, logWarning } from '../utils/errorUtils.js';
 import { createAttachment, renameAttachments } from '../utils/imageUtils.js';
+import { extractChartData } from '../utils/chartUtils.js';
 import { isEmptyMath, ommlToLatex } from '../utils/mathUtils.js';
+import { embeddedObjectKind, embeddedObjectPart, progIdOf } from '../utils/oleUtils.js';
 import { ocrDuringParse } from '../utils/ocrUtils.js';
 import { getAllElementsByTagName, getChildElements, getDirectChildren, getElementsByTagName, getOutermostElements, getFirstElementByTagName, getRawContent, isElement, parseOfficeMetadata, parseOOXMLAppProperties, parseOOXMLCustomProperties, parseXmlString, takeNodes, takeXmlElements, countByte } from '../utils/xmlUtils.js';
 import { bulletCharacter, formatListNumber, wordNumberFormat } from '../utils/listMarkers.js';
@@ -282,7 +284,7 @@ function textBoxFloat(drawing: Element): ShapeMetadata | undefined {
 
 /**
  * Parses a Word document (.docx) and extracts content, formatting, and metadata.
- * 
+ *
  * The parsing process:
  * 1. Unzip the DOCX file
  * 2. Parse word/document.xml to extract paragraphs and runs
@@ -291,7 +293,7 @@ function textBoxFloat(drawing: Element): ShapeMetadata | undefined {
  * 5. Process lists from numbering properties
  * 6. Extract images and optionally perform OCR
  * 7. Parse document metadata
- * 
+ *
  * @param buffer - The DOCX file as a Buffer
  * @param config - Parser configuration options
  * @returns A promise resolving to the parsed AST
@@ -304,6 +306,8 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
 
     const documentFileRegex = /word\/document[\d+]?.xml/;
     const footnotesFileRegex = /word\/footnotes[\d+]?.xml/;
+    // The glossary holds the building blocks a content control names as its placeholder prompt.
+    const glossaryFileRegex = /word\/glossary\/document[\d+]?.xml/;
     const endnotesFileRegex = /word\/endnotes[\d+]?.xml/;
     const commentsFileRegex = /word\/comments[\d+]?.xml/;
     // Headers and footers are the only parts a document can have many of: Word writes up to
@@ -314,6 +318,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
     const footerFileRegex = /word\/footer\d*\.xml/;
     const numberingFileRegex = /word\/numbering[\d+]?.xml/;
     const mediaFileRegex = /(word\/)?media\/.*/;
+    const chartFileRegex = /^word\/charts\/chart\d+\.xml$/;
     const corePropsFileRegex = /docProps\/core[\d+]?.xml/;
     const customPropsFileRegex = /docProps\/custom\.xml/;
     const appPropsFileRegex = /docProps\/app[\d+]?.xml/;
@@ -346,7 +351,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
         const u = getFirstElementByTagName(rPr, 'w:u');
         if (u) {
             const val = u.getAttribute('w:val');
-            // If val is missing, it's a default underline (true). 
+            // If val is missing, it's a default underline (true).
             // If val is present, it's true unless explicit 'none'.
             if (!val || val !== 'none') {
                 formatting.underline = true;
@@ -522,6 +527,95 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
      */
     const ownFirst = (element: Element, tag: string): Element | undefined => getOutermostElements(element, tag, TEXT_BOX)[0];
 
+    /** Whether content control `sdt` is set to show its placeholder (`w:showingPlcHdr`, unless switched off). */
+    const showsPlaceholder = (sdt: Element): boolean => {
+        const properties = getDirectChildren(sdt, "w:sdtPr")[0];
+        const flag = properties ? getDirectChildren(properties, "w:showingPlcHdr")[0] : undefined;
+        if (!flag) return false;
+        const value = (flag.getAttribute("w:val") || "").toLowerCase();
+        return value !== "false" && value !== "0" && value !== "off";
+    };
+
+    /** The text of `element`'s runs, one line per paragraph, with whitespace runs read as one space. */
+    const promptText = (element: Element): string => {
+        const paragraphs = getElementsByTagName(element, "w:p");
+        const lines = (paragraphs.length ? paragraphs : [element]).map(p => getElementsByTagName(p, "w:t").map(t => t.textContent || '').join(''));
+        return lines.join('\n').replace(/\s+/g, ' ').trim();
+    };
+
+    // The placeholder prompt of each glossary building block, by name. Null-prototype: keyed by the
+    // document's own names (see numberingMap).
+    const placeholderPrompts: { [name: string]: string } = Object.create(null);
+
+    /**
+     * Whether content control `sdt` holds its placeholder prompt ("Click or tap here to enter text."):
+     * it is set to show the placeholder, and its content reads as the glossary building block that
+     * `w:placeholder/w:docPart` names. The flag alone is not enough, since a program can fill a control
+     * without clearing it; such text differs from the prompt and is the document's text, as is any
+     * control's content when the document has no glossary to compare it with.
+     */
+    const promptControls = new Map<Element, boolean>();
+    const isPromptControl = (sdt: Element): boolean => {
+        let prompt = promptControls.get(sdt);
+        if (prompt === undefined) {
+            const properties = getDirectChildren(sdt, "w:sdtPr")[0];
+            const placeholder = properties ? getDirectChildren(properties, "w:placeholder")[0] : undefined;
+            const name = placeholder ? getDirectChildren(placeholder, "w:docPart")[0]?.getAttribute("w:val") : undefined;
+            const content = getDirectChildren(sdt, "w:sdtContent")[0];
+            prompt = !!name && !!content && showsPlaceholder(sdt) && name in placeholderPrompts
+                && promptTextWithin(content, placeholderPrompts[name]) === placeholderPrompts[name];
+            promptControls.set(sdt, prompt);
+        }
+        return prompt;
+    };
+
+    /**
+     * {@link promptText} of a control's content, read only as far as telling it from `prompt`: undefined
+     * when the content holds more than 256 nodes, or more text than the prompt's length and a character
+     * (and 1,024 of white space a prompt's runs may hold between its words). Such a control is not its
+     * prompt, and is read as text. Bounded, a control is compared in constant time, however much it holds
+     * or however many controls are nested in it: read whole, each of 20,000 nested controls read all
+     * those inside it.
+     */
+    const MAX_PROMPT_NODES = 256;
+    const promptTextWithin = (content: Element, prompt: string): string | undefined => {
+        let nodes = 0, characters = 0;
+        const limit = prompt.length + 1 + 1024;
+        // (A walk by child index, so a node of many children is not listed whole before the count stops it.)
+        const stack: { node: Node; next: number }[] = [{ node: content, next: 0 }];
+        while (stack.length) {
+            const top = stack[stack.length - 1];
+            const child = top.node.childNodes[top.next++];
+            if (!child) { stack.pop(); continue; }
+            if (++nodes > MAX_PROMPT_NODES) return undefined;
+            if (isElement(child)) stack.push({ node: child, next: 0 });
+            else if ((characters += (child.nodeValue ?? '').length) > limit) return undefined;
+        }
+        // (Read as the glossary's prompt is, over these few nodes.)
+        const text = promptText(content);
+        return text.length > prompt.length + 1 ? undefined : text;
+    };
+
+    /**
+     * Whether `element` lies inside a content control that holds its placeholder prompt. Each ancestor is
+     * answered once: a walk goes up only to the nearest element already answered, and every element it
+     * passes takes the answer (walked to the root from each run, 20,000 nested controls took a walk
+     * 20,000 long for each).
+     */
+    const inPrompt = new Map<Node, boolean>();
+    const inPromptControl = (element: Element): boolean => {
+        const passed: Node[] = [];
+        let answer = false;
+        for (let node = element.parentNode; node; node = node.parentNode) {
+            const known = inPrompt.get(node);
+            if (known !== undefined) { answer = known; break; }
+            passed.push(node);
+            if (isElement(node) && node.nodeName === 'w:sdt' && isPromptControl(node)) { answer = true; break; }
+        }
+        for (const node of passed) inPrompt.set(node, answer);
+        return answer;
+    };
+
     /**
      * The child elements of `container` as Word lays them out: a content control (`w:sdt`) or custom XML
      * element (`w:customXml`) stands for what it wraps, at any depth, and alternate content for the branch
@@ -565,6 +659,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
         x =>
             !!x.match(documentFileRegex) ||
             !!x.match(footnotesFileRegex) ||
+            !!x.match(glossaryFileRegex) ||
             !!x.match(endnotesFileRegex) ||
             !!x.match(numberingFileRegex) ||
             !!x.match(corePropsFileRegex) ||
@@ -575,7 +670,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
             (!config.ignoreComments && !!x.match(commentsFileRegex)) ||
             // (The settings say whether even pages' headers are shown.)
             (!config.ignoreHeadersAndFooters && (!!x.match(headerFileRegex) || !!x.match(footerFileRegex) || x === 'word/settings.xml')) ||
-            (!!config.extractAttachments && !!x.match(mediaFileRegex)) ||
+            (!!config.extractAttachments && (!!x.match(mediaFileRegex) || chartFileRegex.test(x))) ||
             diagramDataRegex.test(x),
         // A DOCX read as a chunk inflates within what the enclosing document left.
         chunk ? { ...config.decompressionLimits, maxUncompressedBytes: chunk.bytesLeft } : config.decompressionLimits,
@@ -588,6 +683,29 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
     // parse loop below uses to recognize it, so the two cannot fall out of step.
     findRequiredPart(files, path => !!path.match(documentFileRegex), config,
         { fileType: 'docx', part: 'word/document.xml' });
+
+    // Each placeholder building block's prompt, for telling a control's prompt from text put in it. The glossary is read
+    // only for that: one that is not XML is no glossary (its controls' prompts read as text), reported. Its elements are
+    // the document's (DOCUMENT_BUDGETS: past the limit, or aborted, the parse ends).
+    const glossaryFile = files.find(f => f.path.match(glossaryFileRegex));
+    if (glossaryFile) {
+        let glossary: Document | undefined;
+        try {
+            glossary = parseXmlString(glossaryFile.content.toString(), { config });
+        } catch (error: any) {
+            if (error?.name === 'AbortError' || DOCUMENT_BUDGETS.has(error?.officeIssue?.code)) throw error;
+            logWarning(OfficeWarningType.CONTENT_PART_NOT_READ, config, {
+                part: `the glossary, ${glossaryFile.path}`,
+                reason: `it is not well-formed XML (${String(error?.message ?? error).slice(0, 200)}), so content controls' placeholder prompts are read as text`,
+            });
+        }
+        if (glossary) for (const docPart of getElementsByTagName(glossary, "w:docPart")) {
+            const docPartPr = getDirectChildren(docPart, "w:docPartPr")[0];
+            const name = docPartPr ? getDirectChildren(docPartPr, "w:name")[0]?.getAttribute("w:val") : undefined;
+            const body = getDirectChildren(docPart, "w:docPartBody")[0];
+            if (name && body) placeholderPrompts[name] = promptText(body);
+        }
+    }
 
     // Each part's relationships, by the part's path: an id in a note, comment, header or footer names a
     // relationship of that part's own, and looking it up among the document's found another target, or
@@ -623,6 +741,86 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
         } finally {
             partRels = previous;
         }
+    };
+    /** A drawing's chart node, its `c:chart` part found among the relationships of the part being read (see withPartRels). */
+    const chartNodeOf = (drawing: Element, documentContent: string): OfficeContentNode | undefined => {
+        const graphicData = ownFirst(drawing, "a:graphicData");
+        if (graphicData?.getAttribute("uri") !== "http://schemas.openxmlformats.org/drawingml/2006/chart") return undefined;
+        const rId = getFirstElementByTagName(graphicData, "c:chart")?.getAttribute("r:id");
+        const attachmentName = rId ? partRels[rId]?.split('/').pop() : undefined;
+        if (!attachmentName) return undefined;
+        const chartNode: OfficeContentNode = { type: 'chart', text: '', metadata: { attachmentName } as ChartMetadata };
+        if (config.includeRawContent) chartNode.rawContent = getRawContent(drawing, documentContent, config);
+        return chartNode;
+    };
+
+    /**
+     * The picture a drawing shows (a DrawingML blip or a VML image), or an embedded object's preview
+     * picture: an image node, of its alt text alone where the package does not hold its data; undefined
+     * for a drawing that shows neither (a text box, SmartArt, a plain shape). An embedded object (OLE: an
+     * Excel sheet, an equation) is `w:object`, or a drawing holding `o:OLEObject`, as older producers
+     * write one in `w:pict`: its alt text names its kind, and one with no preview is reported. (A
+     * function of its own: read in the run's walk, its locals made every level of nested text boxes
+     * deeper on the stack.)
+     */
+    const pictureNodeOf = (imgNode: Element, documentContent: string): OfficeContentNode | undefined => {
+        const blip = ownFirst(imgNode, "a:blip");
+        const imagedata = blip ? undefined : ownFirst(imgNode, "v:imagedata");
+        const oleObject = ownFirst(imgNode, "o:OLEObject");
+        const objectEmbed = oleObject ? undefined : ownFirst(imgNode, "w:objectEmbed") ?? ownFirst(imgNode, "w:objectLink");
+        // An ActiveX control (`w:control`) is not an embedded object: it is the picture it shows, as one in `w:pict` is, or nothing.
+        const control = !oleObject && !objectEmbed && !!ownFirst(imgNode, "w:control");
+        const isObject = !control && (imgNode.nodeName === 'w:object' || imgNode.nodeName === 'object' || !!oleObject);
+        if (!blip && !imagedata && !isObject) return undefined;
+        const progId = isObject ? progIdOf(oleObject?.getAttribute("ProgID") || objectEmbed?.getAttribute("w:progId") || undefined) : undefined;
+        // Extract Alt Text
+        let altText = '';
+        const docPr = ownFirst(imgNode, "wp:docPr");
+        if (docPr) {
+            altText = docPr.getAttribute("descr") || docPr.getAttribute("title") || '';
+        }
+        if (isObject && !altText) altText = ownFirst(imgNode, "v:shape")?.getAttribute("alt") || embeddedObjectKind(progId) || '';
+        // A picture that is a link itself (Insert > Link on a picture writes it on docPr).
+        const pictureLinkRid = docPr ? getFirstElementByTagName(docPr, "a:hlinkClick")?.getAttribute("r:id") : null;
+        const pictureLink = pictureLinkRid && partRels[pictureLinkRid] ? { link: partRels[pictureLinkRid], linkType: 'external' as const } : {};
+
+        // Extract Relationship ID
+        const rId = (blip ? blip.getAttribute("r:embed") : imagedata?.getAttribute("r:id")) || '';
+
+        if (rId && partRels[rId]) {
+            const filename = partRels[rId].split('/').pop();
+            if (!filename) return undefined;
+            const imageNode: OfficeContentNode = {
+                type: 'image',
+                text: '',
+                metadata: { attachmentName: filename, altText: altText, ...pictureLink } as ImageMetadata
+            };
+            if (config.includeRawContent) {
+                imageNode.rawContent = getRawContent(imgNode, documentContent, config);
+            }
+            return imageNode;
+        }
+        // A picture whose data the package does not hold: its alt text, where it has one.
+        const imageNode: OfficeContentNode = {
+            type: 'image',
+            text: '',
+            ...(altText ? { metadata: { altText } as ImageMetadata } : {}),
+        };
+        if (config.includeRawContent) {
+            imageNode.rawContent = getRawContent(imgNode, documentContent, config);
+        }
+        // An object with no picture of it shows nothing of what it holds.
+        if (isObject) {
+            const objectRid = (oleObject ?? objectEmbed)?.getAttribute("r:id");
+            const target = objectRid ? partRels[objectRid] : undefined;
+            logWarning(OfficeWarningType.CONTENT_PART_NOT_READ, config, {
+                part: embeddedObjectPart(progId),
+                reason: 'it has no preview picture, and the object itself is not read',
+                ...(progId ? { progId } : {}),
+                ...(target ? { target } : {}),
+            });
+        }
+        return imageNode;
     };
 
     // The parts alternative-format chunks are read from, inflated second and only those an aFChunk
@@ -695,6 +893,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
     const attachments: OfficeAttachment[] = [];
     const attachmentsByName = attachmentLookup(attachments);
     const mediaFiles = files.filter(f => f.path.match(mediaFileRegex));
+    const chartFiles = files.filter(f => chartFileRegex.test(f.path));
 
     // A note referred to again: Word writes a later reference to a note as a NOTEREF field formatted as
     // its mark, naming a bookmark around the first reference. Each bookmark open where a note reference
@@ -736,9 +935,10 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
         logWarning(OfficeWarningType.ALT_CHUNK_NOT_READ, config, reason);
     };
     const readChunkParts = new Set<string>();
-    // A chunk's pictures take names none of the document's own media, or other chunks' pictures, take.
+    // A chunk's pictures and charts take names none of the document's own media and charts, or other
+    // chunks' attachments, take.
     const attachmentNames = new UniqueNames();
-    for (const media of mediaFiles) attachmentNames.add(media.path.split('/').pop() || '');
+    for (const part of [...mediaFiles, ...chartFiles]) attachmentNames.add(part.path.split('/').pop() || '');
     const claimAttachmentName = (name: string): string => {
         const dot = name.lastIndexOf('.');
         const stem = dot > 0 ? name.slice(0, dot) : name;
@@ -1228,6 +1428,8 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
             if (isElement(node) && (node.nodeName === 'w:r' || node.nodeName === 'm:r')) {
                 const runNode = node;
                 const rPr = getDirectChildren(runNode, "w:rPr")[0];
+                // A content control's prompt stays in the AST, marked, but is not the paragraph's text.
+                const prompt = inPromptControl(runNode);
 
                 // Formatting
                 let formatting: TextFormatting = {};
@@ -1290,8 +1492,10 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
                         if (customMarkFollows) { customMark += tNode.textContent || ''; continue; }
 
                         const tContent = tNode.textContent || '';
-                        text += tContent;
-                        if (tContent.trim()) shownTexts++;
+                        if (!prompt) {
+                            text += tContent;
+                            if (tContent.trim()) shownTexts++;
+                        }
                         const textNode: OfficeContentNode = {
                             type: 'text',
                             text: tContent,
@@ -1308,6 +1512,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
                         }
                         const pageField = pageFields[pageFields.length - 1];
                         if (pageField) textNode.metadata = { ...(textNode.metadata as TextMetadata), field: pageField.field, ...(pageField.format ? { fieldFormat: pageField.format } : {}) };
+                        if (prompt) textNode.metadata = { ...(textNode.metadata as TextMetadata), placeholder: true };
                         children.push(textNode);
                     }
                     // Complex fields: where one begins, its instruction, where its result begins, where it ends.
@@ -1323,16 +1528,16 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
                     // read "AB". An absolute-position tab (w:ptab, as in "left<ptab>right" headers) is one too.
                     else if (child.tagName === "w:tab" || child.tagName === "tab" || child.tagName === "w:ptab") {
                         if (hiddenResults > 0) continue;
-                        text += '\t';
-                        children.push({ type: 'text', text: '\t', formatting } as OfficeContentNode);
+                        if (!prompt) text += '\t';
+                        children.push({ type: 'text', text: '\t', formatting, ...(prompt ? { metadata: { placeholder: true } } : {}) } as OfficeContentNode);
                     }
                     // A non-breaking hyphen is Word's own element, not a character of w:t: left out,
                     // "co<noBreakHyphen/>operate" read "cooperate". A soft hyphen stays out, as Word shows it
                     // only at a line end.
                     else if (child.tagName === "w:noBreakHyphen") {
                         if (hiddenResults > 0) continue;
-                        text += '-';
-                        children.push({ type: 'text', text: '-', formatting } as OfficeContentNode);
+                        if (!prompt) text += '-';
+                        children.push({ type: 'text', text: '-', formatting, ...(prompt ? { metadata: { placeholder: true } } : {}) } as OfficeContentNode);
                     }
                     // Break nodes
                     else if (child.tagName === "w:br"
@@ -1357,7 +1562,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
                         const lineBreak = breakType === 'textWrapping' || breakType === 'carriageReturn';
                         if (!lineBreak && !config.includeBreakNodes) continue;
                         if (lineBreak && hiddenResults > 0) continue;
-                        if (lineBreak) text += '\n';
+                        if (lineBreak && !prompt) text += '\n';
 
                         let breakClear: BreakMetadata["clear"] = undefined;
                         if (breakType === 'textWrapping' && brNode.getAttribute("w:clear") !== null) {
@@ -1366,7 +1571,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
 
                         const breakNode: OfficeContentNode = {
                             type: 'break',
-                            metadata: { breakType, clear: breakClear }
+                            metadata: { breakType, clear: breakClear, ...(prompt ? { placeholder: true } : {}) }
                         };
 
                         if (config.includeRawContent) {
@@ -1397,58 +1602,24 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
                 while (pendingDrawing.length) {
                     const item = pendingDrawing.pop()!;
                     if (!isElement(item) || TEXT_BOX.has(item.nodeName)) continue;
-                    if (item.nodeName === 'w:drawing' || item.nodeName === 'drawing' || item.nodeName === 'w:pict' || item.nodeName === 'pict') runDrawings.push(item);
+                    // (An embedded object, `w:object`, too: its preview picture is what it shows.)
+                    if (item.nodeName === 'w:drawing' || item.nodeName === 'drawing' || item.nodeName === 'w:pict' || item.nodeName === 'pict' || item.nodeName === 'w:object' || item.nodeName === 'object') runDrawings.push(item);
                     else if (isAlternateContent(item)) pushNodes(resolveAlternateContent(item));
                     else pushNodes(item.childNodes);
                 }
 
-                // Pictures: a drawing showing one (a DrawingML blip, or a VML image). A text box, SmartArt,
-                // chart or plain shape shows none, and gave an image node of nothing (`![image]()`).
-                if (config.extractAttachments) {
-                    for (const imgNode of runDrawings) {
-                        const blip = ownFirst(imgNode, "a:blip");
-                        const imagedata = blip ? undefined : ownFirst(imgNode, "v:imagedata");
-                        if (!blip && !imagedata) continue;
-                        // Extract Alt Text
-                        let altText = '';
-                        const docPr = ownFirst(imgNode, "wp:docPr");
-                        if (docPr) {
-                            altText = docPr.getAttribute("descr") || docPr.getAttribute("title") || '';
-                        }
-                        // A picture that is a link itself (Insert > Link on a picture writes it on docPr).
-                        const pictureLinkRid = docPr ? getFirstElementByTagName(docPr, "a:hlinkClick")?.getAttribute("r:id") : null;
-                        const pictureLink = pictureLinkRid && partRels[pictureLinkRid] ? { link: partRels[pictureLinkRid], linkType: 'external' as const } : {};
-
-                        // Extract Relationship ID
-                        const rId = (blip ? blip.getAttribute("r:embed") : imagedata!.getAttribute("r:id")) || '';
-
-                        if (rId && partRels[rId]) {
-                            const target = partRels[rId];
-                            const filename = target.split('/').pop();
-                            if (filename) {
-                                const imageNode: OfficeContentNode = {
-                                    type: 'image',
-                                    text: '',
-                                    metadata: { attachmentName: filename, altText: altText, ...pictureLink } as ImageMetadata
-                                };
-                                if (config.includeRawContent) {
-                                    imageNode.rawContent = getRawContent(imgNode, documentContent, config);
-                                }
-                                children.push(imageNode);
-                            }
-                        } else {
-                            // A picture whose data the package does not hold: its alt text, where it has one.
-                            const imageNode: OfficeContentNode = {
-                                type: 'image',
-                                text: '',
-                                ...(altText ? { metadata: { altText } as ImageMetadata } : {}),
-                            };
-                            if (config.includeRawContent) {
-                                imageNode.rawContent = getRawContent(imgNode, documentContent, config);
-                            }
-                            children.push(imageNode);
-                        }
+                // Charts, with or without attachments, and pictures: a drawing showing a DrawingML blip or
+                // a VML image. A text box, SmartArt or plain shape shows neither, and gave an image node of
+                // nothing (`![image]()`).
+                for (const imgNode of runDrawings) {
+                    const chartNode = chartNodeOf(imgNode, documentContent);
+                    if (chartNode) {
+                        children.push(chartNode);
+                        continue;
                     }
+                    if (!config.extractAttachments) continue;
+                    const imageNode = pictureNodeOf(imgNode, documentContent);
+                    if (imageNode) children.push(imageNode);
                 }
 
                 // What the run's drawings hold that a paragraph cannot: SmartArt (a list, as a slide's
@@ -1978,6 +2149,16 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
         withPartRels(path, read);
     };
 
+    /**
+     * A separator note (the line above the notes, its continuation, the continuation notice) is marked by its
+     * `w:type`, not its id: Word gives its separators ids -1 and 0, but other writers (WPS Office) give theirs
+     * high ids and the first real note id 0. A note with no type, or `normal`, is a note.
+     */
+    const isSeparatorNote = (node: Element): boolean => {
+        const type = node.getAttribute("w:type");
+        return type === "separator" || type === "continuationSeparator" || type === "continuationNotice";
+    };
+
     // Pre-process footnotes and endnotes to be inserted inline later
     if (!config.ignoreNotes) {
         const footnotesFile = files.find(f => f.path.match(footnotesFileRegex));
@@ -1987,7 +2168,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
             await readPart(footnotesFile.path, footnotesDoc.documentElement, () => {
                 for (const node of getElementsByTagName(footnotesDoc, "w:footnote")) {
                     const id = node.getAttribute("w:id");
-                    if (!id || id === "-1" || id === "0") continue;
+                    if (!id || isSeparatorNote(node)) continue;
                     const blocks: OfficeContentNode[] = [];
                     readBlocks(node, footnoteXml, blocks);
                     footnoteMap.set(id, blocks);
@@ -2002,7 +2183,7 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
             await readPart(endnotesFile.path, endnotesDoc.documentElement, () => {
                 for (const node of getElementsByTagName(endnotesDoc, "w:endnote")) {
                     const id = node.getAttribute("w:id");
-                    if (!id || id === "-1" || id === "0") continue;
+                    if (!id || isSeparatorNote(node)) continue;
                     const blocks: OfficeContentNode[] = [];
                     readBlocks(node, endnoteXml, blocks);
                     endnoteMap.set(id, blocks);
@@ -2187,6 +2368,41 @@ export const parseWord = async (buffer: Buffer, config: FullOfficeParserConfig, 
             if (config.ocr && attachment.mimeType.startsWith('image/')) {
                 const ocrText = await ocrDuringParse(media.content, config, attachment.name);
                 if (ocrText !== undefined) attachment.ocrText = ocrText;
+            }
+        }
+
+        for (const chart of chartFiles) {
+            const attachment: OfficeAttachment = {
+                type: 'chart',
+                mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                data: chart.content.toString('base64'),
+                name: chart.path.split('/').pop() || '',
+                extension: 'xml'
+            };
+            attachments.push(attachment);
+            try {
+                attachment.chartData = extractChartData(chart.content, config);
+            } catch (e) {
+                logWarning(OfficeWarningType.CHART_DATA_EXTRACTION_FAILED, config, chart.path, e);
+            }
+        }
+
+        // Each chart node's text is its chart's data. A note or comment shared by many references is
+        // visited once.
+        if (chartFiles.length > 0) {
+            const seen = new Set<OfficeContentNode>();
+            const pending: OfficeContentNode[] = [];
+            for (const list of [content, headers, footers]) appendAll(pending, list);
+            while (pending.length) {
+                const node = pending.pop()!;
+                if (seen.has(node)) continue;
+                seen.add(node);
+                if (node.type === 'chart') {
+                    const attachment = attachmentsByName.get((node.metadata as ChartMetadata | undefined)?.attachmentName);
+                    const text = attachment && attachmentsByName.chartText(attachment, config.newlineDelimiter);
+                    if (text !== undefined) node.text = text;
+                }
+                for (const list of [node.children, node.notes, node.comments]) if (list) appendAll(pending, list);
             }
         }
 

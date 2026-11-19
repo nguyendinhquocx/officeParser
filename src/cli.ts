@@ -43,6 +43,7 @@ import { OfficeGenerator } from './OfficeGenerator.js';
 import { OfficeParserAST, OfficeParserConfig, OfficeWarningType, UniversalGeneratorFormat } from './types.js';
 import * as fs from 'fs';
 import { lookupTable } from './utils/lookupUtils.js';
+import { isWorkbookChartsNotRead } from './parsers/ExcelParser.js';
 import { DEFAULT_GENERATOR_CONFIG, DEFAULT_OFFICE_PARSER_CONFIG } from './defaults.js';
 
 const args = process.argv.slice(2);
@@ -74,14 +75,14 @@ const knownParserBooleans = new Set([
 ]);
 
 const knownGeneratorBooleans = new Set([
-    'includeFormatting', 'generateIds', 'renderMetadata', 'includeImages', 'includeCharts', 'ignoreInternalLinks',
+    'includeFormatting', 'generateIds', 'renderMetadata', 'includeImages', 'includeCharts', 'includePlaceholderText', 'ignoreInternalLinks',
     // Dotted generator booleans, same rationale as the parser set above.
     'pdfConfig.tagged', 'pdfConfig.outline', 'pdfConfig.subsetFonts', 'pdfConfig.printHidden', 'pdfConfig.printSpeakerNotes', 'pdfConfig.landscape', 'pdfConfig.printBackground', 'pdfConfig.displayHeaderFooter',
     'docxConfig.landscape', 'odtConfig.landscape',
     'xlsxConfig.sheetPerTable', 'xlsxConfig.includeText', 'odsConfig.sheetPerTable', 'odsConfig.includeText',
     'texConfig.standalone', 'texConfig.bundle', 'texConfig.embedImages', 'texConfig.numberSections', 'texConfig.landscape',
     'textConfig.preserveLayout', 'textConfig.renderNotes',
-    'htmlConfig.standalone', 'htmlConfig.sourceAttributes', 'htmlConfig.gatedEmbeds',
+    'htmlConfig.standalone', 'htmlConfig.sourceAttributes', 'htmlConfig.gatedEmbeds', 'htmlConfig.footnoteBackLinks',
     'mdConfig.fallbackToHtml', 'mdConfig.fallbackToHtml.inlineFormatting',
 ]);
 
@@ -316,7 +317,11 @@ if (fileArg && !showHelp) {
     // up silently doing nothing.
     const CONFIG_MISTAKES = new Set<string>([OfficeWarningType.UNRECOGNIZED_CONFIG_OPTION, OfficeWarningType.INVALID_CONFIG_VALUE, OfficeWarningType.INVALID_CONTAINER_WIDTH]);
     const originalOnWarning = config.onWarning;
+    // A conversion that leaves charts out (--includeCharts=false) has no chart in its output: a workbook's charts not read
+    // without --extractAttachments are not reported (see isWorkbookChartsNotRead), as OfficeConverter does.
+    const chartsLeftOut = !!outputFormat && outputFormat !== 'json' && generatorConfig.includeCharts === false;
     config.onWarning = (issue) => {
+        if (chartsLeftOut && isWorkbookChartsNotRead(issue)) return;
         if (verbose || CONFIG_MISTAKES.has(issue.code)) {
             const severity = issue.type === 'error' ? 'Error' : 'Warning';
             console.error(`[OfficeParser ${severity}] [${issue.code}]: ${issue.message}`);
@@ -471,7 +476,7 @@ if (fileArg && !showHelp) {
     console.log('  --pdfConfig.fonts.regular=Sans.ttf          Font file the native engine draws in; also .bold, .italic, .boldItalic, .mono');
     console.log('  --pdfConfig.fallbackFonts=a.ttf,b.otf       Font files tried, in order, for characters the fonts before them lack (native engine)');
     console.log('  --pdfConfig.subsetFonts=false               Embed whole font files, not only the glyphs used (default: true)');
-    console.log('  --pdfConfig.printHidden                     Print a spreadsheet\'s hidden sheets, rows and columns (default: false)');
+    console.log('  --pdfConfig.printHidden                     Print hidden sheets, rows, columns and slides (default: false)');
     console.log('  --pdfConfig.printSpeakerNotes               Print each slide\'s speaker notes under it (default: false)');
     console.log('  --pdfConfig.outline                         Write a bookmark outline from the headings (default: false)');
     console.log('  --pdfConfig.format=Letter                   PDF paper format (auto: as the document sets it; A4 | Letter | Legal ...)');

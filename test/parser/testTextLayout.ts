@@ -18,6 +18,7 @@ import { PdfLayoutConfig, RawRun } from '../../src/parsers/pdf/pdfTypes';
 import { layoutOcrText, sniffImageMime } from '../../src/utils/ocrUtils';
 import { OfficeContentNode } from '../../src/types';
 import { DEFAULT_OFFICE_PARSER_CONFIG } from '../../src/defaults';
+import { scaledMs } from '../helpers/timing';
 
 /** Mirrors `FeatureTest` in testOfficeParser.ts (structurally, so results can be pushed there). */
 interface LayoutTest {
@@ -46,11 +47,13 @@ const PAGE: PageContext = { pageNumber: 1, authoredW: 612, authoredH: 792, rotat
  * the machine is not taken for the code's. `run` gets the share of its size to build (0.25 or 1); its
  * last run is the full one.
  */
+/** scalesLinearly's 250 ms of slack on this machine (test/helpers/timing.ts), set when testTextLayout starts. */
+let linearSlackMs = 250;
 function scalesLinearly(run: (share: number) => void): { linear: boolean; detail: string } {
     const time = (share: number): number => { const t0 = performance.now(); run(share); return performance.now() - t0; };
     let small = time(0.25);
     let large = time(1);
-    const within = () => large <= 8 * small + 250;
+    const within = () => large <= 8 * small + linearSlackMs;
     if (!within()) {
         small = Math.min(small, time(0.25));
         large = Math.min(large, time(1));
@@ -122,12 +125,13 @@ function bulletList(itemGap: number): RawRun[] {
 }
 
 export async function testTextLayout(): Promise<LayoutTest[]> {
+    linearSlackMs = await scaledMs(250);
     const results: LayoutTest[] = [];
     const category = 'PDF Text Layout';
     const add = (feature: string, pass: boolean, expected: any, actual: any, details = '') =>
         results.push({ category, feature, fileType: 'pdf', result: { status: pass ? 'PASS' : 'FAIL', expected, actual, details } });
 
-    // ── H6: hanging indents, tight lists, symbol-font bullets ───────────────
+    // ── Hanging indents, tight lists, symbol-font bullets ───────────────
     {
         const shape = shapeOf(nodesOf(bulletList(14.4)));
         const ok = shape.length === 3 && shape.every(s => s.startsWith('list:'))
@@ -203,7 +207,7 @@ export async function testTextLayout(): Promise<LayoutTest[]> {
         const atTwelve = lookups(12);
         const hostile = lookups(1e9);
         const normal = lk(100, 500, 12, 50);
-        add('Colour lookup is bounded under a hostile font size', hostile <= 4 * atTwelve + 50 && normal === '#ff0000',
+        add('Colour lookup is bounded under a hostile font size', hostile <= 4 * atTwelve + await scaledMs(50) && normal === '#ff0000',
             'as fast at fontSize 1e9 as at 12pt, and still matches at 12pt', `${hostile.toFixed(1)}ms at 1e9, ${atTwelve.toFixed(1)}ms at 12pt, normal=${normal}`);
     }
     {
@@ -291,7 +295,7 @@ export async function testTextLayout(): Promise<LayoutTest[]> {
         add('Multi-column article yields no tables', tablesOf(runs).length === 0, 0, tablesOf(runs).length);
     }
 
-    // ── M4: tables need vertically adjacent rows ────────────────────────────
+    // ── Tables need vertically adjacent rows ────────────────────────────
     {
         const runs: RawRun[] = [];
         const row = (y: number, cells: [string, number][]) => { for (const [t, x] of cells) runs.push(run(t, x, y, 10)); };
@@ -317,7 +321,7 @@ export async function testTextLayout(): Promise<LayoutTest[]> {
         add('Genuine grid is still a table', tables.length === 1 && rows === 4, '1 table of 4 rows', `${tables.length} table(s), ${rows} rows`);
     }
 
-    // ── M5: hybrid grid recovery over tag-derived paragraphs ────────────────
+    // ── Hybrid grid recovery over tag-derived paragraphs ────────────────
     // Builds paragraph NODES (what the tagged path emits), one per grid cell, and asserts
     // recoverTaggedGrids folds the calendar into a table while leaving the title paragraph, and never
     // invents a table on prose or on a too-narrow layout.
@@ -412,7 +416,7 @@ export async function testTextLayout(): Promise<LayoutTest[]> {
             'two separate lines', `${text} (${lines.length} line(s))`);
     }
 
-    // ── H7: line building stays linear in the number of runs ────────────────
+    // ── Line building stays linear in the number of runs ────────────────
     {
         let lines: ReturnType<typeof buildLines> = [];
         const grows = scalesLinearly(share => {

@@ -93,10 +93,33 @@
                 <td><code>boolean</code></td>
                 <td><code>true</code></td>
                 <td><strong>Visuals</strong>: Whether to include charts. HTML draws an interactive Chart.js canvas (or, with no
-                    <code>chartJsSrc</code>, the chart's data as a table); DOCX, ODT and LaTeX write the chart's data as a
-                    table, PPTX and ODP a table of its data in the chart's place; plain text and the native PDF engine write
-                    its data as text; Markdown and RTF write nothing for a chart, and XLSX and ODS, whose cells cannot hold
-                    one, report it (<code>CONTENT_NOT_REPRESENTABLE</code>). <code>false</code> omits charts in every generator.</td>
+                    <code>chartJsSrc</code>, the chart's data as a table); DOCX, ODT, LaTeX, Markdown, RTF and EPUB write the
+                    chart's data as a table under its title (a chart in a line of text: DOCX, ODT and LaTeX its data's lines,
+                    Markdown and RTF a table between the text around it); PPTX and ODP a table of its data in the chart's
+                    place, XLSX and ODS a sheet of its data; the native PDF engine draws it (in a heading, list item or note,
+                    its data as text, reported); plain text writes its data as text. CSV writes sheets and tables, and reports
+                    the charts it leaves out (not those <code>onNode</code> leaves out), once
+                    (<code>CONTENT_NOT_REPRESENTABLE</code>, <code>details.reason: 'chart'</code>).
+                    A chart without its data is written as its text, else as its reference (<code>[Chart: chart1.xml]</code>),
+                    by HTML, EPUB, DOCX, ODT, LaTeX, Markdown, RTF, plain text, chunk and native PDF output; PPTX, ODP, XLSX,
+                    ODS and CSV output report it with <code>CONTENT_NOT_REPRESENTABLE</code>. A parse without
+                    <code>extractAttachments</code> reads no chart's data: an ODF chart (ODT, ODS, ODP) has its text, a DOCX
+                    or PPTX chart none, and an XLSX chart is not read, which the parse reports
+                    (<code>CONTENT_PART_NOT_READ</code>). A chart shown at several places has its
+                    table, title and text (in a line, or without its data) written again, charged what each writer writes (UTF-8 bytes, escapes
+                    included), within <code>decompressionLimits.maxRepeatedContent</code>, then a
+                    reference to it (<code>[Chart: Sales]</code>, <code>REPEATED_CONTENT_LIMIT_EXCEEDED</code>).
+                    <code>false</code> omits charts in every generator, unreported.</td>
+            </tr>
+            <tr>
+                <td><code>includePlaceholderText</code></td>
+                <td><code>boolean</code></td>
+                <td><code>false</code></td>
+                <td><strong>Content</strong>: Write the prompt of a DOCX content control that still shows its placeholder
+                    ("Click or tap here to enter text."). The parser keeps the prompt in the AST, marked
+                    <code>TextMetadata.placeholder</code>, and leaves it out of the paragraph's <code>text</code>; every
+                    generator, the native PDF engine included, leaves it out unless this is <code>true</code>. A caller's
+                    <code>onNode</code> is asked first.</td>
             </tr>
             <tr>
                 <td><code>ignoreInternalLinks</code></td>
@@ -242,6 +265,16 @@
                     <code>w:val="auto"</code> already carries no colour). Off by default; the output is unchanged.</td>
             </tr>
             <tr>
+                <td><code>footnoteBackLinks</code></td>
+                <td><code>boolean</code></td>
+                <td><code>true</code></td>
+                <td>End each footnote and endnote with a link back to its reference
+                    (<code>&lt;a href="#footnote-ref-KEY"&gt;↩&lt;/a&gt;</code>). <code>false</code> writes the note's own
+                    content only, for a host that keeps a note's markup as its text (a rich-text editor shows the link as part
+                    of the note and saves it into the note's text). The reference keeps its id either way, and the HTML reader
+                    drops a back-link, so output round-trips with or without it.</td>
+            </tr>
+            <tr>
                 <td><code>sheetLayout</code></td>
                 <td><code>'viewer' | 'tables'</code></td>
                 <td><code>'viewer'</code></td>
@@ -249,10 +282,21 @@
                     letters, row numbers, tabs, and a resizing script where scripts are written). <code>'tables'</code>: as a
                     document holds them, for a host embedding a workbook in a document: each sheet an <code>&lt;h2&gt;</code>
                     with its name and a plain table, merged cells as spans, empty rows and columns kept in place, the first row a
-                    header only where the source marks it (a header-styled or all-bold row), with no tabs, letters, numbers or
+                    header only where the source marks it (a header-styled or all-bold row; see <code>sheetHeaderRow</code>), with no tabs, letters, numbers or
                     script, and without the workbook's own font and size (what most of the cells' text has) on every cell; a cell
                     set apart keeps its own. An unknown value is reported (<code>INVALID_CONFIG_VALUE</code>) and the viewer
                     used.</td>
+            </tr>
+            <tr>
+                <td><code>sheetHeaderRow</code></td>
+                <td><code>'marked' | 'first'</code></td>
+                <td><code>'marked'</code></td>
+                <td>Which row of each sheet is its header row (<code>&lt;thead&gt;</code>, <code>&lt;th&gt;</code> cells) under
+                    <code>sheetLayout: 'tables'</code>. <code>'marked'</code>: the first row, only where the source marks it (a
+                    header-styled or all-bold row). <code>'first'</code>: always the first row, as in a sheet whose first row
+                    names its columns, so a Markdown save of it has a real header row; its cells are written as they are. The
+                    viewer ignores it. An unknown value is reported (<code>INVALID_CONFIG_VALUE</code>) and
+                    <code>'marked'</code> used.</td>
             </tr>
         </tbody>
     </table>
@@ -622,7 +666,7 @@ await ast.to('md', {
                 <td><code>printHidden</code></td>
                 <td><code>boolean</code></td>
                 <td><code>false</code></td>
-                <td>Print hidden sheets, rows and columns, which a printout leaves out. Both engines.</td>
+                <td>Print hidden sheets, rows, columns and slides, which a printout leaves out. Both engines.</td>
             </tr>
             <tr>
                 <td><code>printSpeakerNotes</code></td>
@@ -633,12 +677,27 @@ await ast.to('md', {
         </tbody>
     </table>
 
+    <blockquote>
+        [!NOTE]
+        <strong>Native engine (<code>engine: 'native'</code>) differences beyond fidelity:</strong> it ignores the
+        Puppeteer-only options above (and <code>tagged</code>), uses a non-zero default <code>margin</code> (the document's
+        own, where it sets one), draws a chart as a bar chart of its data (a scatter or bubble chart as points on its X and
+        Y axes, in any other chart a series on a right-hand axis scaled to that axis, a chart in a line of text between the line's parts,
+        categories of several levels as rows of labels), and does not apply <code>renderMetadata</code>. It draws the
+        document's own headers and footers on every page, footnotes at the foot of their page, clickable links, slides as
+        they are laid out, and text in a section's columns. It embeds PNG, JPEG, GIF and BMP pictures and SVG, and an EMF or WMF picture from the bitmap it holds (its lines, shapes
+        and text are reported; one with no bitmap is its alt text, reported), a picture's format read from its bytes, not
+        its name. A picture in a heading, a list item or a note is drawn in its line, as in a paragraph. Choose it to avoid
+        the headless browser; choose <code>'html'</code> for pixel-matching fidelity, other chart kinds and PDF/UA tags.
+    </blockquote>
+
     <h3 id="docxgeneratorconfig">DocxGeneratorConfig (<code>docxConfig</code>)</h3>
     <p>Writes a real WordprocessingML package (a <code>.docx</code> ZIP) from any parsed source and returns a
         <code>Uint8Array</code>. Adds no dependencies (built on the bundled <code>fflate</code>), runs identically in
         Node and the browser, and produces reproducible bytes (honoring <code>metadataOverrides.modified</code>).
         Reproduces headings, styled runs, tables with merged cells, nested lists, images, hyperlinks,
-        footnotes/endnotes, comments, headers/footers and metadata.</p>
+        footnotes/endnotes, comments, headers/footers and metadata. A presentation's speaker notes follow each slide's
+        content, under a "Slide notes" title, as HTML output shows them.</p>
     <table>
         <thead>
             <tr>
@@ -680,7 +739,8 @@ await ast.to('md', {
         <code>Uint8Array</code>. Adds no dependencies (built on the bundled <code>fflate</code>), runs identically in
         Node and the browser, and produces reproducible bytes. It is the round-trip partner of the ODF parser:
         headings, styled runs, tables with merged cells, nested lists, images, hyperlinks, footnotes,
-        comments and headers/footers all re-parse. Formatting lives in ODF automatic styles.</p>
+        comments and headers/footers all re-parse. Formatting lives in ODF automatic styles. A presentation's speaker
+        notes follow each slide's content, under a "Slide notes" title, as HTML output shows them.</p>
     <table>
         <thead>
             <tr>
@@ -806,8 +866,8 @@ await ast.to('md', {
     <ul>
         <li><strong>A presentation</strong> (PPTX, ODP) is written slide for slide at its slide size: each text box, shape
             (its outline, fill, line, turn and mirroring, with the text in it), picture and table in its place
-            (<code>bounds</code>), the slide's background colour, and its speaker notes on the slide's notes page. A chart
-            is a table of its data in the chart's place.</li>
+            (<code>bounds</code>), the slide's background colour, and its speaker notes on the slide's notes page; a hidden
+            slide stays hidden. A chart is a table of its data in the chart's place.</li>
         <li><strong>A PDF</strong> becomes a slide for each page, at the pages' most common size (a page of another size is
             scaled into it, centred). Each paragraph is a text box where the page set it, its lines broken and spaced as on the page
             (each line on the baseline the page drew it on, where the runs' <code>bounds.baseline</code> give it),
@@ -1029,13 +1089,17 @@ const { value: zip } = await ast.to('tex', { texConfig: { bundle: true } });  //
                 <td><code>sheets</code></td>
                 <td><code>string</code></td>
                 <td><code>''</code></td>
-                <td>Range of sheets to export (e.g., "1,3-5").</td>
+                <td>Range of sheets to export (e.g., "1,3-5"; 1-based), counting the sheets and tables. Charts are not
+                    written: those in the sheets written (and, with no range, those outside any) are reported once
+                    (<code>CONTENT_NOT_REPRESENTABLE</code>).</td>
             </tr>
             <tr>
                 <td><code>mergeSheets</code></td>
                 <td><code>boolean</code></td>
                 <td><code>true</code></td>
-                <td>Merges all sheets into one file. If false, returns a ZIP.</td>
+                <td>Merges all sheets into one file. If false, returns a ZIP of one CSV a sheet; two names that make the
+                    same file name (<code>A/B</code> and <code>A_B</code>, or alike but for case) are numbered:
+                    <code>A_B.csv</code>, <code>A_B-2.csv</code>, never with a name another sheet has.</td>
             </tr>
             <tr>
                 <td><code>columnDelimiter</code></td>

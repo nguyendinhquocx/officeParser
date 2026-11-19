@@ -13,6 +13,9 @@ import { strFromU8, Unzlib, unzipSync, unzlibSync, zipSync, zlibSync } from 'ffl
 import { PDFDocument, PDFName, PDFRawStream } from 'pdf-lib';
 import { OfficeGenerator } from '../../src/OfficeGenerator';
 import { documentShapeEscapingTests } from './documentShapeEscaping';
+import { wordRtfContentHardeningTests } from './wordRtfContentHardening';
+import { chartWritersHardeningTests } from './chartWritersHardening';
+import { picturesHardeningTests } from './picturesHardening';
 import { OfficeParser } from '../../src/OfficeParser';
 import { OfficeTemplate } from '../../src/OfficeTemplate';
 import { OfficeParserAST, OfficeWarningType } from '../../src/types';
@@ -23,9 +26,11 @@ import {
     escapeLatex, latexComment, sanitizeLatexUrl, sanitizeLatexMath, sanitizeLatexImagePath,
     sanitizeCommentText, latexSourceComment
 } from '../../src/utils/sanitize';
+import { archiveCancellationTests } from './archiveCancellation';
 import { extractFiles } from '../../src/utils/zipUtils';
 import { cssColorHex } from '../../src/utils/colorUtils';
 import { parseXmlString } from '../../src/utils/xmlUtils';
+import { extractChartData } from '../../src/utils/chartUtils';
 import { getOfficeError, getWrappedError } from '../../src/utils/errorUtils';
 import { terminateOcr } from '../../src/utils/ocrUtils';
 import { OfficeErrorType } from '../../src/types';
@@ -38,7 +43,7 @@ import { KeptJpegs } from '../../src/parsers/pdf/pdfJpeg';
 import { shadeRuns } from '../../src/parsers/pdf/rulings';
 import { CffOutlines, nativeUnbrotli, sfntOf, TrueTypeOutlines } from '../../src/generators/pdf/fontFiles';
 import { cffTable, charString, EMPTY } from '../helpers/cffFontWriter';
-import { withinTime } from '../helpers/timing';
+import { scaledMs, withinDeadline, withinTime } from '../helpers/timing';
 import * as zlib from 'zlib';
 
 let passed = 0;
@@ -132,9 +137,11 @@ const linear = async (name: string, run: () => unknown, heap?: { label: string; 
         }
         return took;
     };
+    // The slack and the backstop are time, so they are this machine's (see test/helpers/timing.ts); the ratio is not.
+    const slack = await scaledMs(LINEAR_SLACK_MS), backstop = await scaledMs(LINEAR_BACKSTOP_MS);
     let small = await time(0.25);
     let large = await time(1);
-    const within = () => large <= LINEAR_RATIO * small + LINEAR_SLACK_MS && large < LINEAR_BACKSTOP_MS;
+    const within = () => large <= LINEAR_RATIO * small + slack && large < backstop;
     if (!within()) {
         small = Math.min(small, await time(0.25));
         large = Math.min(large, await time(1));
@@ -3067,6 +3074,54 @@ async function parserHardeningTests() {
         ...Object.fromEntries(Object.entries(extra).map(([k, v]) => [k, enc(v)])),
     }));
     await heapBudget('pptx: a chart of 20,000 series and 30,000 labels is read', () => parseQuiet(pptxOf({ 'ppt/charts/chart1.xml': `<?xml version="1.0"?><c:chartSpace ${pns}><c:chart><c:plotArea><c:barChart><c:ser><c:cat>${'<c:v>1</c:v>'.repeat(30000)}</c:cat></c:ser>${'<c:ser/>'.repeat(20000)}</c:barChart></c:plotArea></c:chart></c:chartSpace>` }), 'pptx', { extractAttachments: true }));
+    // The parser keeps a cache's point count as a number: a cache that counts a billion points and holds
+    // three gives three entries in each list and in each output.
+    const farPoints = ['0', '500000000', '999999999'].map((idx, i) => `<c:pt idx="${idx}"><c:v>${i + 1}</c:v></c:pt>`).join('');
+    const countedChart = await heapBudget('pptx: a chart counting a billion points and holding three is read', () => parseQuiet(pptxOf({ 'ppt/charts/chart1.xml': `<?xml version="1.0"?><c:chartSpace ${pns}><c:chart><c:plotArea><c:barChart><c:ser><c:cat><c:strCache><c:ptCount val="1000000000"/>${farPoints}</c:strCache></c:cat><c:val><c:numCache><c:ptCount val="1000000000"/>${farPoints}</c:numCache></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>` }), 'pptx', { extractAttachments: true })) as Awaited<ReturnType<typeof parseQuiet>>;
+    const countedData = countedChart.ast?.attachments.find(a => a.chartData)?.chartData;
+    check('pptx: a billion-point count is kept as a count', countedData?.pointCount === 1_000_000_000 && countedData.labelIndexes?.length === 3, JSON.stringify(countedData?.labelIndexes));
+    const countedAst = countedChart.ast && { ...countedChart.ast, content: [{ type: 'chart', metadata: { attachmentName: 'chart1.xml' } }] };
+    const countedOutputs = await heapBudget('docx, html, pdf: a chart counting a billion points is written', () => Promise.all((['docx', 'html', 'pdf'] as const).map(format => countedAst ? OfficeGenerator.generate(countedAst as any, format, { onWarning: () => {}, pdfConfig: { engine: 'native' } } as any) : undefined))) as ({ value: unknown } | undefined)[];
+    check('docx, html, pdf: a chart counting a billion points is written at the size of its three', (countedOutputs ?? []).every(out => out && (out.value as any).length < 2_000_000), (countedOutputs ?? []).map(out => (out?.value as any)?.length).join(' '));
+    // A chart's category levels: at most 16 read, however many a cache holds, all sharing one budget of values.
+    const levelsChart = (count: number, points: number) => `<?xml version="1.0"?><c:chartSpace ${pns}><c:chart><c:plotArea><c:barChart><c:ser><c:cat><c:multiLvlStrRef><c:multiLvlStrCache><c:ptCount val="${points}"/>${`<c:lvl>${Array.from({ length: points }, (_, i) => `<c:pt idx="${i}"><c:v>L${i}</c:v></c:pt>`).join('')}</c:lvl>`.repeat(count)}</c:multiLvlStrCache></c:multiLvlStrRef></c:cat><c:val><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>`;
+    const manyLevels = await heapBudget('pptx: a chart of 1,000 category levels is read', () => parseQuiet(pptxOf({ 'ppt/charts/chart1.xml': levelsChart(1000, 20) }), 'pptx', { extractAttachments: true })) as Awaited<ReturnType<typeof parseQuiet>>;
+    const levelData = manyLevels.ast?.attachments.find(a => a.chartData)?.chartData;
+    check('pptx: a chart of 1,000 category levels keeps 16', levelData?.labelLevels?.length === 16, `${levelData?.labelLevels?.length}`);
+    await linear('pptx: a chart of 4 category levels of 20,000 points is read and written', async () => {
+        const read = await parseQuiet(pptxOf({ 'ppt/charts/chart1.xml': levelsChart(4, n(20000)) }), 'pptx', { extractAttachments: true });
+        return read.ast && OfficeGenerator.generate({ ...read.ast, content: [{ type: 'chart', metadata: { attachmentName: 'chart1.xml' } }] } as any, 'docx', { onWarning: () => {} } as any);
+    });
+    // A chart's axes: at most 64 read, however many its plot area holds.
+    const axesChart = (count: number, titled = true) => `<?xml version="1.0"?><c:chartSpace ${pns}><c:chart><c:plotArea><c:barChart><c:ser><c:val><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:val></c:ser><c:axId val="0"/><c:axId val="1"/></c:barChart>${Array.from({ length: count }, (_, i) => `<c:valAx><c:axId val="${i}"/><c:axPos val="${i % 2 ? 'r' : 'l'}"/>${titled ? `<c:title><c:tx><c:rich><a:p><a:r><a:t>Axis ${i}</a:t></a:r></a:p></c:rich></c:tx></c:title>` : ''}</c:valAx>`).join('')}</c:plotArea></c:chart></c:chartSpace>`;
+    const manyAxes = await heapBudget('pptx: a chart of 100,000 axes is read', () => parseQuiet(pptxOf({ 'ppt/charts/chart1.xml': axesChart(100000, false) }), 'pptx', { extractAttachments: true })) as Awaited<ReturnType<typeof parseQuiet>>;
+    const axesData = manyAxes.ast?.attachments.find(a => a.chartData)?.chartData;
+    check('pptx: a chart of 100,000 axes keeps 64', axesData?.axes?.length === 64, `${axesData?.axes?.length}`);
+    await linear('pptx: a chart of 20,000 titled axes is read and written', async () => {
+        const read = await parseQuiet(pptxOf({ 'ppt/charts/chart1.xml': axesChart(n(20000)) }), 'pptx', { extractAttachments: true });
+        return read.ast && OfficeGenerator.generate({ ...read.ast, content: [{ type: 'chart', metadata: { attachmentName: 'chart1.xml' } }] } as any, 'html', { onWarning: () => {} } as any);
+    });
+    // A bubble series' X values and sizes are read, each list within a budget of its own, and its table and
+    // drawing are written in proportion. (A list of a million points is past the part's element budget,
+    // maxXmlElements, before the chart is read.)
+    const bubbleList = (tag: string, points: number) => `<c:${tag}><c:numRef><c:numCache><c:ptCount val="${points}"/>${Array.from({ length: points }, (_, i) => `<c:pt idx="${i}"><c:v>${i}</c:v></c:pt>`).join('')}</c:numCache></c:numRef></c:${tag}>`;
+    const bubbleChart = (points: number) => `<?xml version="1.0"?><c:chartSpace ${pns}><c:chart><c:plotArea><c:bubbleChart><c:ser>${bubbleList('xVal', points)}${bubbleList('yVal', points)}${bubbleList('bubbleSize', points)}</c:ser></c:bubbleChart></c:plotArea></c:chart></c:chartSpace>`;
+    const bubbles = await heapBudget('pptx: a bubble series of 60,000 points is read', () => parseQuiet(pptxOf({ 'ppt/charts/chart1.xml': bubbleChart(60000) }), 'pptx', { extractAttachments: true })) as Awaited<ReturnType<typeof parseQuiet>>;
+    const bubbleData = bubbles.ast?.attachments.find(a => a.chartData)?.chartData?.dataSets[0];
+    check('pptx: a bubble series keeps its X values and sizes', bubbleData?.xValues?.length === 60000 && bubbleData?.bubbleSizes?.length === 60000, `${bubbleData?.xValues?.length} ${bubbleData?.bubbleSizes?.length}`);
+    // Values, X values and sizes each have a budget of MAX_CHART_VALUES: 600,000 of each are all kept, and
+    // the labels (the X values) with them. (A chart part read alone: past the element budget as a file.)
+    const bareList = (tag: string) => `<c:${tag}><c:numLit>${'<c:v>1</c:v>'.repeat(600000)}</c:numLit></c:${tag}>`;
+    const bareChart = (kind: string, sizes: boolean) => Buffer.from(`<?xml version="1.0"?><c:chartSpace ${pns}><c:chart><c:plotArea><c:${kind}Chart><c:ser>${bareList('xVal')}${bareList('yVal')}${sizes ? bareList('bubbleSize') : ''}</c:ser></c:${kind}Chart></c:plotArea></c:chart></c:chartSpace>`);
+    const bareScatter = extractChartData(bareChart('scatter', false));
+    check('a scatter series of 600,000 points keeps its values, X values and labels', bareScatter.dataSets[0]?.values.length === 600000 && bareScatter.dataSets[0]?.xValues?.length === 600000 && bareScatter.labels.length === 600000, `${bareScatter.dataSets[0]?.values.length} ${bareScatter.dataSets[0]?.xValues?.length} ${bareScatter.labels.length}`);
+    const bareBubble = extractChartData(bareChart('bubble', true));
+    check('a bubble series of 600,000 points keeps its sizes', bareBubble.dataSets[0]?.bubbleSizes?.length === 600000 && bareBubble.dataSets[0]?.values.length === 600000, `${bareBubble.dataSets[0]?.bubbleSizes?.length} ${bareBubble.dataSets[0]?.values.length}`);
+    await linear('pptx: a bubble series of 20,000 points is read and written', async () => {
+        const read = await parseQuiet(pptxOf({ 'ppt/charts/chart1.xml': bubbleChart(n(20000)) }), 'pptx', { extractAttachments: true });
+        const ast = read.ast && { ...read.ast, content: [{ type: 'chart', metadata: { attachmentName: 'chart1.xml' } }] } as any;
+        return ast && Promise.all((['docx', 'html', 'pdf'] as const).map(format => OfficeGenerator.generate(ast, format, { onWarning: () => {}, pdfConfig: { engine: 'native' } } as any)));
+    });
     const sharedComments = await heapBudget('pptx: one comments part named 2,000 times is read', () => parseQuiet(pptxOf({
         'ppt/slides/_rels/slide1.xml.rels': `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${Array.from({ length: 2000 }, (_, i) => `<Relationship Id="rId${i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments/comment1.xml"/>`).join('')}</Relationships>`,
         'ppt/comments/comment1.xml': `<?xml version="1.0"?><p:cmLst ${pns}>${'<p:cm authorId="0"><p:text>c</p:text></p:cm>'.repeat(20000)}</p:cmLst>`,
@@ -3195,6 +3250,13 @@ async function parserHardeningTests() {
     const mns = 'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"';
     await timed('pptx: 200 paragraphs of math nested 1,000 deep are read', () => parseQuiet(pptxOf({ 'ppt/slides/slide1.xml': `<?xml version="1.0"?><p:sld ${pns} ${mns}><p:cSld><p:spTree><p:sp><p:txBody>${`<a:p><x>${nest(`<m:r><m:t>${'A'.repeat(1000)}</m:t></m:r>`, 1000, s => `<m:oMath>${s}</m:oMath>`)}</x></a:p>`.repeat(200)}</p:txBody></p:sp></p:spTree></p:cSld></p:sld>` }), 'pptx'));
     await timed('pptx: chart series nested 2,000 deep around 20,000 values are read', () => parseQuiet(pptxOf({ 'ppt/charts/chart1.xml': `<?xml version="1.0"?><c:chartSpace ${pns}><c:chart>${nest('<c:v>1</c:v>'.repeat(n(20000)), 2000, s => `<c:ser><c:val>${s}</c:val></c:ser>`)}</c:chart></c:chartSpace>` }), 'pptx', { extractAttachments: true }));
+    const nestedPoints = (depth: number) => `<?xml version="1.0"?><c:chartSpace ${pns}><c:chart>${nest('<c:v>1</c:v>'.repeat(n(20000)), depth, (s, i) => `<c:ser>${i % 2 ? `<c:bubbleSize>${s}</c:bubbleSize>` : `<c:xVal>${s}</c:xVal>`}</c:ser>`)}</c:chart></c:chartSpace>`;
+    await timed('pptx: X values and bubble sizes nested 2,000 deep around 20,000 values are read', () => parseQuiet(pptxOf({ 'ppt/charts/chart1.xml': nestedPoints(2000) }), 'pptx', { extractAttachments: true }));
+    // Each level reads every value below it: 200 levels around 20,000 values ask for 4,000,000.
+    const nestedChart = await heapBudget('pptx: X values and bubble sizes nested 200 deep are read', () => parseQuiet(pptxOf({ 'ppt/charts/chart1.xml': nestedPoints(200) }), 'pptx', { extractAttachments: true })) as Awaited<ReturnType<typeof parseQuiet>>;
+    const nestedSeries = nestedChart.ast?.attachments.find(a => a.chartData)?.chartData?.dataSets ?? [];
+    const nestedTotal = nestedSeries.reduce((sum, series) => sum + (series.xValues?.length ?? 0) + (series.bubbleSizes?.length ?? 0), 0);
+    check('pptx: nested X values and bubble sizes hold at most 1,000,000 entries in all', nestedTotal > 0 && nestedTotal <= 1_000_000, `${nestedTotal}`);
     await timed('odt: styles nested 2,000 deep around 60,000 elements are read', () => parseQuiet(odfOf('text', '<text:p>hi</text:p>', {}, nest(empties(60000), 2000, (s, i) => `<style:style style:name="s${i}">${s}</style:style>`)), 'odt'));
 
     // rawContent: a node's markup holds everything nested in it, so nested tables repeat it at every
@@ -3267,6 +3329,17 @@ async function parserHardeningTests() {
     await parseQuiet(repeatedStringDoc, 'xlsx', { decompressionLimits: { maxRepeatedContent: 1000 }, onWarning: (issue: any) => repeatedIssues.push(issue) });
     const repeatedLimit = repeatedIssues.find(issue => issue.code === 'REPEATED_CONTENT_LIMIT_EXCEEDED');
     check('xlsx: maxRepeatedContent grows by 16 characters a byte of the document', repeatedLimit?.message.includes(`(${1000 + 16 * repeatedStringDoc.length} characters`), repeatedLimit?.message.slice(0, 120));
+    const sharedFormulaDoc = xlsxOf({ 'xl/worksheets/sheet1.xml': `<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="B1"><f t="shared" ref="B1:B2000" si="0">${'A1+'.repeat(2666)}A1</f><v>1</v></c></row>${Array.from({ length: 1999 }, (_, i) => `<row r="${i + 2}"><c r="B${i + 2}"><f t="shared" si="0"/><v>1</v></c></row>`).join('')}</sheetData></worksheet>` });
+    const sharedFormulas = await warned(sharedFormulaDoc, 'xlsx', { decompressionLimits: { maxRepeatedContent: 1_000_000 } });
+    const formulaCells = cellsOf(sharedFormulas.ast);
+    const withFormula = formulaCells.filter((c: any) => c.metadata?.formula);
+    check('xlsx: a shared formula\'s copies count against maxRepeatedContent, with REPEATED_CONTENT_LIMIT_EXCEEDED', !sharedFormulas.error && formulaCells.length === 2000 && withFormula.length > 1 && withFormula.length < 1000 && withFormula[1].metadata.formula.startsWith('A2+') && sharedFormulas.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED'), `${sharedFormulas.error} ${formulaCells.length} ${withFormula.length} ${sharedFormulas.codes}`);
+    // A copy is charged at the length its moved references make: a 63-character master of `1:1`s is
+    // free to repeat, and each of its copies a million rows down is 255 characters.
+    const growingFormulaDoc = xlsxOf({ 'xl/worksheets/sheet1.xml': `<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="B1"><f t="shared" ref="B1:B1004000" si="0">${'1:1+'.repeat(15)}1:1</f><v>1</v></c></row>${Array.from({ length: 4000 }, (_, i) => `<row r="${1_000_001 + i}"><c r="B${1_000_001 + i}"><f t="shared" si="0"/><v>1</v></c></row>`).join('')}</sheetData></worksheet>` });
+    const growingFormulas = await warned(growingFormulaDoc, 'xlsx', { decompressionLimits: { maxRepeatedContent: 0 } });
+    const growingCopies = cellsOf(growingFormulas.ast).filter((c: any) => c.metadata?.formula?.startsWith('100'));
+    check('xlsx: a shared formula\'s copy counts against maxRepeatedContent at its moved length', !growingFormulas.error && growingCopies.length > 0 && growingCopies.length <= Math.floor(16 * growingFormulaDoc.length / (255 - 64)) && growingCopies[0].metadata.formula.length === 255 && growingFormulas.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED'), `${growingFormulas.error} ${growingCopies.length} ${growingFormulaDoc.length} ${growingFormulas.codes}`);
 
     // Plain text lays out a table from its cells once: rendered first and then again, each nested
     // table doubled the work (26 levels took minutes).
@@ -3525,10 +3598,10 @@ async function parserHardeningTests() {
     const drawnRun = await withinTime(30_000, () => warned(drawnOften, 'pdf'));
     const drawn = drawnRun.result;
     check('pdf: a form drawing a 1 MB string 300 times stops at maxTimeMs', !drawn.error && drawnRun.within && drawn.codes.includes('PDF_CONTENT_LIMIT_EXCEEDED'), `${drawnRun.ms}ms ${drawn.codes} ${drawn.error}`);
-    const quicklyRun = await withinTime(4000, () => warned(drawnOften, 'pdf', { pdfParserConfig: { maxTimeMs: 200 } }));
+    const quicklyRun = await withinDeadline(200, 3800, () => warned(drawnOften, 'pdf', { pdfParserConfig: { maxTimeMs: 200 } }));
     const quickly = quicklyRun.result;
     check('pdf: maxTimeMs is the base of the limit', !quickly.error && quicklyRun.within && quickly.codes.includes('PDF_CONTENT_LIMIT_EXCEEDED'), `${quicklyRun.ms}ms ${quickly.codes}`);
-    const abortedPdfRun = await withinTime(4000, () => parseQuiet(drawnOften, 'pdf', { abortSignal: AbortSignal.timeout(500), pdfParserConfig: { maxTimeMs: 60_000 } }));
+    const abortedPdfRun = await withinDeadline(500, 3500, () => parseQuiet(drawnOften, 'pdf', { abortSignal: AbortSignal.timeout(500), pdfParserConfig: { maxTimeMs: 60_000 } }));
     const abortedPdf = abortedPdfRun.result;
     check('pdf: abortSignal stops pdf.js in the middle of a stream', /abort/i.test(abortedPdf.error) && abortedPdfRun.within, `${abortedPdfRun.ms}ms ${abortedPdf.error}`);
     const inflating = pdfFrom([
@@ -3569,7 +3642,7 @@ async function parserHardeningTests() {
         ...Array.from({ length: bookmarks }, () => `<</Type/Page/Parent ${chainAt(depth - 1)} 0 R>>`),
         ...Array.from({ length: bookmarks }, (_, i) => `<</Title(b${i})/Parent 5 0 R${i > 0 ? `/Prev ${itemAt(i - 1)} 0 R` : ''}${i < bookmarks - 1 ? `/Next ${itemAt(i + 1)} 0 R` : ''}/Dest[${targetAt(i)} 0 R/XYZ 0 0 0]>>`),
     ]);
-    const outlinedRun = await withinTime(30_000, () => warned(deepOutline, 'pdf', { pdfParserConfig: { maxTimeMs: 200 } }));
+    const outlinedRun = await withinDeadline(200, 29_800, () => warned(deepOutline, 'pdf', { pdfParserConfig: { maxTimeMs: 200 } }));
     const outlined = outlinedRun.result;
     check('pdf: bookmarks naming pages deep in a long page tree are resolved within maxTimeMs', !outlined.error && outlinedRun.within && outlined.codes.includes('PDF_CONTENT_LIMIT_EXCEEDED'), `${outlinedRun.ms}ms ${deepOutline.length} bytes ${outlined.codes} ${outlined.error}`);
     await pdfProcessTests({ pdfFrom, flate, pdfForms, drawnOften, parseQuiet, files });
@@ -4760,7 +4833,7 @@ async function pdfProcessTests(h: {
     let fallback: Awaited<ReturnType<typeof read>>;
     try { fallback = await read(testPdf, { pdfParserConfig: { processMemoryMb: 500 } }); } finally { process.execPath = execPath; }
     check('pdf: where no process can start, pdf.js runs here with PDF_SEPARATE_PROCESS_UNAVAILABLE', !fallback.error && fallback.pages === 8 && fallback.codes.join() === 'PDF_SEPARATE_PROCESS_UNAVAILABLE', `${fallback.pages} pages ${fallback.codes} ${fallback.error}`);
-    const afterHereRun = await withinTime(4000, () => read(drawnOften, { pdfParserConfig: { maxTimeMs: 200 } }));
+    const afterHereRun = await withinDeadline(200, 3800, () => read(drawnOften, { pdfParserConfig: { maxTimeMs: 200 } }));
     const afterHere = afterHereRun.result;
     check('pdf: after pdf.js ran in this process, the next parse still runs it in a separate one', !afterHere.error && afterHereRun.within && named(afterHere.warnings, 'maxTimeMs'), `${afterHereRun.ms}ms ${afterHere.codes} ${afterHere.error}`);
 
@@ -5226,6 +5299,175 @@ async function xlsxCellAllowanceTests() {
     check('xlsx: cells refused a copy of a long string spend none of the cells\' allowance, which a later string still has whole',
         !mixedParsed.error && mixedParsed.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED') && mixedWhole[0] === 1 && mixedExpected[0] === 1 && mixedWhole[1] === mixedExpected[1] && mixedExpected[1] > ifSpent && mixedExpected[1] < 20_000,
         `${mixedParsed.error} ${mixedWhole} whole, expected ${mixedExpected} (${ifSpent} had refused copies spent it)`);
+}
+
+/**
+ * XLSX cell values read from a sheet's own XML (values, prefixed parts, formulas) take time linear in
+ * what the sheet holds, and what they read reaches only the AST.
+ */
+async function xlsxCellReadingTests() {
+    console.log('- XLSX cell values, prefixed parts and formulas are read in linear time...');
+    const ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+    const book = (sheet: string, extra: Record<string, string> = {}) => Buffer.from(zipSync({
+        'xl/workbook.xml': sizeEnc(`<?xml version="1.0"?><workbook ${ns}><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>`),
+        'xl/_rels/workbook.xml.rels': sizeEnc(`<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${SIZE_REL}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>`),
+        'xl/worksheets/sheet1.xml': sizeEnc(sheet),
+        ...Object.fromEntries(Object.entries(extra).map(([k, v]) => [k, sizeEnc(v)])),
+    }));
+    const read = async (buffer: Buffer, extra: object = {}) => {
+        try { return { ast: await OfficeParser.parseOffice(buffer, { fileType: 'xlsx', onWarning: () => {}, ...extra } as any) as OfficeParserAST, error: '' }; }
+        catch (e: any) { return { ast: undefined, error: String(e?.message ?? e) }; }
+    };
+
+    // A value is decoded through the reference reader, whose pattern cannot backtrack on a run of `&`.
+    await linear('xlsx: a cell value of 400,000 & characters', async () => {
+        const { ast, error } = await read(book(`<?xml version="1.0"?><worksheet ${ns}><sheetData><row r="1"><c r="A1" t="str"><v>${'&'.repeat(n(400_000))}x</v></c></row></sheetData></worksheet>`));
+        if (error || !ast) throw new Error(error);
+        return ast;
+    });
+
+    // A part's prefix is found in its root's start tag by a pattern whose name and spaces cannot match
+    // the same character: a declaration of 200,000 name characters and no `=` is read once.
+    await linear('xlsx: a root tag declaring xmlns: and 200,000 name characters', async () => {
+        const { ast, error } = await read(book(`<?xml version="1.0"?><x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:${'a'.repeat(n(200_000))}><x:sheetData><x:row r="1"><x:c r="A1"><x:v>1</x:v></x:c></x:row></x:sheetData></x:worksheet>`));
+        if (error || !ast) throw new Error(error);
+        return ast;
+    });
+    // Each prefix is removed in one pass over the part.
+    await linear('xlsx: a prefixed sheet of 200,000 rows', async () => {
+        const rows = Array.from({ length: n(200_000) }, (_, i) => `<x:row r="${i + 1}"><x:c r="A${i + 1}"><x:v>${i}</x:v></x:c></x:row>`).join('');
+        const { ast, error } = await read(book(`<?xml version="1.0"?><x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><x:sheetData>${rows}</x:sheetData></x:worksheet>`));
+        if (error || !ast) throw new Error(error);
+        const cells = ast.content[0]?.children?.length ?? 0;
+        if (cells !== n(200_000)) throw new Error(`${cells} rows read`);
+        return ast;
+    });
+    // Every bound prefix is removed in the same one pass, however many the root declares: a pass for each
+    // declaration took 29 s for 40,000 on the roots of a workbook's parts, from 544 KB of zip.
+    const main = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    const declaringBook = (declarations: string) => Buffer.from(zipSync({
+        'xl/workbook.xml': sizeEnc(`<?xml version="1.0"?><p0:workbook xmlns:p0="${main}" xmlns:r="${SIZE_REL}"${declarations}><p0:sheets><p0:sheet name="S" sheetId="1" r:id="rId1"/></p0:sheets></p0:workbook>`),
+        'xl/_rels/workbook.xml.rels': sizeEnc(`<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${SIZE_REL}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="${SIZE_REL}/sharedStrings" Target="sharedStrings.xml"/><Relationship Id="rId3" Type="${SIZE_REL}/styles" Target="styles.xml"/></Relationships>`),
+        'xl/worksheets/_rels/sheet1.xml.rels': sizeEnc(`<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${SIZE_REL}/comments" Target="../comments1.xml"/></Relationships>`),
+        'xl/worksheets/sheet1.xml': sizeEnc(`<?xml version="1.0"?><p0:worksheet xmlns:p0="${main}"${declarations}><p0:sheetData><p0:row r="1"><p0:c r="A1" t="s"><p0:v>0</p0:v></p0:c></p0:row></p0:sheetData></p0:worksheet>`),
+        'xl/sharedStrings.xml': sizeEnc(`<?xml version="1.0"?><p0:sst xmlns:p0="${main}"${declarations}><p0:si><p0:t>hello</p0:t></p0:si></p0:sst>`),
+        'xl/styles.xml': sizeEnc(`<?xml version="1.0"?><p0:styleSheet xmlns:p0="${main}"${declarations}><p0:cellXfs count="1"><p0:xf numFmtId="0"/></p0:cellXfs></p0:styleSheet>`),
+        'xl/comments1.xml': sizeEnc(`<?xml version="1.0"?><p0:comments xmlns:p0="${main}"${declarations}><p0:authors><p0:author>me</p0:author></p0:authors><p0:commentList><p0:comment ref="A1" authorId="0"><p0:text><p0:t>note</p0:t></p0:text></p0:comment></p0:commentList></p0:comments>`),
+    }));
+    await linear('xlsx: every part\'s root binding SpreadsheetML to 40,000 prefixes', async () => {
+        const declarations = Array.from({ length: n(40_000) }, (_, i) => ` xmlns:p${i + 1}="${main}"`).join('');
+        const { ast, error } = await read(declaringBook(declarations));
+        if (error || !ast) throw new Error(error);
+        const cell = ast.content[0]?.children?.[0]?.children?.[0] as any;
+        const sheetName = (ast.content[0]?.metadata as any)?.sheetName;
+        if (cell?.text !== 'hello' || cell?.comments?.length !== 1 || sheetName !== 'S') throw new Error(`cell ${JSON.stringify(cell?.text)}, ${cell?.comments?.length} comments, tab ${sheetName}`);
+        return ast;
+    });
+    // A repeated declaration of one prefix (no well-formed XML, but read as text here) costs no pass of its own either.
+    await linear('xlsx: a root repeating one prefix declaration 40,000 times', async () => {
+        const declarations = ` xmlns:x="${main}"`.repeat(n(40_000));
+        const { ast, error } = await read(book(`<?xml version="1.0"?><x:worksheet${declarations}><x:sheetData><x:row r="1"><x:c r="A1" t="str"><x:v>read</x:v></x:c></x:row></x:sheetData></x:worksheet>`));
+        if (error || !ast) throw new Error(error);
+        const text = ast.content[0]?.children?.[0]?.children?.[0]?.text;
+        if (text !== 'read') throw new Error(`cell ${JSON.stringify(text)}`);
+        return ast;
+    });
+
+    // A shared formula's copy is one flat string: built by `+=`, each was a tree of a node per token, and
+    // 1,000,000 copies of an 8-reference master kept 1.2 GB of heap, more than as many cells of a value
+    // (705 MB). Rows of 100 cells, as few bytes as a cell takes.
+    const hundredWide = (cells: number, cell: (row: number, col: number) => string) => {
+        let rows = '';
+        for (let r = 0; r < cells / 100; r++) {
+            rows += '<row>';
+            for (let c = 0; c < 100; c++) rows += cell(r, c);
+            rows += '</row>';
+        }
+        return book(`<?xml version="1.0"?><worksheet ${ns}><sheetData>${rows}</sheetData></worksheet>`);
+    };
+    const valueCells = await memoryOf(() => read(hundredWide(200_000, () => '<c><v>1</v></c>')));
+    if (valueCells.result.error) throw new Error(valueCells.result.error);
+    await linear('xlsx: 200,000 cells of a shared formula (A1+...+H1), kept as flat strings', async () => {
+        const cells = n(200_000), lastRow = cells / 100;
+        const { ast, error } = await read(hundredWide(cells, (r, c) => r === 0 && c === 0
+            ? '<c><f t="shared" ref="A1:CV99999" si="0">A1+B1+C1+D1+E1+F1+G1+H1</f></c>'
+            : '<c><f t="shared" si="0"/></c>'));
+        if (error || !ast) throw new Error(error);
+        const rows = ast.content[0]?.children ?? [];
+        const withFormula = rows.reduce((count, row) => count + (row.children ?? []).filter(cell => (cell.metadata as any)?.formula).length, 0);
+        const lastRowFirst = (rows[rows.length - 1]?.children?.[0]?.metadata as any)?.formula;
+        const expected = 'ABCDEFGH'.split('').map(column => `${column}${lastRow}`).join('+');
+        if (withFormula !== cells || lastRowFirst !== expected) throw new Error(`${withFormula} of ${cells} cells with a formula, the last row's first ${JSON.stringify(lastRowFirst)}`);
+        return ast;
+    }, { label: `xlsx: shared copies keep less heap than as many value cells (${megabytes(valueCells.retained)})`, limit: valueCells.retained });
+
+    // Copies past REPEAT_ALLOWANCE are charged their characters, which a flat one-byte string holds as about
+    // a byte each: what they keep is about their charge. As trees, 3,206 copies of a 5,399-character master
+    // kept 560 MB.
+    const { maxRepeatedContentOf } = await import('../../src/utils/repeatUtils');
+    const { noteDocumentBytes } = await import('../../src/utils/budgetUtils');
+    const masters = {
+        names: Array.from({ length: 2700 }, () => 'A').join('+'),
+        anchored: Array.from({ length: 1600 }, () => '$A$1').join('+'),
+    };
+    for (const [kind, master] of Object.entries(masters)) {
+        const copied = async (rows: number) => {
+            let cells = `<row r="1"><c r="B1"><f t="shared" ref="B1:B${rows}" si="0">${master}</f><v>1</v></c></row>`;
+            for (let r = 2; r <= rows; r++) cells += `<row r="${r}"><c r="B${r}"><f t="shared" si="0"/><v>1</v></c></row>`;
+            const bytes = book(`<?xml version="1.0"?><worksheet ${ns}><sheetData>${cells}</sheetData></worksheet>`);
+            const codes: string[] = [];
+            const measured = await memoryOf(() => read(bytes, { onWarning: (issue: any) => codes.push(issue.code) }));
+            // (The budget of this document: maxRepeatedContent and its characters a byte, as the parse had it.)
+            const holder = {};
+            noteDocumentBytes(holder, bytes.length);
+            const withFormula = (measured.result.ast?.content[0]?.children ?? []).filter(row => (row.children?.[0]?.metadata as any)?.formula).length;
+            return { ...measured, codes, budget: maxRepeatedContentOf(holder), withFormula };
+        };
+        const many = await copied(4_000), few = await copied(1_000);
+        check(`xlsx: copies of a ${master.length.toLocaleString('en-US')}-character shared formula (${kind}) keep about their charge, with REPEATED_CONTENT_LIMIT_EXCEEDED`,
+            !many.result.error && many.codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED') && many.withFormula > 1 && many.withFormula < 4_000 && many.retained < 2 * many.budget + 32_000_000,
+            `${many.result.error} ${many.codes} ${many.withFormula} of 4,000 with a formula, ${megabytes(many.retained)} kept against a budget of ${many.budget} characters`);
+        check(`xlsx: copies of a ${master.length.toLocaleString('en-US')}-character shared formula (${kind}) keep heap in proportion: four times the rows, at most 4.5 times`,
+            !few.result.error && few.withFormula === 1_000 && many.retained <= 4.5 * few.retained + 20_000_000,
+            `${few.withFormula} of 1,000 with a formula; ${megabytes(many.retained)} kept at 4,000 rows, ${megabytes(few.retained)} at 1,000`);
+    }
+
+    // A formula is kept at any length, and its copies are bounded by the budget: a 400,000-character master
+    // filled down keeps a few dozen copies, each charged before it is moved, so the work is the budget's
+    // whatever the rows.
+    await linear('xlsx: a 400,000-character shared formula copied to 1,000 rows', async () => {
+        const rows = n(1_000), master = 'A1+'.repeat(133_333) + 'A1';
+        let cells = `<row r="1"><c r="B1"><f t="shared" ref="B1:B${rows}" si="0">${master}</f><v>1</v></c></row>`;
+        for (let r = 2; r <= rows; r++) cells += `<row r="${r}"><c r="B${r}"><f t="shared" si="0"/><v>1</v></c></row>`;
+        const codes: string[] = [];
+        const { ast, error } = await read(book(`<?xml version="1.0"?><worksheet ${ns}><sheetData>${cells}</sheetData></worksheet>`), { onWarning: (issue: any) => codes.push(issue.code) });
+        if (error || !ast) throw new Error(error);
+        const kept = (ast.content[0]?.children ?? []).filter(row => (row.children?.[0]?.metadata as any)?.formula).length;
+        if (!codes.includes('REPEATED_CONTENT_LIMIT_EXCEEDED') || kept < 2 || kept >= rows) throw new Error(`${kept} of ${rows} cells keep the formula; ${codes}`);
+        return ast;
+    });
+
+    // A formula is the document's own text: it reaches CellMetadata.formula and no output, which writes
+    // the value. A spreadsheet written with it would run it again (an address fetched, a DDE command).
+    const formulaBook = book(`<?xml version="1.0"?><worksheet ${ns}><sheetData><row r="5"><c r="D5"><f t="shared" ref="D5:D6" si="0">QQZZ5-C5</f><v>750000</v></c></row><row r="6"><c r="D6"><f t="shared" si="0"/><v>750001</v></c></row></sheetData></worksheet>`);
+    const formulaRead = await read(formulaBook);
+    const formulas = formulaRead.ast ? JSON.stringify(formulaRead.ast.content) : '';
+    check('xlsx: a formula reaches the AST', formulas.includes('"formula":"QQZZ5-C5"') && formulas.includes('"formula":"QQZZ5-C6"'), formulaRead.error || formulas.slice(0, 200));
+    if (formulaRead.ast) {
+        for (const format of ['text', 'md', 'html', 'csv', 'rtf', 'chunks', 'tex', 'epub', 'docx', 'odt', 'xlsx', 'ods', 'pptx', 'odp', 'pdf'] as const) {
+            let written = '';
+            try {
+                const value: any = (await formulaRead.ast.to(format as any, format === 'pdf' ? { pdfConfig: { engine: 'native' } } as any : undefined)).value;
+                if (format === 'pdf') {
+                    const back = await OfficeParser.parseOffice(Buffer.from(value), { fileType: 'pdf', ocr: false, pdfParserConfig: { separateProcess: false } } as any) as OfficeParserAST;
+                    written = String((await back.to('text')).value) + Buffer.from(value).toString('latin1');
+                } else if (typeof value === 'string') written = value;
+                else if (Array.isArray(value)) written = JSON.stringify(value);
+                else written = Object.values(unzipSync(new Uint8Array(value))).map(bytes => new TextDecoder().decode(bytes)).join('\n');
+            } catch (e: any) { written = `ERROR ${e?.message ?? e}`; }
+            check(`${format}: a cell's formula is not written, its value is`, !written.includes('QQZZ') && written.includes('750000') && written.includes('750001'), written.startsWith('ERROR') ? written : `formula written: ${written.includes('QQZZ')}`);
+        }
+    }
 }
 
 /**
@@ -5746,7 +5988,7 @@ async function pdfAssetTests() {
         const address = `http://127.0.0.1:${(hanging.address() as any).port}/`;
         try {
             for (const separateProcess of [true, false]) {
-                const abortedRun = await withinTime(5000, async () => {
+                const abortedRun = await withinDeadline(500, 4500, async () => {
                     try { await OfficeParser.parseOffice(fixture, { extractAttachments: true, onWarning: () => { }, abortSignal: AbortSignal.timeout(500), pdfCMapUrl: address, pdfDecoderUrl: address, pdfParserConfig: { separateProcess } } as any); return 'parsed'; } catch (e: any) { return String(e?.name); }
                 });
                 check(`pdf assets: an abort ends a parse waiting on a file that never comes (separateProcess ${separateProcess})`, abortedRun.within && abortedRun.result === 'AbortError', `${abortedRun.ms}ms ${abortedRun.result}`);
@@ -5770,7 +6012,8 @@ async function pdfAssetTests() {
                 return { first, after: after.result, afterMs: after.ms, warnings: slow.warnings };
             })();
             const warnings: any[] = [];
-            const timedRun = await withinTime(25_000, async () => {
+            // The folder's 15 s is wall-clock time on any machine; the parse around it is this machine's.
+            const timedRun = await withinDeadline(15_000, 10_000, async () => {
                 warnings.length = 0;
                 const ast = await OfficeParser.parseOffice(fixture, { extractAttachments: true, onWarning: (issue: any) => warnings.push(issue), pdfCMapUrl: address } as any) as OfficeParserAST;
                 return ast.attachments.length;
@@ -5927,7 +6170,7 @@ async function htmlReadingTests() {
         await once(size);
         const small = await time(size);
         const large = await time(size * 4);
-        check(`${label} takes linear time`, large <= LINEAR_RATIO * small + LINEAR_SLACK_MS, `${small.toFixed(0)}ms -> ${large.toFixed(0)}ms`);
+        check(`${label} takes linear time`, large <= LINEAR_RATIO * small + await scaledMs(LINEAR_SLACK_MS), `${small.toFixed(0)}ms -> ${large.toFixed(0)}ms`);
     };
     const epubOf = (override: string) => OfficeGenerator.generate(astWith([{ type: 'paragraph', children: [{ type: 'text', text: 'x' }] }]), 'epub', { onNode: (n: any) => n.type === 'paragraph' ? override : undefined, onWarning: () => {} } as any);
 
@@ -6132,7 +6375,7 @@ async function templateTextBoundTests() {
     const scanned = await withinTime(30_000, () => renderQuiet(docxOf(wp(`{{a}}${spaces}`)), { a: 1 }));
     const unscanned = await withinTime(30_000, () => renderQuiet(docxOf(wp('{{a}}') + wp(spaces)), { a: 1 }));
     check('template: the look-alike scan of a paragraph of 20,000,000 spaces costs about what reading it does',
-        !scanned.result.code && !unscanned.result.code && scanned.ms <= 1.5 * unscanned.ms + 250, `${scanned.ms}ms with a brace in the paragraph, ${unscanned.ms}ms without; ${scanned.result.code ?? unscanned.result.code ?? ''}`);
+        !scanned.result.code && !unscanned.result.code && scanned.ms <= 1.5 * unscanned.ms + await scaledMs(250), `${scanned.ms}ms with a brace in the paragraph, ${unscanned.ms}ms without; ${scanned.result.code ?? unscanned.result.code ?? ''}`);
     // Text made of braces, the scan's worst case: linear, each a few compares.
     for (const [label, make, texts] of [
         ['10,000,000 {} in one paragraph', () => docxOf(wp('{{ v }}') + wp('{}'.repeat(n(10_000_000)))), 0],
@@ -6224,6 +6467,7 @@ async function main() {
     await latexParserTests();
     await odfRepeatExpansionTests();
     await abortSignalTests();
+    await archiveCancellationTests();
     await corruptArchiveTests();
     await truncatedArchiveTests();
     await missingMainPartTests();
@@ -6240,6 +6484,7 @@ async function main() {
     await headerPartWeightTests();
     await xlsxRichStringChargeTests();
     await xlsxCellAllowanceTests();
+    await xlsxCellReadingTests();
     await nestedTextBoxTests();
     await chunkSplitterTests();
     await nativePdfMemoryTests();
@@ -6247,6 +6492,9 @@ async function main() {
     await styleFlagWeightTests();
     await latexHighlightSizeTests();
     await templateTextBoundTests();
+    await wordRtfContentHardeningTests(check);
+    await chartWritersHardeningTests(check);
+    await picturesHardeningTests(check);
 
     console.log(`\n${failed === 0 ? '✓' : '✗'} Sanitization tests: ${passed} passed, ${failed} failed`);
     if (failed > 0) process.exit(1);

@@ -126,7 +126,7 @@ export enum OfficeWarningType {
     REPEATED_CONTENT_LIMIT_EXCEEDED = 'REPEATED_CONTENT_LIMIT_EXCEEDED',
     /** A DOCX alternative-format chunk (`w:altChunk`) could not be read (its part is missing, of a format not read, a DOCX inside a DOCX chunk, or unreadable: not a ZIP, no document part, nested too deep); its content is not in the AST, and the rest of the document is */
     ALT_CHUNK_NOT_READ = 'ALT_CHUNK_NOT_READ',
-    /** A part of the document was not read, and what it holds is not in the AST: an EPUB chapter its package lists that is missing from the archive or encrypted; in a PPTX, the presentation's slide list or relationships, or the relationships of a notes page or a slide master, that are not XML; or, in a PDF, an XObject whose text pdf.js could not read (with its page) */
+    /** A part of the document was not read, and what it holds is not in the AST: an EPUB chapter its package lists that is missing from the archive or encrypted; in a PPTX, the presentation's slide list or relationships, or the relationships of a notes page or a slide master, that are not XML; in a PDF, an XObject whose text pdf.js could not read (with its page); or an RTF picture in a format not read (`\macpict`, `\pmmetafile`, none named, or data held as `\binN`); an RTF equation of no text to read and no picture of it; or an embedded object (DOCX `w:object`, RTF `\object`) with no picture of it; or a DOCX glossary part that is not well-formed XML (content controls' placeholder prompts are then read as text) */
     CONTENT_PART_NOT_READ = 'CONTENT_PART_NOT_READ',
     /** A metadata override could not be represented in the destination format's vocabulary */
     METADATA_NOT_REPRESENTABLE = 'METADATA_NOT_REPRESENTABLE',
@@ -144,6 +144,14 @@ export enum OfficeWarningType {
     INVALID_STYLE_MAP_TAG = 'INVALID_STYLE_MAP_TAG',
     /** A workbook archive contains no worksheet parts (chartsheet-only workbooks are legitimate) */
     NO_WORKSHEETS_FOUND = 'NO_WORKSHEETS_FOUND',
+    /**
+     * A sheet's formula cells hold no calculated result: the program that wrote the workbook wrote its
+     * formulas without calculating them. Those cells are read with their formula (`CellMetadata.formula`)
+     * and no text, and every output writes them empty. Once per sheet, with `details` naming the sheet,
+     * how many cells and the first of them; open and save the workbook in a spreadsheet application to
+     * calculate them.
+     */
+    FORMULA_RESULTS_MISSING = 'FORMULA_RESULTS_MISSING',
     /** A presentation archive contains no slides (a zero-slide presentation is legitimate) */
     NO_SLIDES_FOUND = 'NO_SLIDES_FOUND',
     /** A PDF's tagged-structure tree was absent, incomplete, or flagged unreliable; heuristics were used instead */
@@ -182,6 +190,15 @@ export enum OfficeWarningType {
     TEMPLATE_NOT_A_TAG = 'TEMPLATE_NOT_A_TAG',
     /** A template check found as many problems as it lists (`details.limit`: 1,000 for one data entry, or 10,000 in all for a batch, `details.batch`) and stopped there, in `details.entry` of a batch, with `details.unchecked` entries after it not checked; fix these and check again */
     TEMPLATE_CHECK_LIMITED = 'TEMPLATE_CHECK_LIMITED',
+    /**
+     * A template condition ordered two texts that both read as numbers (`{{ if a > b }}` with `'250'` and
+     * `'1000'`) and, as `numericTextComparison` was not given, compared them as text, character by character.
+     * Raised by `OfficeTemplate.render` and `OfficeTemplate.check` once per tag (its first such comparison),
+     * with the tag, the texts and whether comparing them as numbers answers otherwise in `details` (see
+     * {@link TemplateNumbersAsTextDetails}). Set `numericTextComparison` to `'number'` to compare them as
+     * numbers, or to `'text'` to keep comparing them as text without the warning.
+     */
+    TEMPLATE_NUMBERS_COMPARED_AS_TEXT = 'TEMPLATE_NUMBERS_COMPARED_AS_TEXT',
     /** A config option was passed that this version does not recognize (e.g. a key renamed in a major release); it had no effect */
     UNRECOGNIZED_CONFIG_OPTION = 'UNRECOGNIZED_CONFIG_OPTION',
     /**
@@ -511,7 +528,7 @@ export interface CommonOfficeParserConfig {
     /**
      * The URL/path to the PDF.js worker script, used only on the PDF path in the browser.
      *
-     * Defaults to `https://cdn.jsdelivr.net/npm/pdfjs-dist@6.2.108/build/pdf.worker.min.mjs`, so you only
+     * Defaults to `https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/build/pdf.worker.min.mjs`, so you only
      * need to set it to point at a self-hosted copy when the CDN is unreachable or a CSP blocks it. The
      * slim browser bundle ships no default, so there it is required for PDF parsing. Ignored in Node.
      */
@@ -528,7 +545,7 @@ export interface CommonOfficeParserConfig {
      *
      * In Node the installed package's own folder is used, unless this is set to another address (a
      * path, or a `file:` or `http(s):` address). In the browser it defaults to
-     * `https://cdn.jsdelivr.net/npm/pdfjs-dist@6.2.108/cmaps/`; a page with a Content Security Policy,
+     * `https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/cmaps/`; a page with a Content Security Policy,
      * or one that must work offline, sets it to a copy of that folder it hosts (and allows the address
      * in `connect-src`). The slim browser bundle has no default: there, set it to read such text.
      * Not fetched from its default when `allowRemoteAssets` is false.
@@ -548,7 +565,7 @@ export interface CommonOfficeParserConfig {
      *
      * In Node the installed package's own folder is used, unless this is set to another address (a
      * path, or a `file:` or `http(s):` address). In the browser it defaults to
-     * `https://cdn.jsdelivr.net/npm/pdfjs-dist@6.2.108/wasm/`; a page with a Content Security Policy,
+     * `https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/wasm/`; a page with a Content Security Policy,
      * or one that must work offline, sets it to a copy of that folder it hosts (and allows the address
      * in `connect-src`). The slim browser bundle has no default: there, set it to decode such pictures.
      * Not fetched from its default when `allowRemoteAssets` is false.
@@ -588,7 +605,8 @@ export interface CommonOfficeParserConfig {
      * This is authoritative and is used to determine the file type, so it should be accurate.
      * If provided, this bypasses the magic bytes detection and the file extension-based detection either way.
      * Besides the formats' own names it accepts the {@link FileTypeAlias} names (`latex`, `ltx`, the
-     * ODF template extensions, and `zip`).
+     * ODF template extensions, Word's, Excel's and PowerPoint's macro-enabled, template and slideshow
+     * extensions, and `zip`).
      * 
      * Default is null.
      */
@@ -1388,6 +1406,13 @@ export interface CommonGeneratorConfig {
      */
     includeCharts?: boolean;
     /**
+     * Whether to write the prompt of a DOCX content control that still shows its placeholder ("Click or
+     * tap here to enter text.", see `TextMetadata.placeholder`). Defaults to false: the prompt is not the
+     * document's text, so every generator leaves it out and keeps the cell, row or paragraph around it.
+     * `true` writes it, for output that shows the form as Word displays it.
+     */
+    includePlaceholderText?: boolean;
+    /**
      * Whether to ignore all internal (anchor) links and anchor IDs during generation.
      * When true, all bookmarks, cross-references, and internal document jumps are stripped.
      * Specifically for Markdown, this removes the {#id} block from headings.
@@ -1656,17 +1681,35 @@ export interface HtmlGeneratorConfig {
      */
     omitDefaultTextColor?: boolean;
     /**
+     * Write a link back to the reference at the end of each footnote and endnote
+     * (` <a href="#footnote-ref-KEY">↩</a>`). On by default. Off, a note holds only its own content,
+     * for a host that keeps the note's markup as the note's text (a rich-text editor shows the link as
+     * part of the note, and writes it into the note's text when saving). The reference keeps its id
+     * either way, and `HtmlParser` drops a back-link when reading, so output round-trips with or without it.
+     */
+    footnoteBackLinks?: boolean;
+    /**
      * How a spreadsheet's sheets (XLSX, ODS, CSV) are written:
      * - `'viewer'` (default): a spreadsheet viewer, each sheet a grid with column letters and row
      *   numbers, the sheets switched by tabs (a script resizes columns where scripts are written).
      * - `'tables'`: as a document holds them, for a host that embeds a workbook in a document: each
      *   sheet a heading with its name (`<h2>`) and a plain table of its cells, merged cells as spans,
      *   its empty rows and columns kept in place, its first row a header only where the source marks
-     *   it so (a header-styled or all-bold row); no tabs, column letters, row numbers or script, and
+     *   it so (a header-styled or all-bold row; see `sheetHeaderRow`); no tabs, column letters, row numbers or script, and
      *   not the workbook's own font and size on every cell (the font and size most of the cells' text
      *   has is the workbook's, and is left to the page; a cell set apart keeps its own).
      */
     sheetLayout?: 'viewer' | 'tables';
+    /**
+     * Which row of each sheet is its header row (`<thead>` with `<th>` cells) under `sheetLayout: 'tables'`:
+     * - `'marked'` (default): the first row, only where the source marks it as a header (a header-styled
+     *   or all-bold row); otherwise every row is a body row.
+     * - `'first'`: always the sheet's first row, as in a sheet whose first row names its columns. Its
+     *   cells' content and formatting are unchanged.
+     *
+     * The `'viewer'` layout has column letters for headers and ignores this.
+     */
+    sheetHeaderRow?: 'marked' | 'first';
 }
 
 /**
@@ -1831,10 +1874,10 @@ export interface PdfGeneratorConfig {
      */
     subsetFonts?: boolean;
     /**
-     * Print a spreadsheet's hidden sheets, rows and columns. A spreadsheet's printout leaves them out,
-     * and so does PDF output by default (both engines): they are marked when read
-     * (SheetMetadata.hidden, RowMetadata.hidden, CellMetadata.hidden) and kept as data by every other
-     * format. Defaults to false.
+     * Print a spreadsheet's hidden sheets, rows and columns, and a presentation's hidden slides. A
+     * printout leaves them out, and so does PDF output by default (both engines): they are marked when
+     * read (SheetMetadata.hidden, RowMetadata.hidden, CellMetadata.hidden, SlideMetadata.hidden) and kept
+     * as data by every other format. Defaults to false.
      */
     printHidden?: boolean;
     /**
@@ -2702,8 +2745,9 @@ export type TemplateSyntaxReason =
     /**
      * A tag cannot be read; `detail` says why. Text that only starts like a block tag (`{{ If you call }}`)
      * stays text, and is named so only when the blocks around it fail to pair. Named at once: a block
-     * keyword spelt as other template languages spell it (`elseif`, `elif`, `end if`), and a filter
-     * given what it does not take (`format` with a picture that cannot be read, `upper "x"`).
+     * keyword spelt as other template languages spell it (`elseif`, `elif`, `end if`), and a filter, on a
+     * field or on a value in a condition, given what it does not take (`format` with a picture that cannot
+     * be read, `upper "x"`).
      */
     | 'unreadable'
     /** A block's opening tag has no closing tag. */
@@ -2749,7 +2793,20 @@ export type TemplateDataReason =
     /** A condition compares two values of different kinds (text with a number), or a list or object. */
     | 'incomparable'
     /** A filter cannot write the value: a number picture given text that is not a number, a date picture given one that is not a date. */
-    | 'unformattable';
+    | 'unformattable'
+    /** Text read as a number two ways of a `dataNumberSeparators` list read as different numbers (`1.250`: 1250 or 1.25); `readings` holds each. */
+    | 'ambiguous-number';
+
+/** One way of a `dataNumberSeparators` list that read a text as a number, and what it read. */
+export interface TemplateNumberReading {
+    /** The way's place in the list, from 0. */
+    separators: number;
+    /** Its decimal point and group separator (`''` for none). */
+    decimal: string;
+    group: string;
+    /** The number it read. */
+    value: number;
+}
 
 /** The `details` of a `TEMPLATE_DATA_INVALID` error. */
 export interface TemplateDataDetails {
@@ -2765,6 +2822,24 @@ export interface TemplateDataDetails {
     /** For `unformattable`, the filter, and what it takes (`number` or `date` for `format`). */
     filter?: string;
     takes?: string;
+    /** For `ambiguous-number`, each way that read the text and what it read. */
+    readings?: TemplateNumberReading[];
+}
+
+/** The `details` of a `TEMPLATE_NUMBERS_COMPARED_AS_TEXT` warning: the first such comparison of its tag a render or check met. */
+export interface TemplateNumbersAsTextDetails {
+    /** The tag as typed, delimiters included. */
+    tag: string;
+    /** The document part holding it. */
+    part: string;
+    operator: '<' | '<=' | '>' | '>=';
+    /** The two texts compared, as the condition had them (after their filters), each at most 80 characters (a longer one is its first 77 and `...`). */
+    left: string;
+    right: string;
+    /** Whether comparing them as numbers gives the other answer (`'250' > '1000'`: true). Left out when a text reads as two numbers (a `dataNumberSeparators` list). */
+    differs?: boolean;
+    /** For a batch, the data entry it was met in, from 0. */
+    entry?: number;
 }
 
 /** A loop a template tag is read in: the list as typed in its `for` tag (`lines`, `order.lines`), and the pass, from 0. */
@@ -2779,8 +2854,8 @@ export interface TemplateLoopPlace {
  * - `space-in-name`: text between the delimiters that is a name with white space in it, made of letters,
  *   digits, `_ . -` and white space, starting with a letter or `_`, at most 64 characters: `{{first name}}`
  *   (a field's name has no spaces; `{{first_name}}` with a data key `first_name` is one).
- * - `unknown-filter`: a field through a word after `|` that is no filter, built-in or in `formatters`:
- *   `{{ total | fromat "0.00" }}`.
+ * - `unknown-filter`: a field, or a value in a condition, through a word after `|` that is no filter,
+ *   built-in or in `formatters`: `{{ total | fromat "0.00" }}`, `{{ if answer | lowr == "yes" }}`.
  * - `missing-delimiter`: for delimiters of one character typed twice or more (the default `{{ }}`), a
  *   name between a start delimiter and an end delimiter one of which is a character short: `{{ name }`,
  *   `{ name }}` (a short start inside braces still open, or a short end whose brace a later one closes,
@@ -2813,7 +2888,10 @@ export interface TemplateTagInfo {
      * enclosing `for` tags name.
      */
     fields: string[];
-    /** A field's filters, by name, in order. */
+    /**
+     * A field's filters, by name, in order; for an `if` or `else if`, the filters its condition's values go
+     * through, by name, each once, in the order first written.
+     */
     filters?: string[];
     /** A `for` tag's item name (`line` in `{{ for line in lines }}`). */
     item?: string;
@@ -2901,18 +2979,43 @@ export interface TemplateConfig {
      */
     numberSeparators?: { decimal?: string; group?: string };
     /**
-     * How a number written as text in the data is read, by a number picture and where a condition
-     * compares it with a number: its decimal point and the separator of its groups of three digits.
+     * How a number written as text in the data is read, by a number picture, where a condition compares it
+     * with a number, and where two texts are compared under `numericTextComparison`: its decimal point and the separator of its groups of three digits.
      * `{ decimal: ',', group: '.' }` reads `12,50` and `1.234,50`; `{ decimal: ',', group: ' ' }` reads
      * `1 234,50` (a space separator matches a no-break space too). Each is one character; `group` may be
      * `''` (the default when left out) for none, and `decimal` defaults to `.`. A group separator where
      * groups of three do not follow makes the text no number (`1.5` with `.` for groups), nor is one
      * after a first group starting with 0 (`0.500`), so an ambiguous text is refused rather than misread. Not given (the default), text is read with `.` for the point and
      * no group separator (`1250.5`). `numberSeparators` says how numbers are written, this how they are
-     * read, so data written one way can fill a document written another. A value of the wrong shape is
-     * refused (`IMPROPER_ARGUMENTS`).
+     * read, so data written one way can fill a document written another.
+     *
+     * A list gives several ways, each tried: `[{ decimal: ',', group: '.' }, { decimal: '.' }]` reads `12,50`,
+     * `1.234,50` and `12.50`. Text read by more than one way is taken when they read the same number (`1250`),
+     * and refused when they differ (`1.250`: 1250 one way, 1.25 the other) with `TEMPLATE_DATA_INVALID`
+     * (`reason: 'ambiguous-number'`, each reading in `details.readings`); so such a list refuses a whole number
+     * written with one group separator (`1.000`), which `{ decimal: ',', group: '.' }` alone reads as 1000. One
+     * to 8 ways; one object, or a list of one, reads as before. A value of the wrong shape is refused
+     * (`IMPROPER_ARGUMENTS`).
      */
-    dataNumberSeparators?: { decimal?: string; group?: string };
+    dataNumberSeparators?: { decimal?: string; group?: string } | { decimal?: string; group?: string }[];
+    /**
+     * How a condition compares two texts that both read as numbers, as `dataNumberSeparators` reads them
+     * (by default with `.` for the point: `'250'`, `'-3.5'`, `'1e3'`), such as two columns of a spreadsheet,
+     * where every value is text:
+     * - not given (the default): as text, character by character (`'250' > '1000'` is true), and an order
+     *   comparison (`<`, `<=`, `>`, `>=`) of two such texts is reported, once per tag in a render or a check,
+     *   with a `TEMPLATE_NUMBERS_COMPARED_AS_TEXT` warning;
+     * - `'text'`: as text, without the warning;
+     * - `'number'`: as numbers, for every operator, exactly: `'250' < '1000'`, `'007' == '7'` and `'1.0' == '1'`
+     *   are true, and two 20-digit ids that differ in their last digit stay different. Text too large for
+     *   a double (past about 1.8e308: `'1e400'`, a whole number of 310 digits) is no number, as for a number
+     *   picture, so it compares as text; a very small one (`'1e-400'`) is a number, and compared exactly.
+     *   Text that a `dataNumberSeparators` list reads as two different numbers is refused (`ambiguous-number`).
+     * Text beside text that is no number compares as text. Text compared with a number typed in the tag
+     * (`{{ if total > 100 }}`) is read as a number whatever this says. Another value is reported
+     * (`INVALID_CONFIG_VALUE`) and the default used.
+     */
+    numericTextComparison?: 'text' | 'number';
     /**
      * The month and day names and AM/PM markers a date picture writes. Default English. A value that is
      * not an object of names, or a list of the wrong length, is refused (`IMPROPER_ARGUMENTS`).
@@ -2976,10 +3079,14 @@ export type SupportedFileType = 'docx' | 'pptx' | 'xlsx' | 'odt' | 'odp' | 'ods'
 /**
  * Other names the `fileType` option accepts, as the matching file extensions do: `latex` and `ltx`
  * for `tex`; the ODF template packages `ott`, `ots`, `otp` and `otg` for `odt`, `ods`, `odp` and
- * `odg`; and `zip`, which is parsed as whatever the archive holds (a LaTeX project, an office
- * document).
+ * `odg`; Word's macro-enabled documents and templates `docm`, `dotx` and `dotm` for `docx`, Excel's
+ * `xlsm`, `xltx` and `xltm` for `xlsx`, and PowerPoint's `pptm`, `potx`, `potm`, `ppsx` and `ppsm`
+ * for `pptx` (their macros are not read); and `zip`, which is parsed as whatever the archive holds
+ * (a LaTeX project, an office document).
  */
-export type FileTypeAlias = 'latex' | 'ltx' | 'ott' | 'ots' | 'otp' | 'otg' | 'zip';
+export type FileTypeAlias = 'latex' | 'ltx' | 'ott' | 'ots' | 'otp' | 'otg'
+    | 'docm' | 'dotx' | 'dotm' | 'xlsm' | 'xltx' | 'xltm' | 'pptm' | 'potx' | 'potm' | 'ppsx' | 'ppsm'
+    | 'zip';
 
 /**
  * A structural stand-in for the web `Blob`/`File` so `parseOffice`/`convert` accept them in the
@@ -3007,6 +3114,8 @@ export type OfficeMimeType =
     | 'image/bmp'
     | 'image/tiff'
     | 'image/svg+xml'
+    | 'image/emf'
+    | 'image/wmf'
     | 'application/pdf'
     | 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
     | 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -3151,6 +3260,13 @@ export interface SlideMetadata {
     anchorIds?: string[];
     /** The colour the slide is filled with (its own background, else its layout's or master's), `#RRGGBB`. */
     background?: string;
+    /**
+     * The presentation hides the slide (PPTX `show="0"`, ODP `presentation:visibility="hidden"` in the
+     * page's style). Its content is read as any slide's and
+     * `slideNumber` counts it; a slideshow and a printout leave it out, as PDF output does unless
+     * `pdfConfig.printHidden` is set.
+     */
+    hidden?: boolean;
 }
 
 /**
@@ -3459,6 +3575,19 @@ export interface CellMetadata {
      */
     numberFormat?: string;
     /**
+     * The formula the cell's value is calculated from, as the sheet holds it, without the leading `=`
+     * (XLSX's `<f>`: `B5-C5`, `SUM(A1:A3)`, `_xlfn.XLOOKUP(A1,B:B,C:C)`, a newer function under the prefix
+     * Excel stores it with). A cell of a shared formula has it with its own references (`B6-C6` below
+     * `B5-C5`), as Excel fills a formula down; an array formula is on its range's first cell. `text` and
+     * `value` keep the result the file last calculated, which every output writes. Not set for a cell
+     * without a formula or a what-if data table's cell. Filled-down copies count toward
+     * `decompressionLimits.maxRepeatedContent`: past it a copy is left without its formula (its value is
+     * kept; a copy with no calculated result is left out), with a `REPEATED_CONTENT_LIMIT_EXCEEDED` warning.
+     * It is the document's own text: written into a spreadsheet it runs again (it can fetch addresses or
+     * start DDE commands). officeParser's writers write the value, never the formula.
+     */
+    formula?: string;
+    /**
      * The sheet does not show the cell: its row or its column is hidden. It is read as any cell (text,
      * CSV, chunks and every other output keep it as data); a printout leaves it out, as PDF output does
      * unless `pdfConfig.printHidden` is set.
@@ -3730,6 +3859,14 @@ export interface TextMetadata {
      * `\* ALPHABETIC` and the other switches, ODF's `style:num-format`).
      */
     fieldFormat?: PageNumberFormat;
+    /**
+     * The text is the prompt of a DOCX content control that still shows its placeholder ("Click or tap
+     * here to enter text."): the control is flagged `w:showingPlcHdr` and its content reads as the
+     * placeholder building block in the document's glossary. It is kept in the AST but is not the
+     * document's text: generators leave it out unless `includePlaceholderText` is set, and the
+     * paragraph's own `text` does not include it.
+     */
+    placeholder?: boolean;
 }
 
 /**
@@ -3824,6 +3961,8 @@ export interface BreakMetadata {
 
     /** Unique anchor IDs for internal linking (a rule or page break can be a link's target). */
     anchorIds?: string[];
+    /** The break is part of a content control's placeholder prompt, as its text is (TextMetadata.placeholder). */
+    placeholder?: boolean;
 }
 
 /**
@@ -3840,6 +3979,14 @@ export interface CodeMetadata {
      * 'block' as `$$...$$`. Matches attribute-driven editors' math nodes.
      */
     math?: 'inline' | 'block';
+    /**
+     * For math: the attachment holding the source document's own picture of the equation (RTF `\mmathPict`).
+     * The node stays the equation, and no image node shows the picture. Output that cannot typeset math (DOCX,
+     * ODT, RTF, PPTX, ODP and PDF, both engines) writes the equation as this picture where pictures are written
+     * (`includeImages`), its LaTeX the picture's alt text; HTML, EPUB, Markdown, LaTeX, text and chunks keep the
+     * LaTeX. Absent when the document gives no picture or attachments are not extracted.
+     */
+    fallbackAttachmentName?: string;
 }
 
 /**
@@ -4090,6 +4237,23 @@ export type OfficeContentNode = BaseContentNode & (
     | { type: 'summary'; metadata?: undefined }
 );
 
+/** An axis of a chart. */
+export interface ChartAxis {
+    /** Its id in the chart (OpenXML `c:axId`, ODF `chart:name` such as `primary-y`). */
+    id: string;
+    /** What it measures: categories, dates, values, or series (the depth axis of a 3D chart). */
+    kind: 'category' | 'date' | 'value' | 'series';
+    /** The side it is drawn on (OpenXML `c:axPos`), where the chart says. */
+    position?: 'bottom' | 'left' | 'right' | 'top';
+    /** Its title, where it has one. */
+    title?: string;
+    /** Whether the chart hides it (OpenXML `c:delete`). */
+    deleted?: boolean;
+}
+
+/** The kind of a chart's plot group, 3D and flat alike. */
+export type ChartType = 'area' | 'bar' | 'bubble' | 'doughnut' | 'line' | 'ofPie' | 'pie' | 'radar' | 'scatter' | 'stock' | 'surface';
+
 /**
  * Structured information extracted from a chart.
  */
@@ -4097,10 +4261,13 @@ export interface ChartData {
     /** Chart title (if any) */
     title?: string;
 
-    /** X-axis title (for continuous or categorical axes) */
+    /**
+     * The X axis title: that of the chart's primary X axis (of the axes it lists first, as Office and
+     * LibreOffice take them). A date axis gives it, and a scatter chart's horizontal value axis.
+     */
     xAxisTitle?: string;
 
-    /** Y-axis title (for value or continuous axes) */
+    /** The Y axis title: that of the chart's primary value axis (of the axes it lists first), as `xAxisTitle`. */
     yAxisTitle?: string;
 
     /** 
@@ -4111,17 +4278,88 @@ export interface ChartData {
     dataSets: {
         /** Name of this data group (e.g., 'Sales 2023') */
         name?: string;
+        /** The kind of chart the series is drawn as (a combo chart has several): the plot group it is in. */
+        chartType?: ChartType;
+        /** The axes the series is drawn on (`ChartAxis.id`): its X axis first, then its value axis. */
+        axisIds?: string[];
+        /** A scatter or bubble series' own X values (`c:xVal`), raw. `labels` stays the first series' X values. */
+        xValues?: string[];
+        /** The point index of each X value (`c:pt idx`), ascending, as `valueIndexes`. */
+        xValueIndexes?: number[];
+        /** A bubble series' sizes (`c:bubbleSize`), raw. */
+        bubbleSizes?: string[];
+        /** The point index of each bubble size, ascending. */
+        bubbleSizeIndexes?: number[];
         /** Actual numeric or string values for this group */
         values: string[];
+        /**
+         * The point index of each value (OpenXML's `c:pt idx`; an ODF chart's table row, from 0), ascending. A
+         * chart's cache leaves out blank points (an ODF table's blank or NaN cells), so `values[i]` belongs to
+         * point `valueIndexes[i]`. Absent when the chart gives no point
+         * indexes: the values then hold the points in order.
+         */
+        valueIndexes?: number[];
+        /**
+         * The value cache's Excel number format (`c:formatCode`, e.g. `"£"#,##0` or `0%`). Absent for General
+         * and for ODF charts.
+         */
+        formatCode?: string;
+        /**
+         * Each of `values` as the chart shows it (`£1,250,000`, `12%`), in the chart's date system. A point's
+         * own format wins over `formatCode`. Where the format has no text form here (scientific notation,
+         * fractions), the entry is the raw value. Present only with `formatCode`; its entries line up with
+         * `values`, so they share `valueIndexes`.
+         */
+        shownValues?: string[];
         /** Specific labels for each point in this dataset (if defined per point) */
         pointLabels: string[];
+        /** The point index of each point label (OpenXML's `c:dLbl/c:idx`), ascending. */
+        pointLabelIndexes?: number[];
     }[];
 
     /** 
      * Labels for the chart facets (e.g., 'Jan', 'Feb', 'Mar' on X-axis).
      * These typically correspond to the data points in each dataSet.
+     * In a scatter or bubble chart, the first series' X values: OpenXML's first `c:xVal` (each series' own
+     * are its `xValues`), or an ODF chart's first column, which every series shares.
      */
     labels: string[];
+
+    /**
+     * The point index of each label (OpenXML's `c:pt idx`; an ODF chart's table row, from 0), ascending. A label and a value of one point
+     * share its index, and a point missing from either list is blank in it. Absent when the chart gives no
+     * point indexes: the labels then hold the points in order.
+     */
+    labelIndexes?: number[];
+
+    /**
+     * How many points the chart's categories span (OpenXML's `c:ptCount`; an ODF chart's table's data rows), blank ones included. No list
+     * holds an entry for each of them.
+     */
+    pointCount?: number;
+
+    /** The category cache's Excel number format (e.g. `mmm\-yy`), read as a series' `formatCode` is. */
+    labelFormatCode?: string;
+
+    /**
+     * Each of `labels` as the chart shows it (`Jan-25` for 45658), read as a series' `shownValues` are; its
+     * entries line up with `labels`, so they share `labelIndexes`.
+     */
+    shownLabels?: string[];
+
+    /**
+     * The levels of a chart's categories when they have more than one (quarters under years), innermost first, as
+     * the chart caches them. `labels` (and `labelIndexes`) hold the innermost level, as for a chart of one level;
+     * an outer level's label covers the points from its index to the next label's. Absent for a chart of one level.
+     * OpenXML's `c:multiLvlStrRef` (`c:lvl`).
+     */
+    labelLevels?: { labels: string[]; labelIndexes?: number[] }[];
+
+    /**
+     * Every axis the chart has, in the order it lists them. A series names the axes it is drawn on (`axisIds`).
+     * OpenXML's `c:catAx`, `c:dateAx`, `c:valAx`, `c:serAx`; ODF's `chart:axis`.
+     */
+    axes?: ChartAxis[];
 
     /** Every text node discovered in the chart XML (for keyword search/raw extraction) */
     rawTexts: string[];

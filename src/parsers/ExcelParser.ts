@@ -34,7 +34,7 @@ import { chargeRawContent, decodeXmlEntities, getChildElements, getElementsByTag
 import { MAX_COL_SPAN, MAX_ROW_SPAN } from '../utils/numberUtils.js';
 import { BUILTIN_NUMBER_FORMATS, BUILTIN_OTHER_FORMATS, excelShownText } from '../utils/excelFormat.js';
 import { extractFiles, findRequiredPart, resolvePartPath } from '../utils/zipUtils.js';
-import { inRanges } from '../utils/sheetUtils.js';
+import { columnLetters, inRanges, shiftFormula } from '../utils/sheetUtils.js';
 
 /** The folder of a package part, with its trailing slash (`xl/worksheets/` for `xl/worksheets/sheet1.xml`). */
 const folderOf = (partPath: string): string => partPath.slice(0, partPath.lastIndexOf('/') + 1);
@@ -128,6 +128,37 @@ const partLocator = (partPaths: Iterable<string>, relationships: Iterable<{ sour
     };
 };
 
+/** Why a workbook's charts are reported not read (CONTENT_PART_NOT_READ) by a parse without extractAttachments. */
+export const WORKBOOK_CHARTS_NOT_READ = "a workbook's charts are read only with extractAttachments: true";
+
+/** Whether `issue` is the report that a workbook's charts were not read (a parse without extractAttachments). */
+export const isWorkbookChartsNotRead = (issue: { code?: string; details?: unknown }): boolean =>
+    issue.code === OfficeWarningType.CONTENT_PART_NOT_READ && (issue.details as { reason?: unknown } | undefined)?.reason === WORKBOOK_CHARTS_NOT_READ;
+
+/**
+ * The chart parts in `xl/charts/` a drawing in `xl/drawings/` names (a chart relationship of its relationships part, by
+ * the target's file name, ignoring case, as partLocator finds a chart by its name in xl/charts/ failing an exact match):
+ * the charts a parse with attachments places, not a part no drawing names nor a copy in another folder. A target of a
+ * scheme (`https:`) names no part. An external relationship of a relative target is counted: the parse with attachments
+ * looks it up by the path it resolves to, and places the chart there. A drawing's relationships that cannot be read
+ * name every chart part there.
+ */
+const chartsDrawingsName = <F extends { path: string }>(chartFiles: F[], drawingRels: F[], relationshipsOf: (file: F) => PartRelationship[]): F[] => {
+    const inChartsFolder = chartFiles.filter(f => /^xl\/charts\/chart\d+\.xml$/.test(f.path));
+    const named = new Set<string>();
+    for (const rels of drawingRels) {
+        if (!/^xl\/drawings\/_rels\/drawing\d+\.xml\.rels$/.test(rels.path)) continue;
+        let relationships: PartRelationship[];
+        try { relationships = relationshipsOf(rels); } catch { return inChartsFolder; }
+        for (const rel of relationships) {
+            const target = rel.Target ?? '';
+            if (!rel.Type?.includes('chart') || !target || /^[a-z][a-z\d+.-]*:/i.test(target)) continue;
+            named.add(target.slice(target.lastIndexOf('/') + 1).toLowerCase());
+        }
+    }
+    return inChartsFolder.filter(f => named.has(f.path.slice(f.path.lastIndexOf('/') + 1).toLowerCase()));
+};
+
 /** The folder a workbook relationship's kind of sheet lives in (`xl/worksheets/` for a worksheet), if it names a sheet. */
 const sheetFolderOf = (type: string | null): string | undefined => {
     const kind = /\/(worksheet|chartsheet|dialogsheet|xlMacrosheet)$/.exec(type ?? '')?.[1];
@@ -136,6 +167,59 @@ const sheetFolderOf = (type: string | null): string | undefined => {
 
 /** Whether the character at `at` of `xml` can continue a tag name (so `<c` there opens `<col`, not `<c`). */
 const continuesName = (xml: string, at: number): boolean => /[\w:.-]/.test(xml[at] ?? '');
+
+/** SpreadsheetML's main namespace: transitional, and Strict (ISO/IEC 29500 Strict). */
+const SPREADSHEETML_NAMESPACES: ReadonlySet<string> = new Set([
+    'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+    'http://purl.oclc.org/ooxml/spreadsheetml/main',
+]);
+
+/** The characters a namespace prefix may hold, as read here: one source for both patterns below, so they cannot drift. */
+const PREFIX_NAME = String.raw`[^\s=:"'<>/]+`;
+
+/** A namespace declaration in a start tag: its prefix, and its value in either quote, spaces allowed around `=`. */
+const NAMESPACE_DECLARATION = new RegExp(String.raw`(?:^|\s)xmlns:(${PREFIX_NAME})\s*=\s*(?:"([^"]*)"|'([^']*)')`, 'g');
+
+/** A start or end tag's prefix (`<x:`, `</x:`): the run of characters a prefix may hold after `<` or `</`, and its colon. */
+const PREFIXED_TAG = new RegExp(`<(\\/?)(${PREFIX_NAME}):`, 'g');
+
+/**
+ * A SpreadsheetML part with the prefix some writers (the .NET Open XML SDK, for one) put on its
+ * elements removed, as in `<x:row>`, since the readers below match the plain element names. The
+ * prefix is one the part's root element binds to SpreadsheetML's main namespace (transitional or
+ * Strict, spaces around `=` and either quote allowed): a prefix declared deeper applies only inside
+ * its element, and every known writer declares it on the root. A part without one is returned as it
+ * is, not copied. Linear: the root's start tag is read once, and every bound prefix removed in one pass
+ * over the part, however many the root declares.
+ */
+function withoutMainPrefix(xml: string): string {
+    // The root element's start tag, past the declaration, processing instructions, comments and a DOCTYPE.
+    let at = 0;
+    for (;;) {
+        const lt = xml.indexOf('<', at);
+        if (lt === -1) return xml;
+        if (xml.startsWith('<?', lt)) { const end = xml.indexOf('?>', lt + 2); if (end === -1) return xml; at = end + 2; }
+        else if (xml.startsWith('<!--', lt)) { const end = xml.indexOf('-->', lt + 4); if (end === -1) return xml; at = end + 3; }
+        else if (xml.startsWith('<!', lt)) {
+            // A DOCTYPE, to its `>`, or past its internal subset's `]>` when it has one.
+            const gt = xml.indexOf('>', lt + 2), bracket = xml.indexOf('[', lt + 2);
+            const end = bracket !== -1 && (gt === -1 || bracket < gt) ? xml.indexOf(']>', bracket) : gt;
+            if (end === -1) return xml;
+            at = end + (end === gt ? 1 : 2);
+        } else {
+            const gt = xml.indexOf('>', lt);
+            const rootTag = xml.slice(lt, gt === -1 ? xml.length : gt);
+            const prefixes = new Set<string>();
+            for (const declared of rootTag.matchAll(NAMESPACE_DECLARATION)) {
+                if (SPREADSHEETML_NAMESPACES.has(declared[2] ?? declared[3])) prefixes.add(declared[1]);
+            }
+            if (prefixes.size === 0) return xml;
+            // (At each `<` the run of prefix characters stops at the first a prefix cannot hold: where that is
+            // the colon, the run is the whole prefix, so `<ab:row>` is left when only `a` is bound.)
+            return xml.replace(PREFIXED_TAG, (tag, slash: string, prefix: string) => prefixes.has(prefix) ? `<${slash}` : tag);
+        }
+    }
+}
 
 /** Where the next `<tag` element starts in `xml`, from `from` on; -1 when none does. */
 function nextElement(xml: string, tag: string, from: number): number {
@@ -194,6 +278,41 @@ const attributeNamed = (attrs: string, name: string): string | undefined => {
 
 /** Whether a boolean attribute's value is true (`1` or `true`, as the schema's xsd:boolean has it). */
 const isTrue = (value: string | undefined): boolean => value === '1' || value === 'true';
+
+/** A shared formula's text and the cell it is written on, by its index (`si`), for a sheet. */
+type SharedFormulas = Map<string, { text: string; row: number; col: number }>;
+
+/**
+ * A cell's formula (see CellMetadata.formula) from its `<f>` element. A shared formula is written once,
+ * with its text, on its first cell, which `shared` keeps; each other cell of it names it by index and
+ * gets it moved by its offset from that cell. Those copies are charged to the repeated-content budget
+ * (see repeatUtils), as every cell holding a formula is kept in the AST: one formula of 8 KB written
+ * once and named by a million cells would be 8 GB. A copy is charged at its first cell's length before it is moved, so
+ * a spent budget refuses it without the work, and then for what moving added: `1:1` a million rows
+ * down is `1000001:1000001`, and a free 63-character formula became 255 characters in every cell.
+ * Kept at any length: Excel's 8,192 characters is for a formula typed in, and a copy moved down a sheet
+ * grows past it (`A1` a thousand rows down is `A1001`); the budget bounds the copies.
+ */
+function cellFormula(cContent: string, row: number, col: number, shared: SharedFormulas, config: FullOfficeParserConfig): string | undefined {
+    for (const f of xmlElements(cContent, 'f')) {
+        const kind = attributeNamed(f.attrs, 't');
+        if (kind === 'dataTable') return undefined;
+        // (As an XML reader gives it, as shared strings are read: references decoded, a CR or CRLF as LF, CDATA as text.)
+        const text = f.content.trim() ? xmlText(f.content) : '';
+        const si = kind === 'shared' ? attributeNamed(f.attrs, 'si') : undefined;
+        if (text) {
+            if (si !== undefined && !shared.has(si)) shared.set(si, { text, row, col });
+            return text;
+        }
+        const first = si === undefined ? undefined : shared.get(si);
+        if (!first || takeRepeats(config, 1, first.text.length) === 0) return undefined;
+        const moved = shiftFormula(first.text, row - first.row, col - first.col);
+        const added = moved.length - Math.max(first.text.length, REPEAT_ALLOWANCE);
+        if (added > 0 && takeRepeats(config, 1, REPEAT_ALLOWANCE + added) === 0) return undefined;
+        return moved;
+    }
+    return undefined;
+}
 
 /** A cell reference's 0-based column and row (`B3` is 1, 2), or null. */
 function cellAt(ref: string): { col: number; row: number } | null {
@@ -591,7 +710,9 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
                 !!x.match(corePropsFileRegex) ||
                 !!x.match(customPropsFileRegex) ||
                 !!x.match(appPropsFileRegex) ||
-                (!!config.extractAttachments && (!!x.match(mediaFileRegex) || !!x.match(drawingRelsRegex) || chartSheetsRegex.test(x) || chartSheetRelsRegex.test(x))) ||
+                // A drawing's relationships: read without attachments too, for the charts the drawings name (see the report below).
+                !!x.match(drawingRelsRegex) ||
+                (!!config.extractAttachments && (!!x.match(mediaFileRegex) || chartSheetsRegex.test(x) || chartSheetRelsRegex.test(x))) ||
                 !!x.match(relsRegex);
         },
         config.decompressionLimits,
@@ -647,7 +768,7 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
     let workbookRead: { xml: Document } | { error: unknown } | undefined;
     const workbookXmlOf = (): Document => {
         if (workbookRead === undefined) {
-            try { workbookRead = { xml: parseXmlString(workbookFile.content.toString(), { config }) }; } catch (error) { workbookRead = { error }; }
+            try { workbookRead = { xml: parseXmlString(withoutMainPrefix(workbookFile.content.toString()), { config }) }; } catch (error) { workbookRead = { error }; }
         }
         if ('error' in workbookRead) throw workbookRead.error;
         return workbookRead.xml;
@@ -726,7 +847,7 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
         // charged to the element budget as elements are; a plain string costs an array entry, and eight
         // of them are charged as one element (an empty `<si/>` is five bytes of a zip's XML).
         let plainStrings = 0;
-        for (const si of xmlElements(sharedStringsFile.content.toString(), 'si')) {
+        for (const si of xmlElements(withoutMainPrefix(sharedStringsFile.content.toString()), 'si')) {
             // A string's text and runs come before its phonetic readings (`rPh`), which are not its text.
             const phonetic = nextElement(si.content, 'rPh', 0);
             const body = phonetic === -1 ? si.content : si.content.slice(0, phonetic);
@@ -763,7 +884,7 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
     const cellBuiltinFormatMap: Record<number, string> = {};
 
     if (stylesFile) {
-        const xml = parseXmlString(stylesFile.content.toString(), { config });
+        const xml = parseXmlString(withoutMainPrefix(stylesFile.content.toString()), { config });
 
         // Parse custom number formats (numFmtId -> format code)
         // Classified once per number format, however many cell formats share it.
@@ -906,6 +1027,23 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
     const drawingsPlaced = new Set<string>();
     const mediaFiles = files.filter(f => f.path.match(/xl\/media\/.*/));
     const chartFiles = files.filter(f => f.path.match(chartsRegex));
+    // A workbook's charts are placed (in their sheet's drawing, or a chart sheet's) only with their attachments: without
+    // extractAttachments no chart node is read, and every output left them out with no word. Reported once, counting the
+    // charts its drawings name (a chart part no drawing names is shown by no sheet with its attachments either), naming
+    // the first by its number (`chart1.xml`, the name its attachment and reference take).
+    const placeable = config.extractAttachments || !chartFiles.length ? [] : chartsDrawingsName(chartFiles, files.filter(f => f.path.match(drawingRelsRegex)), relationshipsOf);
+    if (placeable.length) {
+        const numberOf = (path: string) => Number(/chart(\d+)\.xml$/.exec(path)?.[1] ?? Infinity);
+        let first = placeable[0].path;
+        for (const chart of placeable) if (numberOf(chart.path) < numberOf(first)) first = chart.path;
+        const count = placeable.length;
+        logWarning(OfficeWarningType.CONTENT_PART_NOT_READ, config, {
+            part: count === 1 ? `a chart, ${first}` : `${count} charts, the first ${first}`,
+            reason: WORKBOOK_CHARTS_NOT_READ,
+            count,
+            name: first.slice(first.lastIndexOf('/') + 1),
+        });
+    }
 
     // Map to store image details by drawing file path and relationship ID
     // Null-prototype: keyed by document-derived drawing paths / rel ids, so a plain object would let a
@@ -1159,7 +1297,7 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
                             const cFile = attachedCommentParts.has(commentsPath) ? undefined : fileByPath.get(commentsPath);
                             if (cFile) {
                                 attachedCommentParts.add(commentsPath);
-                                const cXml = parseXmlString(cFile.content.toString(), { config });
+                                const cXml = parseXmlString(withoutMainPrefix(cFile.content.toString()), { config });
                                 const commentNodes = getElementsByTagName(cXml, "comment");
                                 const authorsList = getElementsByTagName(cXml, "author");
                                 const authors = authorsList.map(a => a.textContent || '');
@@ -1189,7 +1327,7 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
             }
 
             const rows: OfficeContentNode[] = [];
-            const sheetXml = file.content.toString();
+            const sheetXml = withoutMainPrefix(file.content.toString());
             // The <row> elements as they stand, rather than a walk over the (possibly vast, sparse)
             // row range the sheet's dimensions declare.
             const rowElements = xmlElements(sheetXml, 'row');
@@ -1201,6 +1339,10 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
             // Its cells' hyperlinks (a web or mail address, or a place in the workbook), by `row:col`.
             const links = cellLinks(sheetXml, hyperlinkTargets);
             const columnHidden = inRanges(hiddenColumns);
+            const sharedFormulas: SharedFormulas = new Map();
+            // Formula cells holding no calculated result, and the first of them, for the sheet's warning.
+            let missingResults = 0;
+            let firstMissingResult: string | undefined;
 
             /** Helper to convert Excel column string (A, B, AA, etc.) to 0-based index */
             const colToNumber = (col: string): number => {
@@ -1258,7 +1400,11 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
                     const styleMatch = cAttrs.match(/s="(\d+)"/);
                     const styleIdx = styleMatch ? parseInt(styleMatch[1]) : undefined;
 
-                    const vContent = firstElementContent(cContent, 'v');
+                    // The value as an XML reader gives it (references decoded, a CR or CRLF as LF, CDATA as
+                    // text), for every kind below: a formula's text result, an error, a number or a shared
+                    // string's index written with references (`&#48;`) read as written.
+                    const vRaw = firstElementContent(cContent, 'v');
+                    const vContent = vRaw === undefined ? undefined : xmlText(vRaw);
                     const isContent = type === 'inlineStr' ? firstElementContent(cContent, 'is') : undefined;
 
                     let text = '';
@@ -1366,11 +1512,29 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
                         }
                     }
 
-                    if (text || sharedRuns?.length) {
+                    // A cell is kept when it shows something or holds a formula: one whose result is empty
+                    // (a text result of "") or missing (a workbook written by a program that writes formulas
+                    // without calculating them) is a cell of its formula and no text, which was dropped, and
+                    // a sheet of them read as empty.
+                    const shows = !!(text || sharedRuns?.length);
+                    const formula = cellFormula(cContent, rowIndex, colIndex, sharedFormulas, config);
+                    if (shows || formula !== undefined) {
+                        // (A result is held where one is written, empty or not: a text result, a shared string's index
+                        // naming a string, an inline string.)
+                        const holdsResult = type === 'str' ? vContent !== undefined
+                            : type === 's' ? vContent !== undefined && sharedStrings[parseInt(vContent)] !== undefined
+                                : type === 'inlineStr' && isContent !== undefined;
+                        if (!shows && !holdsResult) {
+                            if (missingResults++ === 0) firstMissingResult = ref ?? `${columnLetters(colIndex)}${rowIndex + 1}`;
+                            // (Of no kind: there is no value.)
+                            valueType = undefined;
+                        }
                         if (sharedRuns?.length) {
                             // The cell's style under each run's own (see restyledRuns, whose copies
                             // richCopyValues weighs from the same key list, STYLE_GIVES).
                             cellNodes = restyledRuns(sharedRuns, restyled ? cellFormatting : undefined);
+                        } else if (!shows) {
+                            // A formula's cell without a result holds no text node.
                         } else {
                             // Simple text node
                             cellNodes.push({
@@ -1399,6 +1563,7 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
                                 ...(valueType ? { valueType } : {}),
                                 ...(value !== undefined ? { value } : {}),
                                 ...(numberFormat !== undefined ? { numberFormat } : {}),
+                                ...(formula !== undefined ? { formula } : {}),
                                 ...(rowHidden || columnHidden(colIndex) ? { hidden: true } : {}),
                             }
                         };
@@ -1429,6 +1594,7 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
             const sheetFileName = file.path.split('/').pop() || 'Sheet';
             const tab = workbookTabs.get(file.path);
             const sheetName = tab?.name || sheetFileName;
+            if (missingResults > 0) logWarning(OfficeWarningType.FORMULA_RESULTS_MISSING, config, { sheet: sheetName, cells: missingResults, first: firstMissingResult });
 
             const pageSetup = config.ignorePageGeometry ? undefined : sheetPageSetup(sheetXml);
             content.push({
@@ -1452,7 +1618,7 @@ export const parseExcel = async (buffer: Buffer, config: FullOfficeParserConfig)
                     if (id && target && type && type.endsWith('/drawing')) drawingMap[id] = locatePart(folderOf(file.path), rel, 'xl/drawings/');
                 }
             }
-            const sheetXml = file.content.toString();
+            const sheetXml = withoutMainPrefix(file.content.toString());
             const children: OfficeContentNode[] = [];
             placeDrawings(sheetXml, drawingMap, children);
             if (children.length === 0) continue;

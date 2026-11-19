@@ -1,6 +1,6 @@
 {
   "name": "officeparser",
-  "version": "8.7.1",
+  "version": "8.9.0",
   "description": "A robust, strictly-typed Node.js and Browser library for parsing office files (.docx, .pptx, .xlsx, .odt, .odp, .ods, .odg, .pdf, .rtf, .csv, .md, .html, .epub, .tex) and generating high-fidelity outputs in DOCX, ODT, XLSX, ODS, PPTX, ODP, LaTeX, Markdown, HTML, CSV, RTF, PDF, EPUB, and RAG-focused chunks.",
   "funding": "https://github.com/sponsors/harshankur",
   "main": "dist/index.js",
@@ -49,6 +49,7 @@
     "test:blog": "node test/testBlog.js",
     "test:site": "node scripts/sync-site-version.js --check && node scripts/sync-site-documents.js --check && node test/testSite.js",
     "test": "npm run lint && npm run test:types && npm run test:blog && npm run test:site && npm run test:clean && npm run build && npm run test:license && npm run test:artifacts && npm run test:parser && npm run test:exhaustive && npm run test:generator && npm run test:security && npm run test:cli",
+    "test:slow": "node scripts/test-slow.js",
     "test:fast": "npm run lint && npm run test:types && npm run test:blog && npm run test:site && npm run test:parser:fast && npm run test:exhaustive && npm run test:generator:fast && npm run test:security && npm run test:cli:fast",
     "test:exhaustive": "npx tsx test/testExhaustive.ts",
     "test:security": "npx tsx test/security/testSanitization.ts",
@@ -136,8 +137,8 @@
   "dependencies": {
     "@xmldom/xmldom": "^0.9.12",
     "fflate": "^0.8.3",
-    "file-type": "^22.1.0",
-    "pdfjs-dist": "6.2.108",
+    "file-type": "^22.3.0",
+    "pdfjs-dist": "6.5.438",
     "tesseract.js": "^7.0.0"
   },
   "peerDependencies": {
@@ -158,20 +159,25 @@
   },
   "devDependencies": {
     "@pdf-lib/fontkit": "^1.1.1",
-    "@types/node": "^26.4.0",
-    "@typescript-eslint/eslint-plugin": "^8.70.0",
-    "@typescript-eslint/parser": "^8.70.0",
+    "@types/node": "^26.6.6",
+    "@typescript-eslint/eslint-plugin": "^8.72.2",
+    "@typescript-eslint/parser": "^8.72.2",
     "buffer": "^6.0.3",
     "dts-bundle-generator": "^9.5.1",
     "esbuild": "^0.28.2",
     "esbuild-plugins-node-modules-polyfill": "^1.8.3",
-    "eslint": "^10.9.1",
+    "eslint": "^10.15.0",
     "husky": "^9.1.7",
     "pdf-lib": "^1.17.1",
     "postject": "^1.0.0-alpha.6",
     "process": "^0.11.10",
-    "puppeteer": "^25.9.0",
-    "tsx": "^4.23.12",
+    "puppeteer": "^25.17.0",
+    "tsx": "^4.23.15",
     "typescript": "^6.0.3"
+  },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.5"
+    }
   }
 }

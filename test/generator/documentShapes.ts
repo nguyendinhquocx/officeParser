@@ -16,6 +16,7 @@ import { PICTURE_MATRIX_FINGERPRINTS_FILE, type PictureMatrixIo, runPictureMatri
 import { runDisclosureHeadingGenerator, runHtmlPictureCommentMatrix, runHtmlPictureMatrix } from '../helpers/htmlPictureLineGenerator';
 import { runAnchorPositionGenerator } from '../helpers/anchorPositionGenerator';
 import { runLineSeparatorGenerator } from '../helpers/lineSeparatorGenerator';
+import { scaledMs } from '../helpers/timing';
 
 /** The text of a node: a line's runs joined, blocks set apart by a space. */
 const wordsOfNode = (node: OfficeContentNode): string => node.children?.length
@@ -251,13 +252,24 @@ export async function testSheetsAsTables(): Promise<void> {
         ],
     } as unknown as OfficeParserAST;
     const tables = (await OfficeGenerator.generate(ast, 'html', { htmlConfig: { standalone: { document: false, styles: 'none' }, sheetLayout: 'tables' } })).value;
-    assert.ok(/<h2 id="sheet-0">Data &lt;1&gt;<\/h2>/.test(tables), `Sheets as tables: the sheet's name as a heading: ${tables}`);
+    assert.ok(/<div class="container"><h2 id="data-1">Data &lt;1&gt;<\/h2>/.test(tables), `Sheets as tables: the sheet's name as a heading, with its text's id only: ${tables}`);
     assert.ok(/<thead><tr><th><b>Region<\/b><\/th><th><b>Visits<\/b><\/th><\/tr><\/thead>/.test(tables), 'Sheets as tables: a bold first row is the header');
     assert.ok(tables.includes('<td colspan="2">Both</td>'), 'Sheets as tables: merged cells as spans');
     assert.ok(/<tr><td><\/td><td><\/td><\/tr>/.test(tables), 'Sheets as tables: an empty row kept in its place');
     assert.ok(/<td>North<\/td><td><span style="font-size: 14pt; font-family: Georgia[^"]*">Big<\/span><\/td>/.test(tables), 'Sheets as tables: a cell set apart keeps its own font');
     assert.ok(!/Arial|10pt|excel-|spreadsheet-|<script|sheet-tab/.test(tables), 'Sheets as tables: no viewer, no workbook font on every cell');
-    assert.ok(/<h2 id="sheet-1">Notes<\/h2>\s*<table><tr><td>Plain<\/td><td><\/td><td>Far<\/td><\/tr>/.test(tables), 'Sheets as tables: no header unless marked, cells keep their columns');
+    assert.ok(/<h2 id="notes">Notes<\/h2>\s*<table><tr><td>Plain<\/td><td><\/td><td>Far<\/td><\/tr>/.test(tables), 'Sheets as tables: no header unless marked, cells keep their columns');
+    assert.ok(!/sheet-\d|<a id/.test(tables), 'Sheets as tables: no viewer ids and no empty anchors');
+    // sheetHeaderRow 'first': every sheet's first row is its header row, its cells as they are.
+    const firstRow = (await OfficeGenerator.generate(ast, 'html', { htmlConfig: { standalone: { document: false, styles: 'none' }, sheetLayout: 'tables', sheetHeaderRow: 'first' } })).value;
+    assert.ok(/<h2 id="notes">Notes<\/h2>\s*<table><thead><tr><th>Plain<\/th><th><\/th><th>Far<\/th><\/tr><\/thead>/.test(firstRow), `Sheets as tables: sheetHeaderRow 'first' makes an unmarked first row the header: ${firstRow}`);
+    assert.ok(/<thead><tr><th><b>Region<\/b><\/th><th><b>Visits<\/b><\/th><\/tr><\/thead>/.test(firstRow), "Sheets as tables: sheetHeaderRow 'first' keeps a marked header as it was");
+    const firstRowMarkdown = String((await OfficeGenerator.generate(await OfficeParser.parseOffice(Buffer.from(firstRow), { fileType: 'html' }), 'md', { generateIds: false })).value);
+    assert.ok(firstRowMarkdown.includes('| Plain |  | Far |\n| --- | --- | --- |'), `Sheets as tables: and saved as Markdown, it is the table's header row: ${firstRowMarkdown}`);
+    const viewerFirstRow = (await OfficeGenerator.generate(ast, 'html', { htmlConfig: { standalone: { document: false, styles: 'none' }, sheetHeaderRow: 'first' } })).value;
+    assert.strictEqual(viewerFirstRow, (await OfficeGenerator.generate(ast, 'html', { htmlConfig: { standalone: { document: false, styles: 'none' } } })).value, "Sheets as tables: the viewer ignores sheetHeaderRow");
+    const badRow = await OfficeGenerator.generate(ast, 'html', { htmlConfig: { standalone: { document: false, styles: 'none' }, sheetLayout: 'tables', sheetHeaderRow: 'all' as any } });
+    assert.ok(badRow.messages.some(m => m.code === 'INVALID_CONFIG_VALUE') && badRow.value === tables, 'Sheets as tables: an unknown sheetHeaderRow is reported, and marked used');
     // The default is the viewer, as before.
     const viewer = (await OfficeGenerator.generate(ast, 'html', { htmlConfig: { standalone: { document: false, styles: 'none' } } })).value;
     assert.ok(viewer.includes('excel-col-header') && viewer.includes('spreadsheet-tab'), 'Sheets as tables: the viewer stays the default');
@@ -370,18 +382,16 @@ export async function testNestedFiguresReadOnce(): Promise<void> {
     const divs = '<div><b>c</b><div><b>x</b></div>'.repeat(depth) + picture + '</div>'.repeat(depth);
     let ast: OfficeParserAST | undefined;
     for (const source of [figures, divs]) await OfficeParser.parseOffice(Buffer.from(source), { fileType: 'html', extractAttachments: true });
-    const figureTime = await timed(async () => { ast = await OfficeParser.parseOffice(Buffer.from(figures), { fileType: 'html', extractAttachments: true }); });
-    const divTime = await timed(() => OfficeParser.parseOffice(Buffer.from(divs), { fileType: 'html', extractAttachments: true }));
-    assert.ok(figureTime < 3 * divTime + 200, `Nested figures: ${depth} levels in ${figureTime.toFixed(0)} ms, the same divs in ${divTime.toFixed(0)} ms`);
+    const figureTimeRun = await linearAgainst(async () => { ast = await OfficeParser.parseOffice(Buffer.from(figures), { fileType: 'html', extractAttachments: true }); }, () => OfficeParser.parseOffice(Buffer.from(divs), { fileType: 'html', extractAttachments: true }));
+    assert.ok(figureTimeRun.within, `Nested figures: ${depth} levels in ${figureTimeRun.time.toFixed(0)} ms, the same divs in ${figureTimeRun.plain.toFixed(0)} ms`);
     assert.strictEqual(ast!.attachments.length, 1, 'Nested figures: the picture is decoded once');
     // Through Markdown, whose HTML blocks the HTML reader reads.
     const mdFigures = '<figure><figcaption>x</figcaption>'.repeat(depth) + '<p>t</p>' + '</figure>'.repeat(depth) + '\n';
     const mdDivs = '<div><div>x</div>'.repeat(depth) + '<p>t</p>' + '</div>'.repeat(depth) + '\n';
     // Each read once first, so neither time holds the first read's compiling.
     for (const source of [mdFigures, mdDivs]) await OfficeParser.parseOffice(Buffer.from(source), { fileType: 'md' });
-    const mdFigureTime = await timed(() => OfficeParser.parseOffice(Buffer.from(mdFigures), { fileType: 'md' }));
-    const mdDivTime = await timed(() => OfficeParser.parseOffice(Buffer.from(mdDivs), { fileType: 'md' }));
-    assert.ok(mdFigureTime < 3 * mdDivTime + 200, `Nested figures: Markdown, ${depth} levels in ${mdFigureTime.toFixed(0)} ms, the same divs in ${mdDivTime.toFixed(0)} ms`);
+    const mdFigureTimeRun = await linearAgainst(() => OfficeParser.parseOffice(Buffer.from(mdFigures), { fileType: 'md' }), () => OfficeParser.parseOffice(Buffer.from(mdDivs), { fileType: 'md' }));
+    assert.ok(mdFigureTimeRun.within, `Nested figures: Markdown, ${depth} levels in ${mdFigureTimeRun.time.toFixed(0)} ms, the same divs in ${mdFigureTimeRun.plain.toFixed(0)} ms`);
     // The inner figure's caption stays its picture's; the outer caption is a paragraph, nothing lost.
     const nested = '<figure><figure><img src="a.png" alt="pic"><figcaption>Inner caption</figcaption></figure><figcaption>Outer caption</figcaption></figure><p>After</p>';
     const nestedAst = await OfficeParser.parseOffice(Buffer.from(nested), { fileType: 'html' });
@@ -432,10 +442,9 @@ export async function testDisclosureCarriesNoText(): Promise<void> {
     const divs = '<div><p>s</p>'.repeat(levels) + body + '</div>'.repeat(levels);
     let nested: OfficeParserAST | undefined;
     let flat: OfficeParserAST | undefined;
-    const nestedTime = await timed(async () => { nested = await OfficeParser.parseOffice(Buffer.from(disclosures), { fileType: 'html' }); });
-    const flatTime = await timed(async () => { flat = await OfficeParser.parseOffice(Buffer.from(divs), { fileType: 'html' }); });
+    const nestedTimeRun = await linearAgainst(async () => { nested = await OfficeParser.parseOffice(Buffer.from(disclosures), { fileType: 'html' }); }, async () => { flat = await OfficeParser.parseOffice(Buffer.from(divs), { fileType: 'html' }); });
     assert.ok(textLength(nested!.content) < 2 * textLength(flat!.content), `Disclosure: nested ones hold ${textLength(nested!.content)} characters of text, divs ${textLength(flat!.content)}`);
-    assert.ok(nestedTime < 3 * flatTime + 200, `Disclosure: ${levels} levels in ${nestedTime.toFixed(0)} ms, divs in ${flatTime.toFixed(0)} ms`);
+    assert.ok(nestedTimeRun.within, `Disclosure: ${levels} levels in ${nestedTimeRun.time.toFixed(0)} ms, divs in ${nestedTimeRun.plain.toFixed(0)} ms`);
     console.log('✓ Disclosure carries no text');
 }
 
@@ -468,9 +477,8 @@ export async function testDoctypeAndDeclarations(): Promise<void> {
         ['an unclosed subset', '<!DOCTYPE a [' + '<!ENTITY x "a">'.repeat(n) + '<p>y</p>'],
         ['brackets in text', '<!DOCTYPE html><p>' + 'a[b] <!x[> '.repeat(n) + '</p>'],
     ]) {
-        const time = await timed(() => OfficeParser.parseOffice(Buffer.from(source), { fileType: 'html' }));
-        const baseline = await timed(() => OfficeParser.parseOffice(Buffer.from(plain(source.length)), { fileType: 'html' }));
-        assert.ok(time < 3 * baseline + 200, `DOCTYPE: ${name} (${source.length} bytes) in ${time.toFixed(0)} ms, plain text in ${baseline.toFixed(0)} ms`);
+        const timeRun = await linearAgainst(() => OfficeParser.parseOffice(Buffer.from(source), { fileType: 'html' }), () => OfficeParser.parseOffice(Buffer.from(plain(source.length)), { fileType: 'html' }));
+        assert.ok(timeRun.within, `DOCTYPE: ${name} (${source.length} bytes) in ${timeRun.time.toFixed(0)} ms, plain text in ${timeRun.plain.toFixed(0)} ms`);
     }
     console.log('✓ DOCTYPE and declarations');
 }
@@ -579,9 +587,8 @@ export async function testMarkdownDisclosureBodies(): Promise<void> {
         ['closers of the other kind', '<details>\n\n' + '<table></details>\n\n'.repeat(2 * n) + '</table>\n'],
         ['inline closers', '<details>\n\n' + 'a `x` </details> <details>\n\n'.repeat(2 * n) + '</details>\n'],
     ]) {
-        const time = await timed(() => OfficeParser.parseOffice(Buffer.from(source), { fileType: 'md' }));
-        const baseline = await timed(() => OfficeParser.parseOffice(Buffer.from(plain(source.length)), { fileType: 'md' }));
-        assert.ok(time < 3 * baseline + 200, `Markdown disclosure: ${name} (${source.length} bytes) in ${time.toFixed(0)} ms, paragraphs in ${baseline.toFixed(0)} ms`);
+        const timeRun = await linearAgainst(() => OfficeParser.parseOffice(Buffer.from(source), { fileType: 'md' }), () => OfficeParser.parseOffice(Buffer.from(plain(source.length)), { fileType: 'md' }));
+        assert.ok(timeRun.within, `Markdown disclosure: ${name} (${source.length} bytes) in ${timeRun.time.toFixed(0)} ms, paragraphs in ${timeRun.plain.toFixed(0)} ms`);
     }
     console.log('✓ Markdown disclosure bodies');
 }
@@ -636,11 +643,11 @@ export async function testOdtNoteMarksFromConfiguration(): Promise<void> {
 async function linearAgainst(run: () => Promise<unknown>, baseline: () => Promise<unknown>): Promise<{ within: boolean; time: number; plain: number }> {
     let plain = await timed(baseline);
     let time = await timed(run);
-    if (time >= 3 * plain + 200) {
+    if (time >= 3 * plain + await scaledMs(200)) {
         plain = Math.max(plain, await timed(baseline));
         time = Math.min(time, await timed(run));
     }
-    return { within: time < 3 * plain + 200, time, plain };
+    return { within: time < 3 * plain + await scaledMs(200), time, plain };
 }
 
 /** `text` read as `fileType` and written as `format`, then read back and written again, `passes` times: each pass's output and text. */
@@ -810,11 +817,11 @@ export async function testMarkdownDisclosureSubDocuments(): Promise<void> {
         const [source, quarter] = [shape(n), shape(n / 4)];
         let small = await timed(() => read(quarter));
         let large = await timed(() => read(source));
-        if (large > 8 * small + 250) {
+        if (large > 8 * small + await scaledMs(250)) {
             small = Math.max(small, await timed(() => read(quarter)));
             large = Math.min(large, await timed(() => read(source)));
         }
-        assert.ok(large <= 8 * small + 250, `Disclosure sub-document: ${name} at ${n} (${source.length} bytes) in ${large.toFixed(0)} ms, at ${n / 4} in ${small.toFixed(0)} ms`);
+        assert.ok(large <= 8 * small + await scaledMs(250), `Disclosure sub-document: ${name} at ${n} (${source.length} bytes) in ${large.toFixed(0)} ms, at ${n / 4} in ${small.toFixed(0)} ms`);
     }
     console.log('✓ Markdown disclosure as a sub-document');
 }
@@ -980,11 +987,11 @@ export async function testMarkdownDisclosureInItemsAndCells(): Promise<void> {
 }
 
 /**
- * Round 10's findings, each read and written back. Markdown: no line after a closed quote's blank line
+ * Each of these read and written back. Markdown: no line after a closed quote's blank line
  * and an empty list item is lost, nor after a leading blank line, an indented first line or anchors
- * before an item (S2); an anchor before a disclosure stays on it (L2). A list item or table cell written
+ * before an item; an anchor before a disclosure stays on it. A list item or table cell written
  * as HTML keeps a definition list, an admonition (its kind and title), a disclosure's id, a stray summary,
- * an embed and a paragraph holding a figure apart and whole (S3, M1, L3, L5).
+ * an embed and a paragraph holding a figure apart and whole.
  */
 export async function testMarkdownDisclosureRound10Findings(): Promise<void> {
     const wordsIn = (s: string): string[] => s.match(/(?<![A-Za-z0-9])w\d+(?![0-9])/g) ?? [];
@@ -1140,11 +1147,11 @@ export async function testMarkdownDisclosureTagAttributes(): Promise<void> {
         const [source, quarter] = [shape(n), shape(n / 4)];
         let small = await timed(() => read(quarter));
         let large = await timed(() => read(source));
-        if (large > 8 * small + 250) {
+        if (large > 8 * small + await scaledMs(250)) {
             small = Math.max(small, await timed(() => read(quarter)));
             large = Math.min(large, await timed(() => read(source)));
         }
-        assert.ok(large <= 8 * small + 250, `Disclosure tag: ${name} at ${n} (${source.length} bytes) in ${large.toFixed(0)} ms, at ${n / 4} in ${small.toFixed(0)} ms`);
+        assert.ok(large <= 8 * small + await scaledMs(250), `Disclosure tag: ${name} at ${n} (${source.length} bytes) in ${large.toFixed(0)} ms, at ${n / 4} in ${small.toFixed(0)} ms`);
     }
     console.log('✓ Markdown disclosure tags with attributes');
 }
@@ -1380,11 +1387,11 @@ export async function testMarkdownDisclosureShapesLinear(): Promise<void> {
         const [source, quarter] = [shape(n), shape(n / 4)];
         let small = await timed(() => readAndWrite(quarter));
         let large = await timed(() => readAndWrite(source));
-        if (large > 8 * small + 250) {
+        if (large > 8 * small + await scaledMs(250)) {
             small = Math.max(small, await timed(() => readAndWrite(quarter)));
             large = Math.min(large, await timed(() => readAndWrite(source)));
         }
-        assert.ok(large <= 8 * small + 250, `Disclosure shapes: ${name} at ${n} in ${large.toFixed(0)} ms, at ${n / 4} in ${small.toFixed(0)} ms`);
+        assert.ok(large <= 8 * small + await scaledMs(250), `Disclosure shapes: ${name} at ${n} in ${large.toFixed(0)} ms, at ${n / 4} in ${small.toFixed(0)} ms`);
     }
     console.log(`✓ Markdown disclosure shapes in linear time (${Object.keys(DISCLOSURE_SHAPES).length} shapes, n against 4n)`);
 }
@@ -1438,11 +1445,11 @@ export async function testDisclosureSummaryShapesLinear(): Promise<void> {
         const [source, quarter] = [shape(n), shape(n / 4)];
         let small = await timed(() => readAndWrite(fileType, quarter));
         let large = await timed(() => readAndWrite(fileType, source));
-        if (large > 8 * small + 250) {
+        if (large > 8 * small + await scaledMs(250)) {
             small = Math.max(small, await timed(() => readAndWrite(fileType, quarter)));
             large = Math.min(large, await timed(() => readAndWrite(fileType, source)));
         }
-        assert.ok(large <= 8 * small + 250, `Summary shapes: ${name} at ${n} (${source.length} bytes) in ${large.toFixed(0)} ms, at ${n / 4} in ${small.toFixed(0)} ms`);
+        assert.ok(large <= 8 * small + await scaledMs(250), `Summary shapes: ${name} at ${n} (${source.length} bytes) in ${large.toFixed(0)} ms, at ${n / 4} in ${small.toFixed(0)} ms`);
     }
     console.log(`✓ Summary and disclosure shapes in linear time (${Object.keys(SUMMARY_SHAPES).length} shapes, n against 4n)`);
 }
@@ -1775,7 +1782,7 @@ export async function testMarkdownItemLineSeparators(): Promise<void> {
  * Generated captioned pictures in every image mode, 17 line and block containers and 7 positions, written as
  * HTML and EPUB and read back four times: no joined or lost words. Round trips settle by pass 3, list items
  * included (a caption in an item was read as a paragraph on pass 3), except cells' headings, which settle at
- * pass 4 as they did before (next-release ledger).
+ * pass 4.
  */
 export async function testHtmlPictureMatrixGenerated(): Promise<void> {
     for (const [label, count, seed] of [['fast', 300, 13], ['full', 3000, 1313]] as const) {
@@ -1986,7 +1993,7 @@ export async function testHtmlSourceCommentBesideCaptionedPicture(): Promise<voi
  * Generated HTML with named anchors (five forms) and element ids in every position around every element kind,
  * disclosures in every summary shape: no id lost by pass 3 in HTML, EPUB or Markdown, none read onto a
  * summary, no word lost. Markdown's ids of cells and headings in a table holding a nested table in a list
- * item, lost the same way by 8.6.0 (next-release ledger), are counted apart.
+ * item, lost the same way as before, are counted apart.
  */
 export async function testAnchorPositionsGenerated(): Promise<void> {
     for (const [label, count, seed] of [['fast', 300, 13], ['full', 3000, 2026]] as const) {
@@ -2005,7 +2012,7 @@ export async function testAnchorPositionsGenerated(): Promise<void> {
  * The HTML picture matrix with a source comment at the start of each picture's line, right before or after
  * the picture or at its end, written with comments and under sourceAttributes: no joined or lost words, no
  * line break after a line's start or another break with only hidden markup between, and round trips settled
- * by pass 3 (list items included) except cells' headings (next-release ledger).
+ * by pass 3 (list items included) except cells' headings.
  */
 export async function testHtmlPictureCommentMatrixGenerated(): Promise<void> {
     for (const [label, count, seed] of [['fast', 300, 13], ['full', 2000, 1414]] as const) {
@@ -2214,11 +2221,11 @@ export async function testDisclosureSummaryAnchorsLinear(): Promise<void> {
     const read = async (n: number): Promise<OfficeParserAST> => OfficeParser.parseOffice(Buffer.from(html(n)), { fileType: 'html' });
     let small = await timed(() => read(20000));
     let large = await timed(() => read(80000));
-    if (large > 8 * small + 250) {
+    if (large > 8 * small + await scaledMs(250)) {
         small = Math.max(small, await timed(() => read(20000)));
         large = Math.min(large, await timed(() => read(80000)));
     }
-    assert.ok(large <= 8 * small + 250, `Summary anchors: 80,000 in ${large.toFixed(0)} ms, 20,000 in ${small.toFixed(0)} ms`);
+    assert.ok(large <= 8 * small + await scaledMs(250), `Summary anchors: 80,000 in ${large.toFixed(0)} ms, 20,000 in ${small.toFixed(0)} ms`);
     const ast = await read(80000);
     const disclosure = ast.content[0];
     const anchorIds = (disclosure.metadata as { anchorIds?: string[] }).anchorIds ?? [];

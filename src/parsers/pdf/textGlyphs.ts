@@ -26,6 +26,11 @@ export interface GlyphFont {
     fontMatrix?: ArrayLike<number>;
     vertical?: boolean;
     /**
+     * Its `/ToUnicode` CMap, as read from the file (see glyphNames' tabMappingsOf), maps code 9 to U+0009: only
+     * then is a glyph of code 9 that pdf.js reads as a tab a word space.
+     */
+    tabMapped?: boolean;
+    /**
      * Its codes read by their glyphs' names (see glyphNames), as the page's text items are normalized: a
      * glyph of such a code that pdf.js read as the code's own character is read so.
      */
@@ -88,8 +93,8 @@ const SPECIAL_CHAR = /^(\s)|(\p{Mn})|(\p{Cf})$/u;
 /** Letters of the right-to-left scripts: a text holding one pdf.js may have reordered. */
 const RTL = /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/;
 
-/** The control characters, a glyph's text where its font lost what it is. */
-const CONTROL = /[\u0000-\u001f\u007f]/;
+/** Control characters from lost glyph mappings, except tabs used for word spaces. */
+const CONTROL = /[\u0000-\u0008\u000a-\u001f\u007f]/;
 
 /** Graphics state the walk keeps across `q`/`Q` and forms. */
 interface State {
@@ -222,9 +227,11 @@ export function collectGlyphs(ops: any, OPS: any, fontOf: (id: string) => GlyphF
                     const width = num(glyph.width) * fm0 * size;
                     const spacing = s.charSpacing + (glyph.isSpace ? s.wordSpacing : 0);
                     const special = SPECIAL_CHAR.exec(unicode);
-                    // (A space: blank text that is no control character, which is a glyph whose text a font lost, drawn
-                    // as any other: pdf.js reads a vertical tab as a blank, LibreOffice's "त्र" was one.)
-                    const blank = !!unicode && !unicode.trim() && !CONTROL.test(unicode);
+                    // A tab is a word space, but pdf.js reads a code its font maps to nothing as the code's own
+                    // character, so a glyph a font lost at code 9 reads as a tab too: a tab of code 9 is a space
+                    // only where its font's `/ToUnicode` is read to map code 9 to the tab (see GlyphFont).
+                    const blank = !!unicode && !unicode.trim() && !CONTROL.test(unicode)
+                        && !(unicode === '\t' && glyph.originalCharCode === 9 && s.font?.tabMapped !== true);
                     if (out.count < MAX_GLYPHS) {
                         out.px.push(userX(qtm, s.rise)); out.py.push(userY(qtm, s.rise));
                         out.x0.push(userX(tm, s.rise)); out.y0.push(userY(tm, s.rise));

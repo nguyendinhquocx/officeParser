@@ -6,7 +6,7 @@
  * consistent error reporting across all parsers and the main entry point.
  */
 
-import { OfficeError, OfficeErrorType, OfficeIssue, OfficeParserConfig, OfficeWarningType, TemplateDataDetails, TemplateSyntaxDetails } from '../types.js';
+import { OfficeError, OfficeErrorType, OfficeIssue, OfficeParserConfig, OfficeWarningType, TemplateDataDetails, TemplateNumbersAsTextDetails, TemplateSyntaxDetails } from '../types.js';
 
 /** Error header prefix for all error messages */
 const ERRORHEADER = "[OfficeParser]: ";
@@ -42,6 +42,11 @@ function templateDataReason(info: TemplateDataDetails): string {
         case 'not-text': return `fills in a value that is a${info.kind === 'object' ? 'n' : ''} ${info.kind}, which has no text of its own; loop over a list with for, or name a field inside an object with a path`;
         case 'incomparable': return `compares a value that is ${info.kind} with one that is ${info.otherKind}; a comparison takes two values of the same kind (or empty)`;
         case 'unformattable': return `formats a value that is ${info.kind} with ${info.filter}, which takes ${info.takes === 'date' ? 'a date, or text that is one in ISO 8601 form (2026-11-01)' : info.takes === 'number' ? 'a number, or text that is one' : 'text, a number, true/false or a date'}`;
+        case 'ambiguous-number': {
+            const readings = (info.readings ?? []).map(r => `${r.value} (decimal '${r.decimal}'${r.group ? `, group '${r.group}'` : ''})`);
+            const listed = readings.length > 1 ? `${readings.slice(0, -1).join(', ')} and as ${readings[readings.length - 1]}` : readings.join('');
+            return `reads text as a number ${['two', 'three', 'four', 'five', 'six', 'seven', 'eight'][readings.length - 2] ?? readings.length} ways with dataNumberSeparators, as ${listed}; write the number so that one way reads it, or list only the ways the data is written`;
+        }
     }
 }
 
@@ -94,11 +99,24 @@ const ERROR_MESSAGES: Record<OfficeErrorType, string | ((...args: any[]) => stri
 const MAX_FONTS_NAMED = 10;
 
 /** `text` shown to 80 characters: when longer, its first 77 and `...`, not splitting a surrogate pair. */
-const shownTo80 = (text: string): string => {
+export const shownTo80 = (text: string): string => {
     if (text.length <= 80) return text;
     const code = text.charCodeAt(76);
     return `${text.slice(0, code >= 0xD800 && code <= 0xDBFF ? 76 : 77)}...`;
 };
+
+/**
+ * A configuration value as a message writes it: a number as itself (NaN, -Infinity) and a bigint with its n
+ * (10n); else as JSON, or as String gives it where JSON writes nothing (undefined, a function, a symbol); and
+ * an object neither can write (one that refers to itself, holds a bigint, or has a toJSON, getter or proxy
+ * that throws) by what it is. Never throws, so a mistaken value is reported, typed, whatever it is.
+ */
+function shownConfigValue(value: unknown): string {
+    if (typeof value === 'number') return String(value);
+    if (typeof value === 'bigint') return `${value}n`;
+    try { return JSON.stringify(value) ?? String(value); } catch { /* written below */ }
+    return 'an object that cannot be written out';
+}
 
 /**
  * Lookup table for warning messages.
@@ -127,7 +145,7 @@ const WARNING_MESSAGES: Record<OfficeWarningType, string | ((...args: any[]) => 
     [OfficeWarningType.WHITESPACE_NODE_SKIPPED]: (nodeType: string) => `Skipped whitespace-only node of type: ${nodeType}`,
     [OfficeWarningType.TABLE_CELL_LIMIT_EXCEEDED]: (limit: number) => `Table cell limit (${limit}: decompressionLimits.maxTableCells, plus one per byte of the document) reached; the remaining cells were not read. A few hundred bytes of ODF can request an unbounded number of cells via table:number-columns-repeated / table:number-rows-repeated, and a small XLSX can hold millions of cells, so the cells a document yields are capped. Raise decompressionLimits.maxTableCells if your documents legitimately exceed it.`,
     [OfficeWarningType.RAW_CONTENT_LIMIT_EXCEEDED]: (limit: number) => `rawContent limit (${limit} characters) reached; the remaining nodes carry no rawContent. A node's rawContent holds the markup of everything nested in it, so nested tables and repeated cells can multiply a small document's markup many times over. Raise decompressionLimits.maxRawContentLength if you need all of it.`,
-    [OfficeWarningType.REPEATED_CONTENT_LIMIT_EXCEEDED]: (limit: number) => `Repeated content limit (${limit} characters: decompressionLimits.maxRepeatedContent, plus 16 per byte of the document) reached: the document repeats content by reference (ODF repeated cells and rows, XLSX shared strings, style values and link targets) and every writer writes it at each use, so later repeats were not made, show the start of their text, or go without the value. Raise decompressionLimits.maxRepeatedContent if your documents legitimately repeat large content.`,
+    [OfficeWarningType.REPEATED_CONTENT_LIMIT_EXCEEDED]: (limit: number) => `Repeated content limit (${limit} characters: decompressionLimits.maxRepeatedContent, plus 16 per byte of the document) reached: the document repeats content by reference (ODF repeated cells and rows, XLSX shared strings, style values and link targets, a chart shown at several places) and every writer writes it at each use, so later repeats were not made, show the start of their text, or go without the value. Raise decompressionLimits.maxRepeatedContent if your documents legitimately repeat large content.`,
     [OfficeWarningType.ALT_CHUNK_NOT_READ]: (reason: string) => `An alternative-format chunk (w:altChunk) of the document was not read: ${reason}. Its content is not in the result; open the document in Word and save it again, which merges chunks into the document.`,
     [OfficeWarningType.CONTENT_PART_NOT_READ]: (info: { part: string, reason: string }) => `A part of the document (${info.part}) was not read: ${info.reason}. Its content is not in the result.`,
     [OfficeWarningType.INVALID_CONTAINER_WIDTH]: (val: any) => `Invalid HTML containerWidth: ${JSON.stringify(val)}. Falling back to "auto". Width must be a positive number, a valid CSS length string (e.g., "900px", "100%", "50vw"), or "auto".`,
@@ -143,6 +161,7 @@ const WARNING_MESSAGES: Record<OfficeWarningType, string | ((...args: any[]) => 
     [OfficeWarningType.IMAGE_NOT_INLINED]: (info: { name?: string, bytes?: number, limit?: number, inDocument?: boolean }) => info.inDocument
         ? `Image${info.name ? ` '${info.name}'` : ''} (${info.bytes ?? '?'} bytes) was emitted as a name reference, not an inline data: URI: the images inlined in this document reached ${info.limit} bytes in all (a picture is inlined at every place that shows it). Provide the file alongside the output.`
         : `Image${info.name ? ` '${info.name}'` : ''} (${info.bytes ?? '?'} bytes) exceeds maxInlineImageBytes (${info.limit}); it was emitted as a name reference, not an inline data: URI. Provide the file alongside the output, raise maxInlineImageBytes, or use a self-contained (standalone) HTML document.`,
+    [OfficeWarningType.FORMULA_RESULTS_MISSING]: (info: { sheet: string, cells: number, first?: string }) => `Sheet "${shownTo80(info.sheet)}" holds ${info.cells} formula cell${info.cells === 1 ? '' : 's'} with no calculated result${info.first ? ` (the first at ${info.first})` : ''}: the workbook was written without calculating its formulas. ${info.cells === 1 ? 'It is' : 'They are'} read with ${info.cells === 1 ? 'its' : 'their'} formula (CellMetadata.formula) and no text; open and save the workbook in a spreadsheet application to calculate ${info.cells === 1 ? 'it' : 'them'}.`,
     [OfficeWarningType.NO_WORKSHEETS_FOUND]: `Workbook contains no worksheet parts (xl/worksheets/). If the workbook holds only chartsheets this is expected and there is simply no cell text to extract; otherwise the file may be incomplete.`,
     [OfficeWarningType.NO_SLIDES_FOUND]: `Presentation contains no slides (ppt/slides/). A legitimately empty presentation produces this too, but if you expected content the file may be incomplete.`,
     [OfficeWarningType.INVALID_STYLE_MAP_TAG]: (tag: string) => `styleMap output.tag ${JSON.stringify(tag)} is not an allowed element name and was ignored; the node's default tag was used instead. A tag name is written into both the opening and closing tag, so only a known-safe set of block, heading and inline elements is accepted.`,
@@ -199,8 +218,7 @@ const WARNING_MESSAGES: Record<OfficeWarningType, string | ((...args: any[]) => 
         `${info.runtime} has a flaw in its Brotli decoder (CVE-2026-111497) that a crafted file can use to run code, so ${info.what} decoded by a slower decoder written in JavaScript instead. What it decodes is the same, and what it cannot decode is reported or left out as with any other. Upgrade to ${info.fixed}: this protects officeParser's own reading only, not anything else in your application that decompresses Brotli, such as fetch().`,
     [OfficeWarningType.OCR_REQUIRES_ATTACHMENTS]: () => `'ocr: true' was set without 'extractAttachments: true'; OCR runs over extracted images, so no OCR was performed. Add 'extractAttachments: true' to recognize text from the document's images.`,
     [OfficeWarningType.INVALID_CONFIG_VALUE]: (info: { option: string; value: unknown; expected: string; fallback: unknown }) => {
-        // A number JSON cannot write (NaN, -Infinity) is shown as itself, not as null.
-        const shown = (typeof info.value === 'number' ? String(info.value) : JSON.stringify(info.value)) ?? String(info.value);
+        const shown = shownConfigValue(info.value);
         const value = shownTo80(shown);
         const fallback = info.fallback === '' || info.fallback === undefined ? 'the default is' : `the default (${JSON.stringify(info.fallback)}) is`;
         return `Invalid ${info.option}: ${value}. Expected ${info.expected}; ${fallback} used instead.`;
@@ -217,6 +235,12 @@ const WARNING_MESSAGES: Record<OfficeWarningType, string | ((...args: any[]) => 
         const cut = found > info.texts.length ? ` (only the first ${info.texts.length} are listed)` : '';
         const one = found === 1;
         return `${one ? 'Text that looks like a template tag is' : `${found} texts that look like template tags are`} not ${one ? 'a tag' : 'tags'} and ${one ? 'is' : 'are'} written as typed${cut}: ${shown}${more}.`;
+    },
+    [OfficeWarningType.TEMPLATE_NUMBERS_COMPARED_AS_TEXT]: (info: TemplateNumbersAsTextDetails) => {
+        const answer = info.differs === true ? ', which here answers otherwise than comparing them as numbers'
+            : info.differs === false ? ' (here the same as comparing them as numbers, which other values need not be)' : '';
+        const entry = info.entry === undefined ? '' : ` (data entry ${info.entry})`;
+        return `Template tag '${info.tag}' in ${info.part} compares two texts that read as numbers, '${info.left}' ${info.operator} '${info.right}', as text, character by character${answer}${entry}. Set numericTextComparison to 'number' to compare such texts as numbers, or to 'text' to keep comparing them as text without this warning.`;
     },
     [OfficeWarningType.TEMPLATE_CHECK_LIMITED]: (info: { limit: number; entry?: number; batch?: boolean; unchecked?: number }) => info.batch
         ? `A template check stopped after ${info.limit} problems in all, in data entry ${info.entry}${info.unchecked ? `; the ${info.unchecked} entr${info.unchecked === 1 ? 'y' : 'ies'} after it ${info.unchecked === 1 ? 'was' : 'were'} not checked` : ''}. Fix these and check again.`

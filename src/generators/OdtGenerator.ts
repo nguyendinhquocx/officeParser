@@ -9,11 +9,13 @@ import { checkAbortSignal } from '../utils/errorUtils.js';
 import { escapeXml, isSafeStyleMapTag, sanitizeOfficePackageUrl, stripInvalidXmlChars } from '../utils/sanitize.js';
 import { heldColumns } from '../utils/columnUtils.js';
 import { onDocumentPage } from '../utils/pageLimits.js';
+import { METAFILE_CONTENT_TYPE, METAFILE_EXT, metafileSize } from '../utils/metafileUtils.js';
 import { ADMONITION_COLOR, decodeBase64, embedUrl, encUrl, fillSheetRowGaps, hexColor, isHeaderRow, furnitureKind, lengthToPt, MIME_EXT, odfUserDefinedXml, resolvePaper, resolveZipInstant, runningFurniture, sectionFurniture, sectionFurnitureIndex, sniffImageSize, toBookmarkNameRaw, toW3CDTF, writableSpacing } from '../utils/officeGenUtils.js';
 import { pictureKindOfBase64, picturesOfKind } from '../utils/imageUtils.js';
 import { formatListNumber, markerPattern, MarkerPattern, odfNumFormat } from '../utils/listMarkers.js';
 import { customNoteMark } from '../utils/noteMarks.js';
 import { BaseGenerator } from './BaseGenerator.js';
+import { utf8Length } from '../utils/repeatUtils.js';
 import { lookupTable } from '../utils/lookupUtils.js';
 
 /**
@@ -172,6 +174,10 @@ interface OdtBreak {
 }
 
 export class OdtGenerator extends BaseGenerator<'odt'> {
+    /** What `text` weighs in a chart's caption or cell: escaped, its tabs, line breaks and runs of spaces as ODF's elements (see BaseGenerator.chartTextWeight). */
+    protected override chartTextWeight(text: string): number {
+        return utf8Length(encodeOdfText(text));
+    }
     private contentStyles = new StyleRegistry();
     private stylesFileStyles = new StyleRegistry();
     private activeStyles = this.contentStyles;
@@ -384,7 +390,11 @@ export class OdtGenerator extends BaseGenerator<'odt'> {
             case 'list': return this.renderListRun([node]);
             case 'table': return this.table(node);
             case 'image': return this.blockImage(node);
-            case 'code': return this.codeBlock(node);
+            case 'code': {
+                // An equation with its document's own picture is that picture, in a paragraph of its own.
+                const picture = this.mathPicture(node);
+                return picture ? this.blockImage(picture) : this.codeBlock(node);
+            }
             case 'break': return this.blockBreak(node);
             case 'note': return this.standaloneNote(node);
             case 'comment': return this.standaloneComment(node);
@@ -397,8 +407,10 @@ export class OdtGenerator extends BaseGenerator<'odt'> {
             case 'sheet': return this.sheet(node);
             case 'row': case 'cell': case 'text':
                 return `<text:p>${await this.renderInline([node])}</text:p>`;
-            case 'page': case 'slide': case 'drawing': case 'definitionList':
+            case 'page': case 'drawing': case 'definitionList':
                 return this.renderBlocks(node.children);
+            // (A slide's speaker notes after its content, see slideNotes.)
+            case 'slide': return (await this.renderBlocks(node.children)) + await this.slideNotes(node);
             // (Opened before any writer but HTML's and Markdown's sees it, see disclosures: its summary in bold, then its body.)
             case 'disclosure': return this.renderBlocks(openedDisclosure(node));
             // (A disclosure's summary is written by its disclosure; one standing alone is its blocks.)
@@ -410,6 +422,27 @@ export class OdtGenerator extends BaseGenerator<'odt'> {
                 return '';
             }
         }
+    }
+
+    /**
+     * A slide's speaker notes, after its content, as the HTML writer shows them: a block under a "Slide
+     * notes" title, set in from a grey rule. A document has no place of its own for them, and they were
+     * left out of ODT output with no warning.
+     */
+    private async slideNotes(slide: OfficeContentNode): Promise<string> {
+        let out = '';
+        const borderAttrs = ' fo:border-left="1.5pt solid #7F8C8D" fo:margin-left="0.14in" fo:padding-left="0.1in"';
+        for (const note of slide.notes ?? []) {
+            if (!note.children?.length && !note.text?.trim()) continue;
+            const prev = this.paraContextAttrs;
+            this.paraContextAttrs = borderAttrs;
+            let body: string;
+            try { body = await this.renderBlocks(this.bodyBlocks(note)); } finally { this.paraContextAttrs = prev; }
+            if (!body) continue;
+            const titleRun = this.activeStyles.intern('text', 'T', '<style:text-properties fo:font-weight="bold" style:font-weight-asian="bold" fo:color="#7F8C8D"/>');
+            out += `<text:p text:style-name="${this.internPara(borderAttrs)}"><text:span text:style-name="${titleRun}">Slide notes</text:span></text:p>` + body;
+        }
+        return out;
     }
 
     /** Body blocks of a note/comment: its children, or a synthesized paragraph from its `text`. */
@@ -571,9 +604,15 @@ export class OdtGenerator extends BaseGenerator<'odt'> {
     private async inlineContent(node: OfficeContentNode): Promise<string> {
         switch (node.type) {
             case 'text': return this.pageField(node) + await this.notesFor(node) + await this.commentsFor(node);
-            case 'code': return this.inlineCode(node);
+            case 'code': {
+                // An equation with its document's own picture is that picture, in its line.
+                const picture = this.mathPicture(node);
+                return picture ? this.imageRun(picture) : this.inlineCode(node);
+            }
             case 'image': return this.imageRun(node);
             case 'break': return this.inlineBreak(node);
+            // A chart in a line: its data's lines, written again within the chart-copy budget (see chartLineWritten).
+            case 'chart': return this.chartLineWritten(node, text => this.span(text, undefined));
             case 'paragraph': case 'heading':
                 return this.renderInline(node.children || [{ type: 'text', text: node.text || '' } as OfficeContentNode]);
             default:
@@ -929,7 +968,9 @@ export class OdtGenerator extends BaseGenerator<'odt'> {
     private mediaRef(attachmentName: string): { href: string; intrinsic: { w: number; h: number } | null } | null {
         const att = this.getAttachment(attachmentName);
         if (!att || !att.data) { this.warn(OfficeWarningType.IMAGE_PROCESSING_FAILED, { name: attachmentName, reason: 'missing attachment' }); return null; }
-        const ext = MIME_EXT[(att.mimeType || '').toLowerCase()];
+        // A metafile (EMF, WMF) is packaged as such: Word and LibreOffice draw both.
+        const mime = (att.mimeType || '').toLowerCase();
+        const ext = MIME_EXT[mime] ?? METAFILE_EXT[mime];
         if (!ext) { this.warn(OfficeWarningType.IMAGE_PROCESSING_FAILED, { name: attachmentName, reason: `ODT output does not take ${picturesOfKind(pictureKindOfBase64(att.data, att.mimeType, att.extension))}` }); return null; }
         // Each attachment decoded and measured once, at the first picture showing it: decoded again at
         // every picture before the media was looked up, one 3 MB picture shown 20,000 times took 105 s.
@@ -942,9 +983,9 @@ export class OdtGenerator extends BaseGenerator<'odt'> {
                 this.warn(OfficeWarningType.IMAGE_PROCESSING_FAILED, { name: attachmentName, reason: 'its data could not be decoded' });
                 return null;
             }
-            this.mediaIntrinsic.set(attachmentName, sniffImageSize(bytes));
+            this.mediaIntrinsic.set(attachmentName, sniffImageSize(bytes) ?? metafileSize(bytes));
             name = `image${this.media.length + 1}.${ext}`;
-            const contentType = att.mimeType || 'image/png';
+            const contentType = ext === 'emf' || ext === 'wmf' ? METAFILE_CONTENT_TYPE[ext] : att.mimeType || 'image/png';
             this.media.push({ name, bytes, ext, contentType });
             this.mediaByAttachment.set(attachmentName, name);
             this.manifestMedia.set(`Pictures/${name}`, contentType);
@@ -1214,9 +1255,14 @@ export class OdtGenerator extends BaseGenerator<'odt'> {
         const meta = node.metadata as any;
         const att = this.getAttachment(meta?.attachmentName);
         const data = att?.chartData;
-        if (!data) return `<text:p>${encodeOdfText(`[Chart: ${meta?.attachmentName || ''}]`)}</text:p>`;
-        const caption = data.title ? `<text:p><text:span text:style-name="${this.boldStyle()}">${encodeOdfText(data.title)}</text:span></text:p>` : '';
-        return caption + await this.table(this.chartTable(data, cellOf));
+        // Without its data (a parse without extractAttachments): its text, as in a line (see chartLineWritten), else
+        // its reference. Its reference alone lost the text the chart holds.
+        if (!data) return `<text:p>${this.chartLineWritten(node, text => this.span(text, undefined))}</text:p>`;
+        const title = this.chartTitle(data);
+        const caption = title ? `<text:p><text:span text:style-name="${this.boldStyle()}">${encodeOdfText(title)}</text:span></text:p>` : '';
+        const table = await this.chartTableWritten(data, cellOf, async t => this.chartWritten(await this.table(t)));
+        if (table === undefined) return caption + `<text:p>${encodeOdfText(this.chartReference(data, meta?.attachmentName))}</text:p>`;
+        return caption + table;
     }
 
     private async embed(node: OfficeContentNode): Promise<string> {

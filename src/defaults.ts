@@ -1,6 +1,6 @@
 import { ChunkingConfig, CsvGeneratorConfig, DeepRequired, DocumentStructureChunkingConfig, DocxGeneratorConfig, FixedSizeChunkingConfig, FullGeneratorConfig, HtmlGeneratorConfig, HtmlParserConfig, MdGeneratorConfig, OcrConfig, OcrTimeoutConfig, OdpGeneratorConfig, OdsGeneratorConfig, OdtGeneratorConfig, OfficeParserConfig, PdfGeneratorConfig, PdfParserConfig, PptxGeneratorConfig, SemanticChunkingConfig, TemplateConfig, TemplateDateNames, TexGeneratorConfig, TexParserConfig, TextGeneratorConfig, XlsxGeneratorConfig } from './types.js';
 
-const PDFJS_VERSION = '6.2.108';
+const PDFJS_VERSION = '6.5.438';
 /** The pdf.js worker address the non-slim builds fall back to (see `allowRemoteAssets`). Empty in the slim builds. */
 export const DEFAULT_PDF_WORKER_SRC = typeof __SLIM__ !== 'undefined' && __SLIM__ ? '' : `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
 /** The folder of pdf.js's CMaps the non-slim builds fall back to in the browser (see `pdfCMapUrl`). Empty in the slim builds. */
@@ -168,7 +168,9 @@ const DEFAULT_HTML_GENERATOR_CONFIG: DeepRequired<HtmlGeneratorConfig> = {
     sourceAttributes: false,
     gatedEmbeds: false,
     omitDefaultTextColor: false,
+    footnoteBackLinks: true,
     sheetLayout: 'viewer',
+    sheetHeaderRow: 'marked',
 };
 
 /**
@@ -356,6 +358,7 @@ export const DEFAULT_GENERATOR_CONFIG: FullGeneratorConfig = {
     includeImages: true,
     maxInlineImageBytes: 1500000,
     includeCharts: true,
+    includePlaceholderText: false,
     ignoreInternalLinks: false,
     abortSignal: null,
     htmlConfig: DEFAULT_HTML_GENERATOR_CONFIG,

@@ -9,11 +9,13 @@ import { heldColumns } from '../utils/columnUtils.js';
 import { onDocumentPage } from '../utils/pageLimits.js';
 import { pageFieldInstruction, wordFmtOf } from '../utils/pageNumbers.js';
 import { clampInt } from '../utils/numberUtils.js';
+import { METAFILE_CONTENT_TYPE, METAFILE_EXT, metafileSize } from '../utils/metafileUtils.js';
 import { ADMONITION_COLOR, decodeBase64, embedUrl, encUrl, fillSheetRowGaps, hexColor, isHeaderRow, furnitureKind, lengthToPt, MIME_EXT, ooxmlCustomPropertiesXml, resolvePaper, resolveZipInstant, runningFurniture, sectionFurniture, sectionFurnitureIndex, sniffImageSize, toBookmarkNameRaw, toW3CDTF, writableSpacing } from '../utils/officeGenUtils.js';
 import { pictureKindOfBase64, picturesOfKind } from '../utils/imageUtils.js';
 import { markerPattern, MarkerPattern } from '../utils/listMarkers.js';
 import { customNoteMark } from '../utils/noteMarks.js';
 import { BaseGenerator } from './BaseGenerator.js';
+import { utf8Length } from '../utils/repeatUtils.js';
 import { lookupTable } from '../utils/lookupUtils.js';
 
 const EMU_PER_PT = 12700;
@@ -24,6 +26,9 @@ const TWIPS_PER_PT = 20;
 function xmlText(s: string | undefined): string {
     return escapeXml(stripInvalidXmlChars(s ?? ''));
 }
+
+/** The element a run's text is written in (see DocxGenerator.runContent), empty. */
+const RUN_TEXT_MARKUP = '<w:t xml:space="preserve"></w:t>';
 
 /**
  * The full WML namespace set. Every part whose body can contain runs, hyperlinks (`r:`) or drawings
@@ -67,6 +72,18 @@ interface CommentEntry { id: number; node: OfficeContentNode; }
  * parser with near-zero loss (the basis of its test strategy).
  */
 export class DocxGenerator extends BaseGenerator<'docx'> {
+    /**
+     * What `text` weighs in a chart's caption or cell: its run content, `<w:br/>` a line and `<w:tab/>` a tab, escaped,
+     * less the one `<w:t>` any text is written in, which the caption's or cell's own markup carries (see
+     * BaseGenerator.chartTextWeight).
+     */
+    protected override chartTextWeight(text: string): number {
+        return Math.max(utf8Length(xmlText(text)), utf8Length(this.runContent(text)) - RUN_TEXT_MARKUP.length);
+    }
+    /** What a chart's title weighs in its caption, a run's text escaped, its lines and tabs as they are (see BaseGenerator.chartTitleWeight). */
+    protected override chartTitleWeight(title: string): number {
+        return utf8Length(xmlText(title));
+    }
     // Relationships are per owning part: an r:id inside footnotes.xml/header1.xml resolves against
     // that part's own `.rels`, not document.xml.rels. `currentRelOwner` names the part being rendered.
     private partRels = new Map<string, Rel[]>();
@@ -142,7 +159,9 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
             this.warn(OfficeWarningType.IMAGE_PROCESSING_FAILED, { name: attachmentName, reason: att ? 'attachment has no data' : 'missing attachment' });
             return null;
         }
-        const ext = MIME_EXT[(att.mimeType || '').toLowerCase()];
+        // A metafile (EMF, WMF) is packaged as such: Word and LibreOffice draw both.
+        const mime = (att.mimeType || '').toLowerCase();
+        const ext = MIME_EXT[mime] ?? METAFILE_EXT[mime];
         if (!ext) { this.warn(OfficeWarningType.IMAGE_PROCESSING_FAILED, { name: attachmentName, reason: `DOCX output does not take ${picturesOfKind(pictureKindOfBase64(att.data, att.mimeType, att.extension))}` }); return null; }
         // Word does not render an SVG referenced by a bare a:blip (it needs the asvg extension + a
         // raster fallback); emit nothing here so the caller degrades to alt text instead of a broken image.
@@ -158,9 +177,9 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
                 this.warn(OfficeWarningType.IMAGE_PROCESSING_FAILED, { name: attachmentName, reason: 'its data could not be decoded' });
                 return null;
             }
-            this.mediaIntrinsic.set(attachmentName, sniffImageSize(bytes));
+            this.mediaIntrinsic.set(attachmentName, sniffImageSize(bytes) ?? metafileSize(bytes));
             name = `image${this.media.length + 1}.${ext}`;
-            const contentType = (att.mimeType || 'image/png');
+            const contentType = ext === 'emf' || ext === 'wmf' ? METAFILE_CONTENT_TYPE[ext] : att.mimeType || 'image/png';
             this.media.push({ name, bytes, ext, contentType });
             this.mediaByAttachment.set(attachmentName, name);
             this.usedExtensions.add(ext);
@@ -272,7 +291,12 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
             case 'list': return this.listItem(node, bareListId);
             case 'table': return this.table(node);
             case 'image': { const r = await this.imageRun(node); return r ? this.wrapP(r, this.jc((node.metadata as any)?.align)) : ''; }
-            case 'code': return this.codeBlock(node);
+            case 'code': {
+                // An equation with its document's own picture is that picture, in a paragraph of its own.
+                const picture = this.mathPicture(node);
+                if (picture) { const r = await this.imageRun(picture); return r ? this.wrapP(r) : ''; }
+                return this.codeBlock(node);
+            }
             case 'break': return this.blockBreak(node);
             case 'note': return this.standaloneNote(node); // orphan note definition: keep it as a trailing note
             case 'comment': return this.standaloneComment(node);
@@ -288,8 +312,10 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
             case 'sheet': return this.sheet(node);
             case 'row': case 'cell': case 'text': // stray inline/table-part at block level: wrap
                 return this.wrapP(await this.renderInline([node]));
-            case 'page': case 'slide': case 'drawing': case 'definitionList':
+            case 'page': case 'drawing': case 'definitionList':
                 return this.renderBlocks(node.children); // containers: flatten (page/slide breaks handled by caller sequence)
+            // (A slide's speaker notes after its content, see slideNotes.)
+            case 'slide': return (await this.renderBlocks(node.children)) + await this.slideNotes(node);
             // (Opened before any writer but HTML's and Markdown's sees it, see disclosures: its summary in bold, then its body.)
             case 'disclosure': return this.renderBlocks(openedDisclosure(node));
             // (A disclosure's summary is written by its disclosure; one standing alone is its blocks.)
@@ -302,6 +328,24 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
                 return '';
             }
         }
+    }
+
+    /**
+     * A slide's speaker notes, after its content, as the HTML writer shows them: a block under a "Slide
+     * notes" title, set in from a grey rule. A document has no place of its own for them, and they were
+     * left out of DOCX output with no warning.
+     */
+    private async slideNotes(slide: OfficeContentNode): Promise<string> {
+        let out = '';
+        const border = `<w:pBdr><w:left w:val="single" w:sz="12" w:space="4" w:color="${SLIDE_NOTES_COLOR}"/></w:pBdr>`;
+        for (const note of slide.notes ?? []) {
+            if (!note.children?.length && !note.text?.trim()) continue;
+            const body = await this.renderBlocks(this.bodyBlocks(note));
+            if (!body) continue;
+            out += `<w:p><w:pPr>${border}<w:ind w:left="360"/></w:pPr><w:r><w:rPr><w:b/><w:color w:val="${SLIDE_NOTES_COLOR}"/></w:rPr><w:t xml:space="preserve">Slide notes</w:t></w:r></w:p>`
+                + withParagraphProperties(body, { border, indentLeft: 360 });
+        }
+        return out;
     }
 
     /** Body blocks of a note/comment: its children, or a synthesized paragraph from its `text`. */
@@ -449,9 +493,15 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
     private async inlineContent(node: OfficeContentNode): Promise<string> {
         switch (node.type) {
             case 'text': return this.textRuns(node) + await this.noteRefs(node) + await this.commentRefs(node);
-            case 'code': return this.inlineCode(node);
+            case 'code': {
+                // An equation with its document's own picture is that picture, in its line.
+                const picture = this.mathPicture(node);
+                return picture ? await this.imageRun(picture) : this.inlineCode(node);
+            }
             case 'image': return await this.imageRun(node);
             case 'break': return this.inlineBreak(node);
+            // A chart in a line: its data's lines, written again within the chart-copy budget (see chartLineWritten).
+            case 'chart': return this.chartLineWritten(node, text => this.run(text, undefined));
             case 'paragraph': case 'heading': // block content nested inline (HTML): render its runs
                 return this.renderInline(node.children || [{ type: 'text', text: node.text || '' } as OfficeContentNode]);
             default:
@@ -1052,10 +1102,15 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
         const meta = node.metadata as any;
         const att = this.getAttachment(meta?.attachmentName);
         const data = att?.chartData;
-        if (!data) return `<w:p><w:r><w:t xml:space="preserve">[Chart: ${xmlText(meta?.attachmentName || '')}]</w:t></w:r></w:p>`;
-        const caption = data.title ? `<w:p><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">${xmlText(data.title)}</w:t></w:r></w:p>` : '';
-        // A table: header = series names, first col = labels (within the grid budget, see chartTable).
-        const table = await this.table(this.chartTable(data, cellOf));
+        // Without its data (a parse without extractAttachments): its text, as in a line (see chartLineWritten), else
+        // its reference. Its reference alone lost the text the chart holds.
+        if (!data) return `<w:p>${this.chartLineWritten(node, text => this.run(text, undefined))}</w:p>`;
+        const title = this.chartTitle(data);
+        const caption = title ? `<w:p><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">${xmlText(title)}</w:t></w:r></w:p>` : '';
+        // A table: header = series names, first col = labels (within the grid budget, see chartTableWritten); past the
+        // budgets, a copy is the chart's reference.
+        const table = await this.chartTableWritten(data, cellOf, async t => this.chartWritten(await this.table(t)));
+        if (table === undefined) return caption + `<w:p><w:r><w:t xml:space="preserve">${xmlText(this.chartReference(data, meta?.attachmentName))}</w:t></w:r></w:p>`;
         return caption + table;
     }
 
@@ -1189,7 +1244,7 @@ export class DocxGenerator extends BaseGenerator<'docx'> {
         const wml = 'application/vnd.openxmlformats-officedocument.wordprocessingml';
         let defaults = `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>`;
         for (const ext of this.usedExtensions) {
-            const ct = ext === 'jpg' ? 'image/jpeg' : ext === 'svg' ? 'image/svg+xml' : ext === 'tiff' ? 'image/tiff' : `image/${ext}`;
+            const ct = ext === 'jpg' ? 'image/jpeg' : ext === 'svg' ? 'image/svg+xml' : ext === 'tiff' ? 'image/tiff' : ext === 'emf' || ext === 'wmf' ? METAFILE_CONTENT_TYPE[ext] : `image/${ext}`;
             defaults += `<Default Extension="${ext}" ContentType="${ct}"/>`;
         }
         let overrides = `<Override PartName="/word/document.xml" ContentType="${wml}.document.main+xml"/>`
@@ -1342,6 +1397,9 @@ function withSectionEnd(out: string, from: number, sectPr: string): string | und
     const at = change >= 0 ? propsAt + change : close;
     return `${out.slice(0, at)}${sectPr}${out.slice(at)}`;
 }
+
+/** The grey of a slide's speaker notes' rule and title (see slideNotes). */
+const SLIDE_NOTES_COLOR = '7F8C8D';
 
 /**
  * Gives every paragraph of `body` a style where it has none, a border where it has none, or `indentLeft`

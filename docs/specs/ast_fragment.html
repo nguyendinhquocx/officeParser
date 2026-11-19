@@ -186,7 +186,14 @@
             ODS's text shows <code>10.46</code>; a date's or time's count of days in Excel's 1900 date system,
             <code>'45000.5'</code>; <code>'true'</code> or <code>'false'</code>), <code>numberFormat</code> (the XLSX number
             format it is shown in, as Excel writes one: <code>'0.0 "kg"'</code>, <code>'mm/dd/yyyy'</code>; none for
-            General) and <code>hidden</code> (in a hidden row or column). XLSX and ODS output hold the cell as that kind
+            General), <code>formula</code> (XLSX: the formula the cell's value is calculated from, as the sheet holds it,
+            without the leading <code>=</code>, <code>'SUM(A1:A3)'</code>; a filled-down (shared) formula with each cell's
+            own references, an array formula on its range's first cell. <code>text</code> and <code>value</code> keep the
+            result the file last calculated, which every output writes; no output writes the formula. Not set for a
+            what-if data table's cell; shared copies count toward <code>decompressionLimits.maxRepeatedContent</code>,
+            past which a copy keeps its value without its formula, and a copy with no calculated result is left out (both reported). A formula cell with no calculated result is a cell of its
+            formula and no text, reported once per sheet with <code>FORMULA_RESULTS_MISSING</code>) and
+            <code>hidden</code> (in a hidden row or column). XLSX and ODS output hold the cell as that kind
             of value, so text that reads as a number (<code>1E5</code>, a card number) stays text.</li>
     </ul>
 
@@ -247,7 +254,9 @@
     <ul>
         <li><strong><code>slide</code></strong>: Container for PPTX/ODP slides and LaTeX <code>beamer</code> frames. <code>metadata.slideNumber</code>
             provides the position: for PPTX, the slide's place in the presentation's slide list, which is also the
-            order slides are read in (a slide part the list no longer names is not read). Slide speaker notes are now attached via <code>slideNode.notes[]</code> instead of
+            order slides are read in (a slide part the list no longer names is not read). <code>metadata.hidden</code> marks a
+            slide the presentation hides (PPTX, ODP); the slide keeps its <code>slideNumber</code>, and PPTX and ODP output keep
+            it hidden. A notes page's slide number is not read as a note. Slide speaker notes are now attached via <code>slideNode.notes[]</code> instead of
             being inserted as top-level <code>note</code> nodes.</li>
         <li><strong><code>page</code></strong>: Container for PDF pages. <code>metadata.pageNumber</code> provides the
             position.</li>
@@ -363,17 +372,23 @@
             <code>.checked</code> mark a GFM task-list item (<code>- [x] Done</code>).</li>
         <li>Text-node metadata additions: <code>TextMetadata.citationKey</code> (Pandoc/MultiMarkdown
             <code>[@key]</code>), <code>.wikilink</code> (Obsidian <code>[[page]]</code>), and
-            <code>.abbreviationTitle</code> (Markdown Extra <code>*[HTML]: ...</code> abbreviations), and
+            <code>.abbreviationTitle</code> (Markdown Extra <code>*[HTML]: ...</code> abbreviations),
+            <code>.placeholder</code> (the prompt of a DOCX content control still showing its placeholder, left out of
+            the paragraph's <code>text</code> and of output unless <code>includePlaceholderText</code>), and
             <code>TextFormatting.keyboard</code> for keyboard input (<code>&lt;kbd&gt;</code>, read with
             <code>font: 'monospace'</code> so formats without the notion write it as code).</li>
         <li><strong>Equations</strong> are <code>code</code> nodes carrying
             <code>CodeMetadata.math</code> (<code>'inline' | 'block'</code>), with
             <code>node.text</code> holding bare LaTeX. Every format that can carry an equation
-            produces this same node: OOXML <code>&lt;m:oMath&gt;</code> (DOCX, PPTX), MathML
+            produces this same node: OOXML <code>&lt;m:oMath&gt;</code> (DOCX, PPTX), RTF <code>\mmath</code>
+            (OMML in control words), MathML
             <code>&lt;math&gt;</code> (ODT/ODP/ODS embedded objects, HTML, EPUB3), Markdown
             <code>$...$</code>/<code>$$...$$</code>, and LaTeX <code>$...$</code>/<code>\(...\)</code>,
             <code>\[...\]</code> and the <code>equation</code>/<code>align</code>/<code>gather</code> environments
-            (user macros expanded).</li>
+            (user macros expanded). An RTF equation names the document's own picture of it, an attachment no image
+            node shows, in <code>CodeMetadata.fallbackAttachmentName</code>; DOCX, ODT, RTF, PPTX, ODP and PDF output write the
+            equation as that picture where they write pictures (PPTX and ODP on a slide after its paragraph, or after its table for one in a cell), its LaTeX the
+            alt text where the format has one.</li>
     </ul>
 
     <h3>4. Rich Content</h3>
@@ -389,9 +404,30 @@
             <code>'none'</code> included. An image
             that is a link (a badge, a clickable picture) carries <code>link</code>, <code>linkType</code>
             (<code>'internal' | 'external'</code>) and an optional <code>linkTitle</code>, as a linked run
-            carries them on <code>TextMetadata</code>.</li>
-        <li><strong><code>chart</code></strong>: References a chart attachment. Contains structured
-            <code>chartData</code> in metadata if requested.</li>
+            carries them on <code>TextMetadata</code>. An embedded object (DOCX <code>w:object</code>, RTF
+            <code>\object</code>) is the picture it shows, its <code>altText</code> naming its kind
+            (<code>Excel worksheet</code>, <code>Equation</code>). EMF and WMF attachments are typed
+            <code>image/emf</code> and <code>image/wmf</code>.</li>
+        <li><strong><code>chart</code></strong>: References a chart attachment through
+            <code>metadata.attachmentName</code> (DOCX, PPTX, XLSX, ODT, ODS, ODP; a Word or ODT chart in a line of
+            text stays a child of its paragraph). With <code>extractAttachments</code> the attachment's
+            <code>chartData</code> holds the chart's data: <code>title</code>, <code>xAxisTitle</code>,
+            <code>yAxisTitle</code>, <code>labels</code> (the innermost category level; a scatter chart's first
+            series' X values) with <code>labelIndexes</code> and <code>pointCount</code> (point positions: a cache
+            leaves out blank points, so pair entries by their indexes), <code>labelFormatCode</code> and
+            <code>shownLabels</code> (each label as the chart shows it), <code>labelLevels</code> (every level of
+            categories of several, innermost first, each with its own <code>labelIndexes</code>), <code>axes</code>
+            (each axis's <code>id</code>, <code>kind</code> <code>'category' | 'date' | 'value' | 'series'</code>,
+            <code>position</code>, <code>title</code>, <code>deleted</code>), <code>rawTexts</code>, and
+            <code>dataSets</code>: each series' <code>name</code>, <code>values</code> and <code>valueIndexes</code>,
+            <code>formatCode</code> and <code>shownValues</code>, <code>pointLabels</code> and
+            <code>pointLabelIndexes</code>, <code>chartType</code> (its plot group: <code>'bar'</code>,
+            <code>'line'</code>, <code>'pie'</code>, <code>'scatter'</code>, <code>'bubble'</code>, ...),
+            <code>axisIds</code> (the axes it is drawn on, its X axis first), and a scatter or bubble series' own
+            <code>xValues</code> and <code>bubbleSizes</code> with <code>xValueIndexes</code> and
+            <code>bubbleSizeIndexes</code>. Every writer writes a chart's data: a table (with the shown text) in
+            DOCX, ODT, LaTeX, Markdown, RTF and the slide and sheet writers, a Chart.js chart in HTML, a drawn chart
+            in the native PDF engine.</li>
         <li><strong><code>drawing</code></strong>: A vector drawing or shape, in the content tree: see
             <code>drawing</code> above (<code>ShapeMetadata</code>).</li>
     </ul>

@@ -647,6 +647,10 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
     let placing: { layout?: TemplatePart; master?: TemplatePart; theme: Map<string, string> } | undefined;
     /** The theme's colours, under its colour maps, of the slide or master being read (empty elsewhere). */
     let partTheme = new Map<string, string>();
+    /** The placeholder a notes page prints its slide number in, which is not a note (its date, header and footer text stay in the notes). */
+    const NOTES_PAGE_FURNITURE: ReadonlySet<string> = new Set(['sldNum']);
+    /** The placeholder types whose shapes traverseSpTree skips in the part being read; undefined outside a notes page. */
+    let skipPlaceholders: ReadonlySet<string> | undefined;
     /**
      * A run's own colour (`a:solidFill`): a colour of its own, or one of its theme's (`a:schemeClr`, as
      * its colour map maps it), with its shades and tints. A theme's colour was not read.
@@ -1055,6 +1059,10 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
 
             // Case 1: Normal shape
             if (tag === "p:sp") {
+                if (skipPlaceholders) {
+                    const ph = getFirstElementByTagName(getDirectChildren(element, "p:nvSpPr")[0] ?? element, "p:ph");
+                    if (ph && skipPlaceholders.has(ph.getAttribute("type") || 'body')) continue;
+                }
                 appendAll(nodes, placeShape(element, extractShapeNodes(element, rels, xmlContentString), transform));
             }
             // Case 2: Inline picture
@@ -1238,6 +1246,8 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
         try {
             const metadata: SlideMetadata = { slideNumber };
             slideNode = readPart(file, { type: 'slide', children: [], metadata }, xml => {
+                const show = xml.documentElement?.getAttribute("show");
+                if (show === "0" || show === "false") metadata.hidden = true;
                 // A slide's own colour map, over its layout's and master's.
                 const slideMap = colorMapOf(xml);
                 if (slideMap) {
@@ -1286,10 +1296,16 @@ export const parsePowerPoint = async (buffer: Buffer, config: FullOfficeParserCo
             const notesMaster = templatePart(templateOf(notesFile.path, 'notesMaster'));
             const notesTheme = (own?: Element) => mappedTheme(themeOf(notesMaster?.path), notesMaster?.path ?? '', [notesMaster?.colorMap, own]);
             partTheme = notesTheme();
-            const note = readPart(notesFile, { type: 'note', children: [], metadata: { slideNumber, noteId: `slide-note-${slideNumber}` } }, xml => {
-                const own = colorMapOf(xml);
-                if (own) partTheme = notesTheme(own);
-            });
+            let note: OfficeContentNode;
+            try {
+                skipPlaceholders = NOTES_PAGE_FURNITURE;
+                note = readPart(notesFile, { type: 'note', children: [], metadata: { slideNumber, noteId: `slide-note-${slideNumber}` } }, xml => {
+                    const own = colorMapOf(xml);
+                    if (own) partTheme = notesTheme(own);
+                });
+            } finally {
+                skipPlaceholders = undefined;
+            }
             if (note.children!.length > 0) (slideNode.notes ??= []).push(note);
         }
 

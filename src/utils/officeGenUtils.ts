@@ -9,11 +9,42 @@
  * @module officeGenUtils
  */
 
-import { CellMetadata, EmbedMetadata, HeaderFooterMetadata, ImageMode, OfficeContentNode, OfficeParserAST, PageSetup, ParagraphSpacing, RowMetadata, SheetMetadata } from '../types.js';
+import { BreakMetadata, CellMetadata, CodeMetadata, EmbedMetadata, HeaderFooterMetadata, ImageMetadata, ImageMode, OfficeAttachment, OfficeContentNode, OfficeParserAST, PageSetup, ParagraphSpacing, RowMetadata, SheetMetadata, SlideMetadata, TextMetadata } from '../types.js';
 import { cssColorHex } from './colorUtils.js';
 import { escapeXml, stripInvalidXmlChars } from './sanitize.js';
 import { lookupTable } from './lookupUtils.js';
 import { hasPageSize } from './pageLimits.js';
+
+/**
+ * Whether `node` is part of a DOCX content control's placeholder prompt ("Click or tap here to enter
+ * text."): its text, or a line break in it (TextMetadata.placeholder). Every generator leaves these
+ * nodes out unless `includePlaceholderText` is set.
+ */
+export function isPlaceholderNode(node: OfficeContentNode): boolean {
+    return (node.type === 'text' && !!(node.metadata as TextMetadata | undefined)?.placeholder)
+        || (node.type === 'break' && !!(node.metadata as BreakMetadata | undefined)?.placeholder);
+}
+
+/**
+ * The picture an equation is written as by a writer that cannot typeset math (DOCX, ODT, RTF, PPTX, ODP, PDF): an
+ * image node of the source document's own picture of it (`CodeMetadata.fallbackAttachmentName`, RTF's `\mmathPict`),
+ * the equation's LaTeX its alt text, and its `anchorIds` where it has any. Given only for a `code` node with `math`
+ * whose `fallbackAttachmentName` is a string, `attachment` (the attachment of that name) holding data, and `mode`
+ * writing pictures ('image-only' or 'image+ocr-text'); undefined otherwise, and the equation is written as its LaTeX.
+ * A new node each call: a caller that needs one node per equation keeps it (see nativePdfEngine.mathPicture).
+ * Its text is empty: the picture has no recognized text, so 'image+ocr-text' adds nothing after it.
+ */
+export function mathPictureOf(node: OfficeContentNode, attachment: OfficeAttachment | undefined, mode: ImageMode): OfficeContentNode | undefined {
+    const meta = node.metadata as CodeMetadata | undefined;
+    if (node.type !== 'code' || !meta?.math || typeof meta.fallbackAttachmentName !== 'string' || !attachment?.data) return undefined;
+    if (mode !== 'image-only' && mode !== 'image+ocr-text') return undefined;
+    const metadata: ImageMetadata = {
+        attachmentName: meta.fallbackAttachmentName,
+        altText: node.text ?? '',
+        ...(Array.isArray(meta.anchorIds) && meta.anchorIds.length ? { anchorIds: meta.anchorIds } : {}),
+    };
+    return { type: 'image', text: '', metadata };
+}
 
 /**
  * Resolves `config.includeImages` - a boolean, a CLI-provided `'true'`/`'false'` string, or an
@@ -143,6 +174,21 @@ export function decodeBase64(b64: string): Uint8Array {
     const bin = atob(b64);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+}
+
+/**
+ * A picture's bytes for a writer that shows it at several places, decoded once at the first (`cache`, keyed by
+ * its attachment's name): decoded again at each, a picture shown many times cost its decoding each time. Null when
+ * its data is not base64, which the caller reports (`its data could not be decoded`) and writes the picture's
+ * alternative text for: the decoding threw, and the writer failed with it.
+ */
+export function decodedPictureBytes(cache: Map<string, Uint8Array | null>, name: string, data: string): Uint8Array | null {
+    let bytes = cache.get(name);
+    if (bytes === undefined) {
+        try { bytes = decodeBase64(data); } catch { bytes = null; }
+        cache.set(name, bytes);
+    }
     return bytes;
 }
 
@@ -606,6 +652,17 @@ export function withShownCellText(ast: OfficeParserAST): OfficeParserAST {
 export function withoutSpeakerNotes(ast: OfficeParserAST): OfficeParserAST {
     if (!ast.content.some(n => n.type === 'slide' && n.notes?.length)) return ast;
     return { ...ast, content: ast.content.map(n => n.type === 'slide' && n.notes?.length ? { ...n, notes: undefined } : n) };
+}
+
+/**
+ * A presentation's content as a printout shows it: hidden slides (SlideMetadata.hidden) left out, their
+ * speaker notes with them. The AST as given when no slide is hidden; otherwise a copy that shares the
+ * nodes it keeps.
+ */
+export function withoutHiddenSlides(ast: OfficeParserAST): OfficeParserAST {
+    const isHidden = (n: OfficeContentNode) => n.type === 'slide' && !!(n.metadata as SlideMetadata | undefined)?.hidden;
+    if (!ast.content.some(isHidden)) return ast;
+    return { ...ast, content: ast.content.filter(n => !isHidden(n)) };
 }
 
 /**
